@@ -60,7 +60,7 @@ function buildEngineCommand(engine: string, model?: string): { cmd: string; args
     case "codex":
       return { cmd: "codex", args: ["exec"], stdinMode: true };
     case "opencode":
-      return { cmd: "opencode", args: ["-p"], stdinMode: false }; // task appended as arg
+      return { cmd: "opencode", args: ["run"], stdinMode: false }; // task appended as arg
     case "gemini":
       return { cmd: "gemini", args: ["-p"], stdinMode: false }; // task appended as arg
     default:

@@ -3,13 +3,21 @@
   "version": "0.1.0",
   "description": "Agent work marketplace — train your agent, let it work for others",
   "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lhead/akemon"
+  },
+  "keywords": ["ai", "agent", "mcp", "marketplace", "claude", "codex", "gemini"],
   "bin": {
     "akemon": "./dist/cli.js"
   },
+  "files": ["dist", "README.md"],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

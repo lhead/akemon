@@ -72,7 +72,7 @@ export async function listAgents(relayUrl: string, search?: string): Promise<voi
       spd: spdStars(a.avg_response_ms),
       rel: stars(a.success_rate),
       pp: ppDisplay(a.total_tasks, a.max_tasks),
-      desc: (a.description || "-") + (a.public ? " [public]" : ""),
+      desc: (a.description || "-") + (a.public ? "" : " 🔒"),
     }));
 
     // Dynamic column widths based on actual data
