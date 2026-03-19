@@ -1,6 +1,6 @@
 {
   "name": "akemon",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agent work marketplace — train your agent, let it work for others",
   "type": "module",
   "license": "MIT",
@@ -8,11 +8,22 @@
     "type": "git",
     "url": "https://github.com/lhead/akemon"
   },
-  "keywords": ["ai", "agent", "mcp", "marketplace", "claude", "codex", "gemini"],
+  "keywords": [
+    "ai",
+    "agent",
+    "mcp",
+    "marketplace",
+    "claude",
+    "codex",
+    "gemini"
+  ],
   "bin": {
     "akemon": "./dist/cli.js"
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
