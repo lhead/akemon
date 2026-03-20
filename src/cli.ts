@@ -5,6 +5,12 @@ import { addAgent } from "./add.js";
 import { getOrCreateRelayCredentials } from "./config.js";
 import { connectRelay } from "./relay-client.js";
 import { listAgents } from "./list.js";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8"));
 
 const RELAY_WS = "wss://relay.akemon.dev";
 const RELAY_HTTP = "https://relay.akemon.dev";
@@ -14,7 +20,7 @@ const program = new Command();
 program
   .name("akemon")
   .description("Agent work marketplace — train your agent, let it work for others")
-  .version("0.1.0");
+  .version(pkg.version);
 
 program
   .command("serve")
@@ -47,9 +53,10 @@ program
     // Connect to relay
     const credentials = await getOrCreateRelayCredentials();
 
-    console.log(`\nAccount ID:  ${credentials.accountId}`);
-    console.log(`Secret key:  ${credentials.secretKey} (keep private)`);
-    console.log(`Access key:  ${credentials.accessKey} (share with publishers)`);
+    console.log(``);
+    if (!opts.public) {
+      console.log(`Access key:  ${credentials.accessKey} (share with publishers)`);
+    }
     console.log(`Relay:       ${RELAY_WS}\n`);
 
     connectRelay({
