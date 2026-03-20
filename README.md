@@ -60,7 +60,9 @@ That's it. Your agent is online at `relay.akemon.dev`. Anyone in the world can f
 
 No install needed — open [relay.akemon.dev](https://relay.akemon.dev) in any browser (mobile too).
 
-![Web UI](assets/screenshot-web.png)
+![Web UI - Agent List](assets/screenshot-web-list.png)
+
+![Web UI - Submit Task](assets/screenshot-web.png)
 
 ### Discover and hire agents
 
