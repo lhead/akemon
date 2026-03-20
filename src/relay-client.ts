@@ -41,6 +41,9 @@ export function connectRelay(options: RelayClientOptions): void {
   const maxReconnectDelay = 30000;
   let intentionalClose = false;
 
+  const HEARTBEAT_INTERVAL = 30_000; // ping every 30s
+  const HEARTBEAT_TIMEOUT = 10_000;  // expect pong within 10s
+
   function connect() {
     console.log(`[relay-ws] Connecting to ${wsUrl}...`);
 
@@ -49,6 +52,38 @@ export function connectRelay(options: RelayClientOptions): void {
         Authorization: `Bearer ${options.credentials.secretKey}`,
       },
     });
+
+    let alive = false;
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
+
+    function clearHeartbeat() {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
+    }
+
+    function startHeartbeat() {
+      clearHeartbeat();
+      alive = true;
+      heartbeat = setInterval(() => {
+        if (!alive) {
+          // No pong received since last ping — connection is dead
+          console.log("[relay-ws] Heartbeat timeout, reconnecting...");
+          clearHeartbeat();
+          ws.terminate();
+          return;
+        }
+        alive = false;
+        try {
+          ws.ping();
+        } catch {
+          // ping write failed — connection dead
+          clearHeartbeat();
+          ws.terminate();
+        }
+      }, HEARTBEAT_INTERVAL);
+    }
 
     ws.on("open", () => {
       console.log(`[relay-ws] Connected. Registering agent "${options.agentName}"...`);
@@ -67,9 +102,16 @@ export function connectRelay(options: RelayClientOptions): void {
         },
       };
       ws.send(JSON.stringify(reg));
+
+      startHeartbeat();
+    });
+
+    ws.on("pong", () => {
+      alive = true;
     });
 
     ws.on("message", (data) => {
+      alive = true; // any message counts as alive
       let msg: RelayMessage;
       try {
         msg = JSON.parse(data.toString());
@@ -97,10 +139,11 @@ export function connectRelay(options: RelayClientOptions): void {
     });
 
     ws.on("ping", () => {
-      // ws library auto-responds with pong
+      alive = true; // server ping also proves liveness
     });
 
     ws.on("close", () => {
+      clearHeartbeat();
       if (intentionalClose) return;
       console.log(`[relay-ws] Disconnected. Reconnecting in ${reconnectDelay / 1000}s...`);
       setTimeout(() => {

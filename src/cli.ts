@@ -35,6 +35,7 @@ program
   .option("--max-tasks <n>", "Maximum tasks per day (PP)")
   .option("--approve", "Review every task before execution")
   .option("--mock", "Use mock responses (for demo/testing)")
+  .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
     const port = parseInt(opts.port);
     const engine = opts.engine || "claude";
@@ -57,10 +58,11 @@ program
     if (!opts.public) {
       console.log(`Access key:  ${credentials.accessKey} (share with publishers)`);
     }
-    console.log(`Relay:       ${RELAY_WS}\n`);
+    const relayWs = opts.relay;
+    console.log(`Relay:       ${relayWs}\n`);
 
     connectRelay({
-      relayUrl: RELAY_WS,
+      relayUrl: relayWs,
       agentName: opts.name,
       credentials,
       localPort: port,
