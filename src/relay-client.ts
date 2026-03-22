@@ -172,6 +172,9 @@ function handleMCPRequest(ws: WebSocket, msg: RelayMessage, localPort: number): 
   if (msg.session_id) {
     headers["mcp-session-id"] = msg.session_id;
   }
+  if (msg.headers?.["x-publisher-id"]) {
+    headers["x-publisher-id"] = msg.headers["x-publisher-id"];
+  }
 
   const bodyStr = typeof msg.body === "string" ? msg.body : JSON.stringify(msg.body);
   const bodyBuf = Buffer.from(bodyStr);

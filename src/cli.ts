@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { serve, serveStdio } from "./server.js";
+import { serve } from "./server.js";
 import { addAgent } from "./add.js";
 import { getOrCreateRelayCredentials } from "./config.js";
 import { connectRelay } from "./relay-client.js";
@@ -35,12 +35,19 @@ program
   .option("--max-tasks <n>", "Maximum tasks per day (PP)")
   .option("--approve", "Review every task before execution")
   .option("--mock", "Use mock responses (for demo/testing)")
+  .option("--allow-all", "Skip all permission prompts (for self-use)")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
     const port = parseInt(opts.port);
     const engine = opts.engine || "claude";
 
-    // Local MCP server for loopback
+    // Connect to relay
+    const credentials = await getOrCreateRelayCredentials();
+
+    // Derive relay HTTP URL from WS URL
+    const relayWs = opts.relay;
+    const relayHttp = relayWs.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
+
     serve({
       port,
       workdir: opts.workdir,
@@ -48,17 +55,16 @@ program
       model: opts.model,
       mock: opts.mock,
       approve: opts.approve,
+      allowAll: opts.allowAll,
       engine,
+      relayHttp,
+      secretKey: credentials.secretKey,
     });
-
-    // Connect to relay
-    const credentials = await getOrCreateRelayCredentials();
 
     console.log(``);
     if (!opts.public) {
       console.log(`Access key:  ${credentials.accessKey} (share with publishers)`);
     }
-    const relayWs = opts.relay;
     console.log(`Relay:       ${relayWs}\n`);
 
     connectRelay({

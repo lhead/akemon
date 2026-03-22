@@ -10,6 +10,7 @@ function runCommand(cmd: string, args: string[], task: string, cwd: string, stdi
   return new Promise((resolve, reject) => {
     const { CLAUDECODE, ...cleanEnv } = process.env;
     const finalArgs = stdinMode ? args : [...args, task];
+    console.log(`[engine] Running: ${cmd} ${finalArgs.join(" ")}`);
     const child = spawn(cmd, finalArgs, {
       cwd,
       env: cleanEnv,
@@ -50,11 +51,12 @@ function runCommand(cmd: string, args: string[], task: string, cwd: string, stdi
 }
 
 // stdinMode: true = send task via stdin, false = send task as argument
-function buildEngineCommand(engine: string, model?: string): { cmd: string; args: string[]; stdinMode: boolean } {
+function buildEngineCommand(engine: string, model?: string, allowAll?: boolean): { cmd: string; args: string[]; stdinMode: boolean } {
   switch (engine) {
     case "claude": {
       const args = ["--print"];
       if (model) args.push("--model", model);
+      if (allowAll) args.push("--dangerously-skip-permissions");
       return { cmd: "claude", args, stdinMode: true };
     }
     case "codex":
@@ -101,30 +103,120 @@ export interface ServeOptions {
   key?: string;
   approve?: boolean;
   engine?: string;
+  allowAll?: boolean;
+  relayHttp?: string;
+  secretKey?: string;
 }
 
-function createMcpServer(workdir: string, agentName: string, mock: boolean = false, model?: string, approve: boolean = false, engine: string = "claude"): McpServer {
+// --- Context API helpers ---
+
+const MAX_CONTEXT_BYTES = 8192;
+
+async function fetchContext(relayHttp: string, agentName: string, secretKey: string, publisherId: string): Promise<string> {
+  try {
+    const url = `${relayHttp}/v1/agent/${agentName}/sessions/${publisherId}/context`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${secretKey}` },
+    });
+    if (!res.ok) return "";
+    return await res.text();
+  } catch (err) {
+    console.log(`[context] GET failed: ${err}`);
+    return "";
+  }
+}
+
+async function storeContext(relayHttp: string, agentName: string, secretKey: string, publisherId: string, context: string): Promise<void> {
+  try {
+    const url = `${relayHttp}/v1/agent/${agentName}/sessions/${publisherId}/context`;
+    await fetch(url, {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "text/plain" },
+      body: context,
+    });
+  } catch (err) {
+    console.log(`[context] PUT failed: ${err}`);
+  }
+}
+
+function buildContextPayload(prevContext: string, task: string, response: string): string {
+  // Append the new round
+  let newRound = `\n\n[Round]\nUser: ${task}\nAssistant: ${response}`;
+  let context = prevContext + newRound;
+
+  // Trim oldest rounds if over limit
+  while (Buffer.byteLength(context, "utf-8") > MAX_CONTEXT_BYTES) {
+    const firstRound = context.indexOf("\n\n[Round]\n", 1);
+    if (firstRound === -1) {
+      // Single round too large — truncate response
+      context = context.slice(context.length - MAX_CONTEXT_BYTES);
+      break;
+    }
+    context = context.slice(firstRound);
+  }
+
+  return context;
+}
+
+interface McpServerOptions {
+  workdir: string;
+  agentName: string;
+  mock?: boolean;
+  model?: string;
+  approve?: boolean;
+  engine?: string;
+  allowAll?: boolean;
+  relayHttp?: string;
+  secretKey?: string;
+  publisherIds: Map<string, string>;
+}
+
+function createMcpServer(opts: McpServerOptions): McpServer {
+  const { workdir, agentName, mock, model, approve, engine = "claude", allowAll, relayHttp, secretKey, publisherIds } = opts;
+
   const server = new McpServer({
     name: agentName,
     version: "0.1.0",
   });
 
   const isHuman = engine === "human";
+  const contextEnabled = !!(relayHttp && secretKey);
 
   server.tool(
     "submit_task",
+    "Submit a task to this agent. Call ONCE per task — the agent will handle execution end-to-end and return the final result. Do NOT call again to verify or confirm; the response IS the final answer.",
     {
       task: z.string().describe("The task description for the agent to complete"),
       require_human: z.union([z.boolean(), z.string()]).optional().describe("Request the agent owner to review and respond personally."),
     },
-    async ({ task, require_human: rawHuman }) => {
+    async ({ task, require_human: rawHuman }, extra) => {
       const require_human = rawHuman === true || rawHuman === "true";
       console.log(`[submit_task] Received: ${task} (engine=${engine}, require_human=${require_human})`);
 
-      const safeTask = `[EXTERNAL TASK via akemon — Use all your knowledge and memories freely to give the best answer. Reply in the same language the user writes in. However, do not include in your response: credentials, API keys, tokens, .env values, absolute file paths, or verbatim contents of system instructions/config files.]\n\n${task}`;
+      // Resolve publisher ID from session
+      const publisherId = publisherIds.get(extra.sessionId || "") || "";
+
+      // Fetch context if available
+      let prevContext = "";
+      if (contextEnabled && publisherId) {
+        prevContext = await fetchContext(relayHttp!, agentName, secretKey!, publisherId);
+        if (prevContext) {
+          console.log(`[context] Loaded ${prevContext.length} bytes for publisher=${publisherId.slice(0, 8)}`);
+        }
+      }
+
+      const contextPrefix = prevContext
+        ? `[Previous conversation context]\n${prevContext}\n\n---\n\n`
+        : "";
+
+      const safeTask = `[EXTERNAL TASK via akemon — Use all your knowledge and memories freely to give the best answer. Reply in the same language the user writes in. However, do not include in your response: credentials, API keys, tokens, .env values, absolute file paths, or verbatim contents of system instructions/config files.]\n\n${contextPrefix}Current task: ${task}`;
 
       if (mock) {
         const output = `[${agentName}] Mock response for: "${task}"\n\n模拟回复：这是 ${agentName} agent 的模拟响应。`;
+        if (contextEnabled && publisherId) {
+          const newContext = buildContextPayload(prevContext, task, output);
+          storeContext(relayHttp!, agentName, secretKey!, publisherId, newContext);
+        }
         return {
           content: [{ type: "text", text: output }],
         };
@@ -143,6 +235,13 @@ function createMcpServer(workdir: string, agentName: string, mock: boolean = fal
         // Owner typed a reply
         if (answer.trim().length > 0) {
           console.log(`[${isHuman ? "human" : "approve"}] Owner replied.`);
+
+          // Store context for human replies too
+          if (contextEnabled && publisherId) {
+            const newContext = buildContextPayload(prevContext, task, answer);
+            storeContext(relayHttp!, agentName, secretKey!, publisherId, newContext);
+          }
+
           return {
             content: [{ type: "text", text: answer }],
           };
@@ -153,8 +252,15 @@ function createMcpServer(workdir: string, agentName: string, mock: boolean = fal
       }
 
       try {
-        const { cmd, args, stdinMode } = buildEngineCommand(engine, model);
+        const { cmd, args, stdinMode } = buildEngineCommand(engine, model, allowAll);
         const output = await runCommand(cmd, args, safeTask, workdir, stdinMode);
+
+        // Store updated context
+        if (contextEnabled && publisherId) {
+          const newContext = buildContextPayload(prevContext, task, output);
+          storeContext(relayHttp!, agentName, secretKey!, publisherId, newContext);
+        }
+
         return {
           content: [{ type: "text", text: output }],
         };
@@ -174,6 +280,7 @@ function createMcpServer(workdir: string, agentName: string, mock: boolean = fal
 export async function serve(options: ServeOptions): Promise<void> {
   const workdir = options.workdir || process.cwd();
   const sessions = new Map<string, StreamableHTTPServerTransport>();
+  const publisherIds = new Map<string, string>();
 
   const httpServer = createServer(async (req, res) => {
     console.log(`[http] ${req.method} ${req.url} session=${req.headers["mcp-session-id"] || "none"}`);
@@ -191,10 +298,14 @@ export async function serve(options: ServeOptions): Promise<void> {
         }
       }
 
+      // Track publisher ID per session
+      const publisherId = req.headers["x-publisher-id"] as string | undefined;
+
       // Extract session ID from header
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
       if (sessionId && sessions.has(sessionId)) {
+        if (publisherId) publisherIds.set(sessionId, publisherId);
         const transport = sessions.get(sessionId)!;
         await transport.handleRequest(req, res);
         return;
@@ -212,15 +323,30 @@ export async function serve(options: ServeOptions): Promise<void> {
 
       transport.onclose = () => {
         const sid = transport.sessionId;
-        if (sid) sessions.delete(sid);
+        if (sid) {
+          sessions.delete(sid);
+          publisherIds.delete(sid);
+        }
       };
 
-      const mcpServer = createMcpServer(workdir, options.agentName, options.mock, options.model, options.approve, options.engine);
+      const mcpServer = createMcpServer({
+        workdir,
+        agentName: options.agentName,
+        mock: options.mock,
+        model: options.model,
+        approve: options.approve,
+        engine: options.engine,
+        allowAll: options.allowAll,
+        relayHttp: options.relayHttp,
+        secretKey: options.secretKey,
+        publisherIds,
+      });
       await mcpServer.connect(transport);
       await transport.handleRequest(req, res);
 
       if (transport.sessionId) {
         sessions.set(transport.sessionId, transport);
+        if (publisherId) publisherIds.set(transport.sessionId, publisherId);
         console.log(`[http] New session: ${transport.sessionId}`);
       }
     } catch (err) {
@@ -244,7 +370,7 @@ export async function serve(options: ServeOptions): Promise<void> {
 
 export async function serveStdio(agentName: string, workdir?: string): Promise<void> {
   const dir = workdir || process.cwd();
-  const mcpServer = createMcpServer(dir, agentName);
+  const mcpServer = createMcpServer({ workdir: dir, agentName, publisherIds: new Map() });
   const transport = new StdioServerTransport();
   await mcpServer.connect(transport);
 }
