@@ -190,21 +190,28 @@ async function autoRoute(task: string, selfName: string, relayHttp: string): Pro
     return "[auto] No available agents to route to.";
   }
 
-  // Simple scoring: keyword match on tags/description + wealth
+  // Value-based scoring: quality / price (cost-benefit analysis)
   const taskWords = task.toLowerCase().split(/\s+/).filter((w: string) => w.length >= 2);
   const scored = candidates.map((a: any) => {
-    let score = a.credits || 0;
+    let quality = 0;
     const desc = (a.description || "").toLowerCase();
     const tags: string[] = (a.tags || []).map((t: string) => t.toLowerCase());
+    // Relevance: keyword match
     for (const word of taskWords) {
-      if (tags.some((t: string) => t.includes(word))) score += 100;
-      if (desc.includes(word)) score += 50;
+      if (tags.some((t: string) => t.includes(word))) quality += 100;
+      if (desc.includes(word)) quality += 50;
     }
-    return { name: a.name, engine: a.engine, score };
-  }).sort((a: any, b: any) => b.score - a.score);
+    // Track record
+    quality += (a.success_rate || 0) * 100;
+    quality += (a.level || 1) * 10;
+    // Value = quality / cost (prefer cheaper agents when quality is similar)
+    const price = a.price || 1;
+    const value = quality / price;
+    return { name: a.name, engine: a.engine, price, quality, value };
+  }).sort((a: any, b: any) => b.value - a.value);
 
   const target = scored[0];
-  console.log(`[auto] Routing to ${target.name} (score=${target.score}, engine=${target.engine})`);
+  console.log(`[auto] Routing to ${target.name} (quality=${target.quality}, price=${target.price}, value=${target.value.toFixed(1)})`);
 
   try {
     const result = await callAgent(target.name, task);
