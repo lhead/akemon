@@ -19,6 +19,7 @@ interface RelayMessage {
   account_id?: string;
   public?: boolean;
   engine?: string;
+  action?: string;
 }
 
 export interface RelayClientOptions {
@@ -133,6 +134,10 @@ export function connectRelay(options: RelayClientOptions): void {
           handleMCPRequest(ws, msg, options.localPort);
           break;
 
+        case "control":
+          handleControl(ws, msg);
+          break;
+
         default:
           console.log(`[relay-ws] Unknown message type: ${msg.type}`);
       }
@@ -158,6 +163,32 @@ export function connectRelay(options: RelayClientOptions): void {
   }
 
   connect();
+}
+
+function handleControl(ws: WebSocket, msg: RelayMessage): void {
+  const action = msg.action || "";
+  console.log(`[control] Received: ${action}`);
+
+  switch (action) {
+    case "shutdown":
+      console.log("[control] Shutting down by remote command...");
+      ws.send(JSON.stringify({ type: "control_ack", action }));
+      setTimeout(() => process.exit(0), 500);
+      break;
+
+    case "set_public":
+      console.log("[control] Agent set to public by remote command");
+      ws.send(JSON.stringify({ type: "control_ack", action }));
+      break;
+
+    case "set_private":
+      console.log("[control] Agent set to private by remote command");
+      ws.send(JSON.stringify({ type: "control_ack", action }));
+      break;
+
+    default:
+      console.log(`[control] Unknown action: ${action}`);
+  }
 }
 
 function handleMCPRequest(ws: WebSocket, msg: RelayMessage, localPort: number): void {
