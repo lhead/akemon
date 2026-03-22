@@ -2,9 +2,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
-import { spawn } from "child_process";
+import { spawn, exec } from "child_process";
 import { createServer } from "http";
 import { createInterface } from "readline";
+import { callAgent } from "./relay-client.js";
 
 function runCommand(cmd: string, args: string[], task: string, cwd: string, stdinMode: boolean = true): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -47,6 +48,19 @@ function runCommand(cmd: string, args: string[], task: string, cwd: string, stdi
     });
 
     child.on("error", reject);
+  });
+}
+
+function runTerminal(command: string, cwd: string): Promise<string> {
+  return new Promise((resolve) => {
+    exec(command, { cwd, timeout: 300_000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      const output = (stdout || "") + (stderr ? "\n[stderr]\n" + stderr : "");
+      if (err && !output.trim()) {
+        resolve(`[error] ${err.message}`);
+      } else {
+        resolve(output.trim() || "[no output]");
+      }
+    });
   });
 }
 
@@ -252,8 +266,15 @@ function createMcpServer(opts: McpServerOptions): McpServer {
       }
 
       try {
-        const { cmd, args, stdinMode } = buildEngineCommand(engine, model, allowAll);
-        const output = await runCommand(cmd, args, safeTask, workdir, stdinMode);
+        let output: string;
+
+        if (engine === "terminal") {
+          console.log(`[terminal] Executing: ${task}`);
+          output = await runTerminal(task, workdir);
+        } else {
+          const { cmd, args, stdinMode } = buildEngineCommand(engine, model, allowAll);
+          output = await runCommand(cmd, args, safeTask, workdir, stdinMode);
+        }
 
         // Store updated context
         if (contextEnabled && publisherId) {
@@ -268,6 +289,30 @@ function createMcpServer(opts: McpServerOptions): McpServer {
         console.error(`[engine] Error: ${err.message}`);
         return {
           content: [{ type: "text", text: "Error: agent failed to process this task. Please try again later." }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Agent-to-agent calling tool
+  server.tool(
+    "call_agent",
+    "Call another akemon agent by name. The target agent will execute the task and return the result. Use this to delegate subtasks to specialized agents.",
+    {
+      agent: z.string().describe("Name of the target agent to call"),
+      task: z.string().describe("Task to send to the target agent"),
+    },
+    async ({ agent: target, task }) => {
+      console.log(`[call_agent] ${agentName} → ${target}: ${task.slice(0, 80)}`);
+      try {
+        const result = await callAgent(target, task);
+        return {
+          content: [{ type: "text", text: result }],
+        };
+      } catch (err: any) {
+        return {
+          content: [{ type: "text", text: `[error] Failed to call agent "${target}": ${err.message}` }],
           isError: true,
         };
       }

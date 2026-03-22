@@ -20,6 +20,11 @@ interface RelayMessage {
   public?: boolean;
   engine?: string;
   action?: string;
+  call_id?: string;
+  caller?: string;
+  target?: string;
+  task?: string;
+  result?: string;
 }
 
 export interface RelayClientOptions {
@@ -30,6 +35,37 @@ export interface RelayClientOptions {
   description?: string;
   isPublic?: boolean;
   engine?: string;
+}
+
+// Pending agent_call results (callId → resolve function)
+const pendingAgentCalls = new Map<string, (result: string) => void>();
+let relayWsRef: WebSocket | null = null;
+
+/** Call another agent through the relay. Available to any engine. */
+export function callAgent(target: string, task: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!relayWsRef || relayWsRef.readyState !== WebSocket.OPEN) {
+      reject(new Error("Not connected to relay"));
+      return;
+    }
+    const callId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    pendingAgentCalls.set(callId, resolve);
+
+    relayWsRef.send(JSON.stringify({
+      type: "agent_call",
+      call_id: callId,
+      target,
+      task,
+    }));
+
+    // Timeout after 5 minutes
+    setTimeout(() => {
+      if (pendingAgentCalls.has(callId)) {
+        pendingAgentCalls.delete(callId);
+        reject(new Error(`agent_call to ${target} timed out`));
+      }
+    }, 300_000);
+  });
 }
 
 export function connectRelay(options: RelayClientOptions): void {
@@ -89,6 +125,7 @@ export function connectRelay(options: RelayClientOptions): void {
     ws.on("open", () => {
       console.log(`[relay-ws] Connected. Registering agent "${options.agentName}"...`);
       reconnectDelay = 1000; // reset backoff
+      relayWsRef = ws;
 
       // Send registration message
       const reg: RelayMessage = {
@@ -138,6 +175,14 @@ export function connectRelay(options: RelayClientOptions): void {
           handleControl(ws, msg);
           break;
 
+        case "agent_call":
+          handleIncomingAgentCall(ws, msg, options.localPort);
+          break;
+
+        case "agent_call_result":
+          handleAgentCallResult(msg);
+          break;
+
         default:
           console.log(`[relay-ws] Unknown message type: ${msg.type}`);
       }
@@ -163,6 +208,100 @@ export function connectRelay(options: RelayClientOptions): void {
   }
 
   connect();
+}
+
+function handleIncomingAgentCall(ws: WebSocket, msg: RelayMessage, localPort: number): void {
+  const callId = msg.call_id || "";
+  const caller = msg.caller || "unknown";
+  const task = msg.task || "";
+  console.log(`[agent_call] Incoming from ${caller}: ${task.slice(0, 80)}`);
+
+  // Forward to local MCP as a submit_task call
+  const initBody = JSON.stringify({
+    jsonrpc: "2.0", id: 1,
+    method: "initialize",
+    params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "agent-call", version: "1.0" } },
+  });
+
+  const doRequest = (body: string, sessionId?: string): Promise<{ data: string; sessionId?: string }> => {
+    return new Promise((resolve, reject) => {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+      };
+      if (sessionId) headers["mcp-session-id"] = sessionId;
+
+      const req = http.request({ hostname: "127.0.0.1", port: localPort, path: "/mcp", method: "POST", headers: { ...headers, "Content-Length": Buffer.byteLength(body) } }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c: Buffer) => chunks.push(c));
+        res.on("end", () => {
+          const sid = res.headers["mcp-session-id"] as string | undefined;
+          resolve({ data: Buffer.concat(chunks).toString(), sessionId: sid || sessionId });
+        });
+      });
+      req.on("error", reject);
+      req.write(body);
+      req.end();
+    });
+  };
+
+  // Initialize → call tool → return result
+  doRequest(initBody)
+    .then(({ sessionId: sid }) => {
+      const callBody = JSON.stringify({
+        jsonrpc: "2.0", id: 2,
+        method: "tools/call",
+        params: { name: "submit_task", arguments: { task } },
+      });
+      return doRequest(callBody, sid);
+    })
+    .then(({ data }) => {
+      // Extract text from SSE or JSON response
+      let result = data;
+      try {
+        // Try SSE extraction
+        const lines = data.split("\n");
+        let lastData = "";
+        for (const line of lines) {
+          if (line.startsWith("data: ")) lastData = line.slice(6);
+        }
+        if (lastData) {
+          const parsed = JSON.parse(lastData);
+          const content = parsed?.result?.content;
+          if (content) result = content.map((c: any) => c.text || "").join("\n");
+        } else {
+          const parsed = JSON.parse(data);
+          const content = parsed?.result?.content;
+          if (content) result = content.map((c: any) => c.text || "").join("\n");
+        }
+      } catch { /* use raw */ }
+
+      ws.send(JSON.stringify({
+        type: "agent_call_result",
+        call_id: callId,
+        caller,
+        result,
+      }));
+      console.log(`[agent_call] Replied to ${caller} (${result.length} bytes)`);
+    })
+    .catch((err) => {
+      ws.send(JSON.stringify({
+        type: "agent_call_result",
+        call_id: callId,
+        caller,
+        result: `[error] ${err.message}`,
+      }));
+    });
+}
+
+function handleAgentCallResult(msg: RelayMessage): void {
+  const callId = msg.call_id || "";
+  const resolve = pendingAgentCalls.get(callId);
+  if (resolve) {
+    pendingAgentCalls.delete(callId);
+    resolve(msg.result || "");
+    console.log(`[agent_call] Got result for call_id=${callId.slice(0, 8)} from ${msg.caller}`);
+  }
 }
 
 function handleControl(ws: WebSocket, msg: RelayMessage): void {
