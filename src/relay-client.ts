@@ -35,6 +35,7 @@ export interface RelayClientOptions {
   description?: string;
   isPublic?: boolean;
   engine?: string;
+  tags?: string[];
 }
 
 // Pending agent_call results (callId → resolve function)
@@ -128,7 +129,7 @@ export function connectRelay(options: RelayClientOptions): void {
       relayWsRef = ws;
 
       // Send registration message
-      const reg: RelayMessage = {
+      const reg: Record<string, any> = {
         type: "register",
         name: options.agentName,
         description: options.description || "",
@@ -139,6 +140,9 @@ export function connectRelay(options: RelayClientOptions): void {
           access_token: options.credentials.accessKey,
         },
       };
+      if (options.tags && options.tags.length > 0) {
+        reg.tags = options.tags;
+      }
       ws.send(JSON.stringify(reg));
 
       startHeartbeat();

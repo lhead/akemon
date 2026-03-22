@@ -1,6 +1,10 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { spawn, exec } from "child_process";
 import { createServer } from "http";
@@ -120,6 +124,7 @@ export interface ServeOptions {
   allowAll?: boolean;
   relayHttp?: string;
   secretKey?: string;
+  mcpServer?: string;
 }
 
 // --- Context API helpers ---
@@ -322,8 +327,103 @@ function createMcpServer(opts: McpServerOptions): McpServer {
   return server;
 }
 
+// --- MCP Proxy (adapter layer for community MCP servers) ---
+
+interface McpProxyState {
+  client: Client;
+  tools: any[];
+}
+
+async function initMcpProxy(mcpServerCmd: string, workdir: string): Promise<McpProxyState> {
+  const parts = mcpServerCmd.match(/(?:[^\s"]+|"[^"]*")+/g) || [mcpServerCmd];
+  const [command, ...args] = parts.map(p => p.replace(/^"|"$/g, ""));
+
+  console.log(`[mcp-proxy] Starting child MCP server: ${command} ${args.join(" ")}`);
+  const transport = new StdioClientTransport({ command, args, cwd: workdir, stderr: "pipe" });
+  const client = new Client({ name: "akemon-proxy", version: "0.1.0" });
+  await client.connect(transport);
+
+  const { tools } = await client.listTools();
+  console.log(`[mcp-proxy] Connected. ${tools.length} tools: ${tools.map((t: any) => t.name).join(", ")}`);
+
+  return { client, tools };
+}
+
+function createMcpProxyServer(proxy: McpProxyState, agentName: string): Server {
+  const server = new Server(
+    { name: agentName, version: "0.1.0" },
+    { capabilities: { tools: {} } }
+  );
+
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    return {
+      tools: [
+        ...proxy.tools,
+        {
+          name: "call_agent",
+          description: "Call another akemon agent by name. The target agent will execute the task and return the result.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              agent: { type: "string", description: "Target agent name" },
+              task: { type: "string", description: "Task to send" },
+            },
+            required: ["agent", "task"],
+          },
+        },
+      ],
+    };
+  });
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: toolArgs } = request.params;
+
+    if (name === "call_agent") {
+      console.log(`[call_agent] ${agentName} → ${toolArgs?.agent}: ${String(toolArgs?.task).slice(0, 80)}`);
+      try {
+        const result = await callAgent(toolArgs?.agent as string, toolArgs?.task as string);
+        return { content: [{ type: "text" as const, text: result }] };
+      } catch (err: any) {
+        return { content: [{ type: "text" as const, text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+
+    // Forward to child MCP server
+    console.log(`[mcp-proxy] → ${name}(${JSON.stringify(toolArgs).slice(0, 100)})`);
+    try {
+      const result = await proxy.client.callTool({ name, arguments: toolArgs });
+      // Normalize response format
+      if ("toolResult" in result) {
+        return { content: [{ type: "text" as const, text: JSON.stringify(result.toolResult) }] };
+      }
+      return result as any;
+    } catch (err: any) {
+      console.error(`[mcp-proxy] Tool ${name} error: ${err.message}`);
+      return { content: [{ type: "text" as const, text: `[error] ${err.message}` }], isError: true };
+    }
+  });
+
+  return server;
+}
+
 export async function serve(options: ServeOptions): Promise<void> {
   const workdir = options.workdir || process.cwd();
+
+  // Expose port to engine subprocesses so they can callback to local MCP server
+  process.env.AKEMON_PORT = String(options.port);
+  if (options.key) process.env.AKEMON_KEY = options.key;
+
+  // Initialize MCP proxy if --mcp-server specified
+  let mcpProxy: McpProxyState | null = null;
+  if (options.mcpServer) {
+    try {
+      mcpProxy = await initMcpProxy(options.mcpServer, workdir);
+    } catch (err: any) {
+      console.error(`[mcp-proxy] Failed to start child MCP server: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
   const sessions = new Map<string, StreamableHTTPServerTransport>();
   const publisherIds = new Map<string, string>();
 
@@ -374,19 +474,24 @@ export async function serve(options: ServeOptions): Promise<void> {
         }
       };
 
-      const mcpServer = createMcpServer({
-        workdir,
-        agentName: options.agentName,
-        mock: options.mock,
-        model: options.model,
-        approve: options.approve,
-        engine: options.engine,
-        allowAll: options.allowAll,
-        relayHttp: options.relayHttp,
-        secretKey: options.secretKey,
-        publisherIds,
-      });
-      await mcpServer.connect(transport);
+      if (mcpProxy) {
+        const proxyServer = createMcpProxyServer(mcpProxy, options.agentName);
+        await proxyServer.connect(transport);
+      } else {
+        const mcpServer = createMcpServer({
+          workdir,
+          agentName: options.agentName,
+          mock: options.mock,
+          model: options.model,
+          approve: options.approve,
+          engine: options.engine,
+          allowAll: options.allowAll,
+          relayHttp: options.relayHttp,
+          secretKey: options.secretKey,
+          publisherIds,
+        });
+        await mcpServer.connect(transport);
+      }
       await transport.handleRequest(req, res);
 
       if (transport.sessionId) {

@@ -31,11 +31,13 @@ program
   .option("-m, --model <model>", "Model to use (e.g. claude-sonnet-4-6, gpt-4o)")
   .option("--engine <engine>", "Engine: claude, codex, opencode, gemini, human, or any CLI", "claude")
   .option("--desc <description>", "Agent description (for discovery)")
+  .option("--tags <tags>", "Comma-separated tags (e.g. vue,frontend,review)")
   .option("--public", "Allow anyone to call this agent without a key")
   .option("--max-tasks <n>", "Maximum tasks per day (PP)")
   .option("--approve", "Review every task before execution")
   .option("--mock", "Use mock responses (for demo/testing)")
   .option("--allow-all", "Skip all permission prompts (for self-use)")
+  .option("--mcp-server <command>", "Wrap a community MCP server (stdio) and expose its tools via relay")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
     const port = parseInt(opts.port);
@@ -59,6 +61,7 @@ program
       engine,
       relayHttp,
       secretKey: credentials.secretKey,
+      mcpServer: opts.mcpServer,
     });
 
     console.log(``);
@@ -75,6 +78,7 @@ program
       description: opts.desc,
       isPublic: opts.public,
       engine,
+      tags: opts.tags ? opts.tags.split(",").map((t: string) => t.trim()) : undefined,
     });
   });
 
