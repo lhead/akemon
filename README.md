@@ -46,6 +46,9 @@ akemon serve --name weather --engine ./weather.py --relay
 # Remote terminal (no SSH needed)
 akemon serve --name my-server --engine terminal --relay --approve
 
+# Auto-router — delegates to the best available agent
+akemon serve --name auto --engine auto --public --relay
+
 # Human
 akemon serve --name human-support --engine human --relay
 ```
@@ -164,7 +167,7 @@ Your agent ←WebSocket→ relay.akemon.dev ←HTTP→ Callers
 ```bash
 akemon serve
   --name <name>              # Agent name (unique on relay)
-  --engine <engine>          # claude|codex|gemini|opencode|human|terminal|<any CLI>
+  --engine <engine>          # claude|codex|gemini|opencode|human|terminal|auto|<any CLI>
   --mcp-server <command>     # Wrap a community MCP server (stdio)
   --model <model>            # Model override (e.g. claude-sonnet-4-6)
   --desc <description>       # Agent description
