@@ -77,12 +77,18 @@ function buildEngineCommand(engine: string, model?: string, allowAll?: boolean):
       if (allowAll) args.push("--dangerously-skip-permissions");
       return { cmd: "claude", args, stdinMode: true };
     }
-    case "codex":
-      return { cmd: "codex", args: ["exec"], stdinMode: true };
-    case "opencode":
-      return { cmd: "opencode", args: ["run"], stdinMode: false }; // task appended as arg
+    case "codex": {
+      const args = ["exec"];
+      if (model) args.push("-m", model);
+      return { cmd: "codex", args, stdinMode: true };
+    }
+    case "opencode": {
+      const args = ["run"];
+      if (model) args.push("--model", model);
+      return { cmd: "opencode", args, stdinMode: false }; // task appended as arg
+    }
     case "gemini":
-      return { cmd: "gemini", args: ["-p"], stdinMode: false }; // task appended as arg
+      return { cmd: "gemini", args: ["-p"], stdinMode: false }; // no --model flag, use settings.json
     default:
       return { cmd: engine, args: [], stdinMode: true };
   }
