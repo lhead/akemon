@@ -36,6 +36,7 @@ export interface RelayClientOptions {
   isPublic?: boolean;
   engine?: string;
   tags?: string[];
+  price?: number;
 }
 
 // Pending agent_call results (callId → resolve function)
@@ -142,6 +143,9 @@ export function connectRelay(options: RelayClientOptions): void {
       };
       if (options.tags && options.tags.length > 0) {
         reg.tags = options.tags;
+      }
+      if (options.price && options.price > 0) {
+        reg.price = options.price;
       }
       ws.send(JSON.stringify(reg));
 

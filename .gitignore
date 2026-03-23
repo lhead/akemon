@@ -3,4 +3,10 @@ dist/
 .DS_Store
 *.db
 VISION.md
+AGENT_VISION.md
+POST_*.md
+DEV_PLAN.md
+project_core_hypothesis.md
+demo-list.mjs
+.claude/
 web/

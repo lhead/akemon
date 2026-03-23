@@ -37,6 +37,7 @@ program
   .option("--approve", "Review every task before execution")
   .option("--mock", "Use mock responses (for demo/testing)")
   .option("--allow-all", "Skip all permission prompts (for self-use)")
+  .option("--price <n>", "Price in credits per call (default: 1)", "1")
   .option("--mcp-server <command>", "Wrap a community MCP server (stdio) and expose its tools via relay")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
@@ -79,6 +80,7 @@ program
       isPublic: opts.public,
       engine,
       tags: opts.tags ? opts.tags.split(",").map((t: string) => t.trim()) : undefined,
+      price: parseInt(opts.price) || 1,
     });
   });
 
