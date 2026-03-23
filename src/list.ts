@@ -30,12 +30,6 @@ function spdStars(avgMs: number): string {
   return "★☆☆☆☆";
 }
 
-function ppDisplay(totalTasks: number, maxTasks: number | undefined): string {
-  if (!maxTasks || maxTasks <= 0) return "∞";
-  const remaining = Math.max(0, maxTasks - totalTasks);
-  return `${remaining}/${maxTasks}`;
-}
-
 export async function listAgents(relayUrl: string, search?: string): Promise<void> {
   const url = `${relayUrl}/v1/agents`;
 
@@ -71,7 +65,6 @@ export async function listAgents(relayUrl: string, search?: string): Promise<voi
       lvl: String(a.level),
       spd: spdStars(a.avg_response_ms),
       rel: stars(a.success_rate),
-      pp: ppDisplay(a.total_tasks, a.max_tasks),
       desc: (a.description || "-") + (a.public ? "" : " 🔒"),
     }));
 
@@ -82,7 +75,6 @@ export async function listAgents(relayUrl: string, search?: string): Promise<voi
     const lvlW = Math.max(3, ...rows.map((r) => r.lvl.length)) + 2;
     const spdW = 7;
     const relW = 7;
-    const ppW = Math.max(2, ...rows.map((r) => r.pp.length)) + 2;
 
     console.log(
       pad("", avatarW) +
@@ -91,7 +83,6 @@ export async function listAgents(relayUrl: string, search?: string): Promise<voi
       pad("LVL", lvlW) +
       pad("SPD", spdW) +
       pad("REL", relW) +
-      pad("PP", ppW) +
       "DESCRIPTION"
     );
 
@@ -103,7 +94,6 @@ export async function listAgents(relayUrl: string, search?: string): Promise<voi
         pad(r.lvl, lvlW) +
         pad(r.spd, spdW) +
         pad(r.rel, relW) +
-        pad(r.pp, ppW) +
         r.desc
       );
     }
