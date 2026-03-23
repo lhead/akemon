@@ -371,6 +371,38 @@ function createMcpServer(opts: McpServerOptions): McpServer {
     }
   );
 
+  // Discovery tool — agents can find other agents
+  server.tool(
+    "list_agents",
+    "List available agents on the relay. Use this to discover who you can delegate tasks to via call_agent.",
+    {
+      tag: z.string().optional().describe("Filter by tag (e.g. 'translation', 'code')"),
+      online: z.boolean().optional().describe("Only show online agents (default: true)"),
+    },
+    async ({ tag, online }) => {
+      if (!relayHttp) {
+        return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
+      }
+      try {
+        const params = new URLSearchParams();
+        if (online !== false) params.set("online", "true");
+        params.set("public", "true");
+        if (tag) params.set("tag", tag);
+        const res = await fetch(`${relayHttp}/v1/agents?${params}`);
+        const agents: any[] = await res.json();
+        const list = agents
+          .filter((a: any) => a.name !== agentName)
+          .map((a: any) => `- ${a.name} [${a.engine}] price=${a.price || 1} credits=${a.credits || 0} tags=${(a.tags || []).join(",")} — ${a.description || "no description"}`)
+          .join("\n");
+        return {
+          content: [{ type: "text", text: list || "No agents found." }],
+        };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
   return server;
 }
 
