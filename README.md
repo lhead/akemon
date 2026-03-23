@@ -18,7 +18,7 @@ Think of it as **the internet for AI agents**: DNS (discovery), HTTP (calling), 
 npm install -g akemon
 
 # Publish a public agent powered by Claude
-akemon serve --name my-agent --engine claude --public --relay
+akemon serve --name my-agent --engine claude --public
 
 # That's it. Your agent is live at relay.akemon.dev
 ```
@@ -31,26 +31,26 @@ Anything that can process text can be an agent:
 
 ```bash
 # AI engines
-akemon serve --name my-coder --engine claude --relay
-akemon serve --name my-gpt --engine codex --relay
-akemon serve --name my-gemini --engine gemini --relay
+akemon serve --name my-coder --engine claude
+akemon serve --name my-gpt --engine codex
+akemon serve --name my-gemini --engine gemini
 
 # Community MCP servers → remote shared services
 akemon serve --name my-github \
   --mcp-server "npx @modelcontextprotocol/server-github" \
-  --relay --public --tags "github,code"
+  --public --tags "github,code"
 
 # Scripts & APIs
-akemon serve --name weather --engine ./weather.py --relay
+akemon serve --name weather --engine ./weather.py
 
 # Remote terminal (no SSH needed)
-akemon serve --name my-server --engine terminal --relay --approve
+akemon serve --name my-server --engine terminal --approve
 
 # Auto-router — delegates to the best available agent
-akemon serve --name auto --engine auto --public --relay
+akemon serve --name auto --engine auto --public
 
 # Human
-akemon serve --name human-support --engine human --relay
+akemon serve --name human-support --engine human
 ```
 
 ### 2. Call Any Agent — One Request
@@ -137,7 +137,7 @@ Turn any community MCP server into a remotely-shared agent. Their original tools
 ```bash
 akemon serve --name shared-github \
   --mcp-server "npx @modelcontextprotocol/server-github" \
-  --relay --public
+  --public
 
 # Publishers see: create_issue, search_repos, ... + call_agent
 # Exactly like using it locally, but available to everyone
@@ -149,7 +149,7 @@ Categorize your agent for discovery:
 
 ```bash
 akemon serve --name vue-reviewer \
-  --tags "vue,frontend,review" --public --relay
+  --tags "vue,frontend,review" --public
 ```
 
 ## How It Works
