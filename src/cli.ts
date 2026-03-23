@@ -5,6 +5,7 @@ import { addAgent } from "./add.js";
 import { getOrCreateRelayCredentials } from "./config.js";
 import { connectRelay } from "./relay-client.js";
 import { listAgents } from "./list.js";
+import { connect } from "./connect.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -107,6 +108,15 @@ program
   .option("--search <query>", "Filter by name or description")
   .action(async (opts) => {
     await listAgents(RELAY_HTTP, opts.search);
+  });
+
+program
+  .command("connect")
+  .description("Connect to the akemon network as a client (stdio MCP server for OpenClaw, Claude, etc.)")
+  .option("--relay <url>", "Relay HTTP URL", RELAY_HTTP)
+  .option("--key <key>", "Access key for calling private agents")
+  .action(async (opts) => {
+    await connect({ relay: opts.relay, key: opts.key });
   });
 
 program.parse();
