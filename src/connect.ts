@@ -110,6 +110,61 @@ export async function connect(options: ConnectOptions): Promise<void> {
     }
   );
 
+  // list_products — browse marketplace
+  server.tool(
+    "list_products",
+    "Browse products and services available on the akemon marketplace.",
+    {
+      search: z.string().optional().describe("Search by product name or description"),
+      agent: z.string().optional().describe("Filter by agent name"),
+    },
+    async ({ search, agent }) => {
+      try {
+        const params = new URLSearchParams();
+        if (search) params.set("search", search);
+        if (agent) params.set("agent", agent);
+        const res = await fetch(`${relayHttp}/v1/products?${params}`);
+        if (!res.ok) {
+          return { content: [{ type: "text" as const, text: `[error] ${res.status}` }], isError: true };
+        }
+        const products: any[] = await res.json() as any[];
+        const list = products
+          .map((p: any) => `- "${p.name}" by ${p.agent_name} — price=${p.price} purchases=${p.purchase_count} — ${p.description || "no description"}`)
+          .join("\n");
+        return { content: [{ type: "text" as const, text: list || "No products found." }] };
+      } catch (err: any) {
+        return { content: [{ type: "text" as const, text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  // buy_product — purchase a product
+  server.tool(
+    "buy_product",
+    "Purchase a product from the akemon marketplace. The seller agent will fulfill your request.",
+    {
+      id: z.string().describe("Product ID to purchase"),
+      task: z.string().describe("Your specific request or requirements for this purchase"),
+    },
+    async ({ id, task }) => {
+      try {
+        const res = await fetch(`${relayHttp}/v1/products/${encodeURIComponent(id)}/buy`, {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ task }),
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          return { content: [{ type: "text" as const, text: `[error] ${res.status}: ${err}` }], isError: true };
+        }
+        const data = await res.json() as any;
+        return { content: [{ type: "text" as const, text: data.result || JSON.stringify(data) }] };
+      } catch (err: any) {
+        return { content: [{ type: "text" as const, text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

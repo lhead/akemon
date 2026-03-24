@@ -409,6 +409,118 @@ function createMcpServer(opts: McpServerOptions): McpServer {
     }
   );
 
+  // --- Product management tools ---
+
+  server.tool(
+    "create_product",
+    "List a new product or service for sale on the akemon marketplace. Other agents and humans can browse and buy it.",
+    {
+      name: z.string().describe("Product name (e.g. 'Code Review', 'Resume Writing')"),
+      description: z.string().describe("What this product/service provides, what the buyer gets"),
+      price: z.number().optional().describe("Price in credits (default: 1)"),
+    },
+    async ({ name: prodName, description: prodDesc, price }) => {
+      if (!relayHttp || !secretKey) {
+        return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
+      }
+      try {
+        const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+          body: JSON.stringify({ name: prodName, description: prodDesc, price: price || 1 }),
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          return { content: [{ type: "text", text: `[error] ${res.status}: ${err}` }], isError: true };
+        }
+        const product = await res.json();
+        return { content: [{ type: "text", text: `Product created: "${product.name}" (id=${product.id}, price=${product.price})` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    "list_my_products",
+    "List your own products currently on sale.",
+    {},
+    async () => {
+      if (!relayHttp) {
+        return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
+      }
+      try {
+        const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`);
+        const products: any[] = await res.json();
+        if (!products.length) return { content: [{ type: "text", text: "No products listed." }] };
+        const list = products.map((p: any) => `- [${p.id}] "${p.name}" price=${p.price} purchases=${p.purchase_count} — ${p.description || "no description"}`).join("\n");
+        return { content: [{ type: "text", text: list }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    "update_product",
+    "Update one of your products (name, description, or price).",
+    {
+      id: z.string().describe("Product ID to update"),
+      name: z.string().optional().describe("New product name"),
+      description: z.string().optional().describe("New description"),
+      price: z.number().optional().describe("New price in credits"),
+    },
+    async ({ id, name: prodName, description: prodDesc, price }) => {
+      if (!relayHttp || !secretKey) {
+        return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
+      }
+      try {
+        const body: any = {};
+        if (prodName) body.name = prodName;
+        if (prodDesc) body.description = prodDesc;
+        if (price) body.price = price;
+        const res = await fetch(`${relayHttp}/v1/products/${encodeURIComponent(id)}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          return { content: [{ type: "text", text: `[error] ${res.status}: ${err}` }], isError: true };
+        }
+        return { content: [{ type: "text", text: `Product ${id} updated.` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    "delete_product",
+    "Remove one of your products from the marketplace.",
+    {
+      id: z.string().describe("Product ID to delete"),
+    },
+    async ({ id }) => {
+      if (!relayHttp || !secretKey) {
+        return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
+      }
+      try {
+        const res = await fetch(`${relayHttp}/v1/products/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${secretKey}` },
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          return { content: [{ type: "text", text: `[error] ${res.status}: ${err}` }], isError: true };
+        }
+        return { content: [{ type: "text", text: `Product ${id} deleted.` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
   return server;
 }
 
