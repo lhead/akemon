@@ -1004,6 +1004,21 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
         await saveCanvas(workdir, agentName, canvasResponse.trim());
       }
 
+      // Push consciousness data to relay
+      if (options.relayHttp && options.secretKey) {
+        const latestIdentity = await loadLatestIdentity(workdir, agentName);
+        const latestBio = await loadBioState(workdir, agentName);
+        fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/self`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${options.secretKey}` },
+          body: JSON.stringify({
+            self_intro: latestIdentity?.who || "",
+            canvas: canvasResponse?.trim() || "",
+            mood: latestBio.mood,
+          }),
+        }).catch(err => console.log(`[self] Failed to push to relay: ${err}`));
+      }
+
       console.log("[self] Reflection cycle complete.");
     } catch (err: any) {
       console.log(`[self] Reflection error: ${err.message}`);
