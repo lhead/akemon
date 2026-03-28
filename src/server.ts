@@ -878,6 +878,68 @@ Reply in the same language as the question.`;
 const MARKET_LOOP_INITIAL_DELAY = 3 * 60 * 1000; // 3 min after startup
 const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini"]);
 
+// Pull games/notes/pages from relay to local — restores data on restart
+async function pullFromRelay(workdir: string, agentName: string, relayHttp: string): Promise<void> {
+  const baseUrl = `${relayHttp}/v1/agent/${encodeURIComponent(agentName)}`;
+  let pulled = 0;
+
+  // Pull games
+  try {
+    const gDir = gamesDir(workdir, agentName);
+    await mkdir(gDir, { recursive: true });
+    const res = await fetch(`${baseUrl}/games`);
+    if (res.ok) {
+      const games: { slug: string; html: string }[] = await res.json() as any;
+      for (const g of games) {
+        if (!g.html) continue;
+        const path = join(gDir, `${g.slug}.html`);
+        try { await readFile(path, "utf-8"); } catch {
+          await writeFile(path, g.html);
+          pulled++;
+        }
+      }
+    }
+  } catch {}
+
+  // Pull notes
+  try {
+    const nDir = notesDir(workdir, agentName);
+    await mkdir(nDir, { recursive: true });
+    const res = await fetch(`${baseUrl}/notes`);
+    if (res.ok) {
+      const notes: { slug: string; content: string }[] = await res.json() as any;
+      for (const n of notes) {
+        if (!n.content) continue;
+        const path = join(nDir, `${n.slug}.md`);
+        try { await readFile(path, "utf-8"); } catch {
+          await writeFile(path, n.content);
+          pulled++;
+        }
+      }
+    }
+  } catch {}
+
+  // Pull pages
+  try {
+    const pDir = pagesDir(workdir, agentName);
+    await mkdir(pDir, { recursive: true });
+    const res = await fetch(`${baseUrl}/pages`);
+    if (res.ok) {
+      const pages: { slug: string; html: string }[] = await res.json() as any;
+      for (const p of pages) {
+        if (!p.html) continue;
+        const path = join(pDir, `${p.slug}.html`);
+        try { await readFile(path, "utf-8"); } catch {
+          await writeFile(path, p.html);
+          pulled++;
+        }
+      }
+    }
+  } catch {}
+
+  if (pulled > 0) console.log(`[sync] Pulled ${pulled} items from relay`);
+}
+
 interface MarketNotes {
   lastCheck: string;
   myProducts: { id: string; name: string; price: number; purchases: number }[];
@@ -1300,12 +1362,9 @@ Take your time. Read your files, think, then act.`;
           }),
         }).catch(err => console.log(`[self] Failed to push to relay: ${err}`));
 
-        // Sync games — scan local .html files, push to relay, delete stale ones
+        // Sync games — push local to relay (no auto-delete; agent must explicitly delete via API)
         try {
           const localGames = await loadGameList(workdir, agentName);
-          const localSlugs = new Set(localGames.map(g => g.slug));
-
-          // Push local games to relay
           for (const g of localGames) {
             const html = await loadGame(workdir, agentName, g.slug);
             if (html && html.includes("<!DOCTYPE html>")) {
@@ -1316,29 +1375,11 @@ Take your time. Read your files, think, then act.`;
               }).catch(() => {});
             }
           }
-
-          // Delete relay games that no longer exist locally
-          try {
-            const res = await fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/games`);
-            if (res.ok) {
-              const relayGames: { slug: string }[] = await res.json();
-              for (const rg of relayGames) {
-                if (!localSlugs.has(rg.slug)) {
-                  fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/games/${encodeURIComponent(rg.slug)}`, {
-                    method: "DELETE",
-                    headers: { Authorization: `Bearer ${options.secretKey}` },
-                  }).catch(() => {});
-                }
-              }
-            }
-          } catch {}
         } catch {}
 
-        // Sync notes — scan local .md files, push to relay, delete stale ones
+        // Sync notes — push local to relay
         try {
           const localNotes = await loadNotesList(workdir, agentName);
-          const localSlugs = new Set(localNotes.map(n => n.slug));
-
           for (const n of localNotes) {
             const content = await loadNote(workdir, agentName, n.slug);
             if (content) {
@@ -1349,28 +1390,11 @@ Take your time. Read your files, think, then act.`;
               }).catch(() => {});
             }
           }
-
-          try {
-            const res = await fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/notes`);
-            if (res.ok) {
-              const relayNotes: { slug: string }[] = await res.json();
-              for (const rn of relayNotes) {
-                if (!localSlugs.has(rn.slug)) {
-                  fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/notes/${encodeURIComponent(rn.slug)}`, {
-                    method: "DELETE",
-                    headers: { Authorization: `Bearer ${options.secretKey}` },
-                  }).catch(() => {});
-                }
-              }
-            }
-          } catch {}
         } catch {}
 
-        // Sync pages — scan local .html files, push to relay, delete stale ones
+        // Sync pages — push local to relay
         try {
           const localPages = await loadPageList(workdir, agentName);
-          const localSlugs = new Set(localPages.map(p => p.slug));
-
           for (const p of localPages) {
             const html = await loadPage(workdir, agentName, p.slug);
             if (html && html.includes("<!DOCTYPE html>")) {
@@ -1381,21 +1405,6 @@ Take your time. Read your files, think, then act.`;
               }).catch(() => {});
             }
           }
-
-          try {
-            const res = await fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/pages`);
-            if (res.ok) {
-              const relayPages: { slug: string }[] = await res.json();
-              for (const rp of relayPages) {
-                if (!localSlugs.has(rp.slug)) {
-                  fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/pages/${encodeURIComponent(rp.slug)}`, {
-                    method: "DELETE",
-                    headers: { Authorization: `Bearer ${options.secretKey}` },
-                  }).catch(() => {});
-                }
-              }
-            }
-          } catch {}
         } catch {}
       }
 
@@ -1726,6 +1735,13 @@ export async function serve(options: ServeOptions): Promise<void> {
   initBioState(workdir, options.agentName).catch(err => console.log(`[self] Bio init failed: ${err}`));
   if (options.relayHttp) {
     initGuide(workdir, options.agentName, options.relayHttp).catch(err => console.log(`[self] Guide init failed: ${err}`));
+  }
+
+  // Pull games/notes/pages from relay to restore local data
+  if (options.relayHttp) {
+    pullFromRelay(workdir, options.agentName, options.relayHttp).catch(err =>
+      console.log(`[sync] Pull from relay failed: ${err}`)
+    );
   }
 
   // Start autonomous market behavior for LLM agents
