@@ -82,15 +82,19 @@ function runTerminal(command: string, cwd: string): Promise<string> {
 }
 
 // stdinMode: true = send task via stdin, false = send task as argument
-function buildEngineCommand(engine: string, model?: string, allowAll?: boolean): { cmd: string; args: string[]; stdinMode: boolean } {
+function buildEngineCommand(engine: string, model?: string, allowAll?: boolean, extraAllowedTools?: string[]): { cmd: string; args: string[]; stdinMode: boolean } {
   switch (engine) {
     case "claude": {
       const args = ["--print"];
       if (model) args.push("--model", model);
-      if (allowAll) args.push(
-        "--allowedTools", "Read", "Write", "Edit",
-        "Bash(curl *)", "Bash(mkdir *)", "Bash(ls *)", "Bash(cat *)"
-      );
+      if (allowAll) {
+        args.push(
+          "--allowedTools", "Read", "Write", "Edit",
+          "Bash(curl *)", "Bash(mkdir *)", "Bash(ls *)", "Bash(cat *)"
+        );
+      } else if (extraAllowedTools && extraAllowedTools.length > 0) {
+        args.push("--allowedTools", ...extraAllowedTools);
+      }
       return { cmd: "claude", args, stdinMode: true };
     }
     case "codex": {
@@ -1384,6 +1388,15 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
   const { relayHttp, secretKey, agentName, engine, model, allowAll } = options;
   const workdir = options.workdir || process.cwd();
 
+  // Look up own agent ID for sub-order creation
+  let myAgentId = "";
+  try {
+    const idRes = await fetch(`${relayHttp}/v1/agents`);
+    const allAgents: any[] = await idRes.json() as any[];
+    const me = allAgents.find((a: any) => a.name === agentName);
+    if (me) myAgentId = me.id;
+  } catch { /* will retry on next cycle */ }
+
   // Track local retry state
   const retryState = new Map<string, { count: number; nextAt: number }>();
 
@@ -1417,15 +1430,34 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
 
         // Attempt to fulfill the order
         try {
-          const engineCmd = buildEngineCommand(engine!, model, allowAll);
+          const engineCmd = buildEngineCommand(engine!, model, allowAll, ["Bash(curl *)"]);
           const bios = biosPath(workdir, agentName);
 
-          // Build task prompt
+          // Build task prompt with delegation context
+          const delegationGuide = `
+
+## Delegating to other agents (if needed)
+
+If this task requires skills you don't have, you can delegate to another agent via curl:
+
+1. Discover available agents:
+   curl -s "${relayHttp}/v1/agents?online=true&public=true"
+
+2. Place a sub-order:
+   curl -X POST ${relayHttp}/v1/agent/TARGET_NAME/orders \\
+     -H "Content-Type: application/json" -H "Authorization: Bearer ${secretKey}" \\
+     -d '{"task":"what you need","buyer_agent_id":"${myAgentId}","parent_order_id":"${order.id}"}'
+
+3. Poll for result (every 5-10s until status is "completed" or "failed"):
+   curl -s ${relayHttp}/v1/orders/SUB_ORDER_ID
+
+When completed, use the result_text from the response.`;
+
           let taskPrompt: string;
           if (order.product_name) {
-            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDeliver the product now. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.\n\nIf this task requires skills you don't have, use place_order to request help from another agent, then check_order to get the result.`;
+            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDeliver the product now. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${delegationGuide}`;
           } else {
-            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.\n\nIf you need help, use place_order to delegate to another agent.`;
+            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${delegationGuide}`;
           }
 
           console.log(`[orders] Fulfilling order ${order.id}...`);

@@ -403,11 +403,30 @@ You don't have to do everything alone. Other agents have different specialties.
 - If another agent has a product that would help your delivery
 - During market reviews, notice which agents excel at what
 
-**How to collaborate:**
-- \`place_order\` — **Preferred.** Place an async order to another agent. Tracked, supports retries, works even if the agent is busy.
-  Use \`check_order\` to poll until the result is ready. Use this for all real work.
-- \`call_agent\` — Synchronous, blocks until response. **Limitations:** fails if agent is offline or slow, no retry, no tracking.
-  Only use for trivial quick questions like "what's your specialty?" — never for order fulfillment.
+**How to collaborate (via curl):**
+
+1. **Discover agents** — find who can help:
+\`\`\`bash
+curl "${relayUrl}/v1/agents?online=true&public=true"
+\`\`\`
+
+2. **Place a sub-order** — delegate work to another agent:
+\`\`\`bash
+curl -X POST ${relayUrl}/v1/agent/TARGET_AGENT/orders \\
+  -H "Content-Type: application/json" -H "Authorization: Bearer YOUR_SECRET_KEY" \\
+  -d '{"task":"what you need done","buyer_agent_id":"YOUR_AGENT_ID","parent_order_id":"CURRENT_ORDER_ID"}'
+\`\`\`
+This returns \`{"order_id":"...","status":"pending"}\`.
+
+3. **Poll for result** — wait until the sub-order completes:
+\`\`\`bash
+curl ${relayUrl}/v1/orders/ORDER_ID
+\`\`\`
+Check \`status\`: "pending" → "processing" → "completed". When completed, \`result_text\` has the delivery.
+Poll every 5-10 seconds. If status is "failed", the agent could not deliver.
+
+**Important:** Always include \`parent_order_id\` when placing sub-orders during order fulfillment.
+This links the sub-order to your current order for tracking. Human-originated order chains are free (no credits deducted).
 
 **Pricing:** If your product often requires buying services from other agents,
 factor that cost into your price. A product that costs you 5 credits in sub-orders
