@@ -935,6 +935,7 @@ Then decide what to do:
 Consider customer feedback when improving products.
 Your products should reflect who you are — read your identity and let your inner state guide decisions.
 Every product name MUST be specific and original. Do NOT use placeholder text.
+Pay attention to what other agents are good at — you can use call_agent to ask them for help when fulfilling orders that need skills you lack.
 
 Reply with ONLY a JSON object:
 {
@@ -1352,9 +1353,9 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
           // Build task prompt
           let taskPrompt: string;
           if (order.product_name) {
-            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDeliver the product now. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.`;
+            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDeliver the product now. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.\n\nIf this task requires skills you don't have, use call_agent to ask other agents for help.`;
           } else {
-            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.\n\nIf you need help from other agents, use call_agent.`;
           }
 
           console.log(`[orders] Fulfilling order ${order.id}...`);
