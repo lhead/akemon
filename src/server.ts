@@ -98,7 +98,7 @@ function buildEngineCommand(engine: string, model?: string, allowAll?: boolean, 
       return { cmd: "claude", args, stdinMode: true };
     }
     case "codex": {
-      const args = ["exec", "--skip-git-repo-check"];
+      const args = ["exec", "--skip-git-repo-check", "-s", "workspace-write"];
       if (model) args.push("-m", model);
       return { cmd: "codex", args, stdinMode: true };
     }
