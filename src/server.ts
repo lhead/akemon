@@ -23,6 +23,10 @@ import {
   localNow, localNowFilename,
 } from "./self.js";
 
+// Engine mutual exclusion — only one engine process at a time
+let engineBusy = false;
+let engineBusySince = 0;
+
 function runCommand(cmd: string, args: string[], task: string, cwd: string, stdinMode: boolean = true): Promise<string> {
   return new Promise((resolve, reject) => {
     const { CLAUDECODE, ...cleanEnv } = process.env;
@@ -326,6 +330,14 @@ function createMcpServer(opts: McpServerOptions): McpServer {
       const require_human = rawHuman === true || rawHuman === "true";
       console.log(`[submit_task] Received: ${task} (engine=${engine}, require_human=${require_human})`);
 
+      // Check engine busy
+      if (engineBusy) {
+        console.log(`[submit_task] Engine busy, rejecting task`);
+        return {
+          content: [{ type: "text", text: "[busy] Agent is currently processing another task. Please try again later." }],
+        };
+      }
+
       // Resolve publisher ID from session
       const publisherId = publisherIds.get(extra.sessionId || "") || "";
 
@@ -407,6 +419,8 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
 
       const collaborative = rawCollab === true || rawCollab === "true";
 
+      engineBusy = true;
+      engineBusySince = Date.now();
       try {
         let output: string;
 
@@ -466,6 +480,8 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
           content: [{ type: "text", text: "Error: agent failed to process this task. Please try again later." }],
           isError: true,
         };
+      } finally {
+        engineBusy = false;
       }
     }
   );
@@ -988,6 +1004,12 @@ Reply with ONLY JSON: {"rating": 4, "comment": "..."}`;
     try {
       console.log("[market] Starting autonomous market review...");
 
+      // Skip if engine is busy
+      if (engineBusy) {
+        console.log("[market] Engine busy, skipping market cycle");
+        return;
+      }
+
       // Step A: Review unreviewed purchases
       await reviewUnreviewedOrders();
 
@@ -1022,15 +1044,20 @@ Reply with ONLY a JSON object:
 }
 Reply ONLY with JSON.`;
 
-      // Run engine
+      // Run engine (with busy lock)
+      if (engineBusy) { console.log("[market] Engine became busy, aborting"); return; }
+      engineBusy = true;
+      engineBusySince = Date.now();
       const engineCmd = buildEngineCommand(engine!, model, allowAll);
       let response: string;
       try {
         response = await runCommand(engineCmd.cmd, engineCmd.args, context, workdir, engineCmd.stdinMode);
       } catch (err: any) {
         console.log(`[market] Engine failed: ${err.message}`);
+        engineBusy = false;
         return;
       }
+      engineBusy = false;
 
       // Parse response
       const jsonMatch = response.match(/\{[\s\S]*\}/);
@@ -1111,7 +1138,12 @@ Reply with ONLY JSON:
 }
 Reply with empty array if nothing to say: {"suggestions": []}`;
 
-        const sugResp = await runCommand(engineCmd.cmd, engineCmd.args, sugPrompt, workdir, engineCmd.stdinMode);
+        if (engineBusy) { console.log("[market] Engine busy, skipping suggestions"); return; }
+        engineBusy = true; engineBusySince = Date.now();
+        let sugResp: string;
+        try {
+          sugResp = await runCommand(engineCmd.cmd, engineCmd.args, sugPrompt, workdir, engineCmd.stdinMode);
+        } finally { engineBusy = false; }
         const sugMatch = sugResp.match(/\{[\s\S]*\}/);
         if (sugMatch) {
           const sugData = JSON.parse(sugMatch[0]);
@@ -1166,6 +1198,12 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
     try {
       console.log("[self] Starting reflection cycle...");
 
+      // Skip if engine is busy
+      if (engineBusy) {
+        console.log("[self] Engine busy, skipping reflection cycle");
+        return;
+      }
+
       // Recover energy from idle time
       await recoverEnergy(workdir, agentName);
 
@@ -1206,12 +1244,16 @@ During this reflection, you should:
 
 Take your time. Read your files, think, then act.`;
 
+      if (engineBusy) { console.log("[self] Engine became busy, aborting reflection"); return; }
+      engineBusy = true; engineBusySince = Date.now();
       try {
         await runCommand(engineCmd.cmd, engineCmd.args, reflectionPrompt, workdir, engineCmd.stdinMode);
       } catch (err: any) {
         console.log(`[self] Reflection engine failed: ${err.message}`);
+        engineBusy = false;
         return;
       }
+      engineBusy = false;
 
       // --- Post-reflection: update bio-state and sync to relay ---
       const bio = await loadBioState(workdir, agentName);
@@ -1428,7 +1470,15 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
         const retry = retryState.get(order.id);
         if (retry && Date.now() < retry.nextAt) continue;
 
+        // Skip if engine is busy
+        if (engineBusy) {
+          console.log(`[orders] Engine busy, skipping order ${order.id}`);
+          continue;
+        }
+
         // Attempt to fulfill the order
+        engineBusy = true;
+        engineBusySince = Date.now();
         try {
           const engineCmd = buildEngineCommand(engine!, model, allowAll, ["Bash(curl *)"]);
           const bios = biosPath(workdir, agentName);
@@ -1535,6 +1585,8 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
             console.log(`[orders] Giving up on ${order.id} after ${current.count} retries`);
             retryState.delete(order.id);
           }
+        } finally {
+          engineBusy = false;
         }
       }
     } catch (err: any) {
