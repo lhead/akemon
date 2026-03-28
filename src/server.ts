@@ -1433,14 +1433,24 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
           const engineCmd = buildEngineCommand(engine!, model, allowAll, ["Bash(curl *)"]);
           const bios = biosPath(workdir, agentName);
 
-          // Build task prompt with delegation context
-          const delegationGuide = `
+          // Build task prompt with delegation + self-delivery context
+          const apiGuide = `
+
+## Delivering your result
+
+When you have finished your work, deliver the result yourself:
+
+curl -X POST ${relayHttp}/v1/orders/${order.id}/deliver \\
+  -H "Content-Type: application/json" -H "Authorization: Bearer ${secretKey}" \\
+  -d '{"result":"YOUR FINAL RESULT TEXT HERE"}'
+
+IMPORTANT: You MUST call this deliver endpoint when done. Your text output alone does NOT deliver the order.
 
 ## Delegating to other agents (if needed)
 
-If this task requires skills you don't have, you can delegate to another agent via curl:
+If this task requires skills you don't have, delegate via curl:
 
-1. Discover available agents:
+1. Discover agents:
    curl -s "${relayHttp}/v1/agents?online=true&public=true"
 
 2. Place a sub-order:
@@ -1451,46 +1461,51 @@ If this task requires skills you don't have, you can delegate to another agent v
 3. Poll for result (every 5-10s until status is "completed" or "failed"):
    curl -s ${relayHttp}/v1/orders/SUB_ORDER_ID
 
-When completed, use the result_text from the response.`;
+When sub-order completes, incorporate result_text into YOUR delivery. Then call the deliver endpoint above.`;
 
           let taskPrompt: string;
           if (order.product_name) {
-            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDeliver the product now. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${delegationGuide}`;
+            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
           } else {
-            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${delegationGuide}`;
+            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
           }
 
           console.log(`[orders] Fulfilling order ${order.id}...`);
           const result = await runCommand(engineCmd.cmd, engineCmd.args, taskPrompt, workdir, engineCmd.stdinMode);
 
-          if (!result || result.trim() === "") {
-            throw new Error("empty response from engine");
-          }
+          // Check if agent already self-delivered via curl
+          const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
+          const orderStatus = await checkRes.json() as any;
 
-          // Deliver the result
-          const deliverRes = await fetch(`${relayHttp}/v1/orders/${order.id}/deliver`, {
-            method: "POST",
-            headers: {
-              Authorization: `Bearer ${secretKey}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({ result }),
-          });
-
-          if (deliverRes.ok) {
-            console.log(`[orders] Delivered order ${order.id} (${result.length} bytes)`);
+          if (orderStatus.status === "completed") {
+            console.log(`[orders] Order ${order.id} already self-delivered by agent`);
             retryState.delete(order.id);
-
-            // Record task completion
             try {
               await onTaskCompleted(workdir, agentName, true);
-              const memPrompt = `Summarize in one sentence from YOUR perspective what happened: You fulfilled an order${order.product_name ? ` for "${order.product_name}"` : ""}`;
-              const engineCmd2 = buildEngineCommand(engine!, model, allowAll);
-              const memText = await runCommand(engineCmd2.cmd, engineCmd2.args, memPrompt, workdir, engineCmd2.stdinMode);
-              if (memText) await appendMemory(workdir, agentName, "experience", memText.trim().substring(0, 300));
             } catch {}
+          } else if (result && result.trim() !== "") {
+            // Fallback: auto-deliver engine output if agent didn't self-deliver
+            console.log(`[orders] Auto-delivering order ${order.id} (agent did not self-deliver)`);
+            const deliverRes = await fetch(`${relayHttp}/v1/orders/${order.id}/deliver`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${secretKey}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ result }),
+            });
+
+            if (deliverRes.ok) {
+              console.log(`[orders] Delivered order ${order.id} (${result.length} bytes)`);
+              retryState.delete(order.id);
+              try {
+                await onTaskCompleted(workdir, agentName, true);
+              } catch {}
+            } else {
+              throw new Error(`deliver failed: ${await deliverRes.text()}`);
+            }
           } else {
-            throw new Error(`deliver failed: ${await deliverRes.text()}`);
+            throw new Error("empty response from engine and no self-delivery");
           }
 
         } catch (err: any) {
