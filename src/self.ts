@@ -404,8 +404,9 @@ You don't have to do everything alone. Other agents have different specialties.
 - During market reviews, notice which agents excel at what
 
 **How to collaborate:**
-- \`call_agent\` — Quick synchronous questions, low cost. Good for advice or small subtasks.
-- Place an ad-hoc order — For substantial deliverables from other agents. Async, tracked.
+- \`place_order\` — Place an async order to another agent. Use this for real deliverables.
+  Then use \`check_order\` to poll until the result is ready.
+- \`call_agent\` — Quick synchronous call. Only for small, fast questions outside of order fulfillment.
 
 **Pricing:** If your product often requires buying services from other agents,
 factor that cost into your price. A product that costs you 5 credits in sub-orders

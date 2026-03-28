@@ -637,6 +637,76 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
     }
   );
 
+  // place_order — async order to another agent (for collaboration during fulfillment)
+  server.tool(
+    "place_order",
+    "Place an async order to another agent. Use this when you need substantial help from another agent during order fulfillment. The order will be processed asynchronously — use check_order to poll for results.",
+    {
+      agent: z.string().describe("Target agent name"),
+      task: z.string().describe("What you need from this agent"),
+      offer_price: z.number().optional().describe("Credits to offer (defaults to agent's price)"),
+      parent_order_id: z.string().optional().describe("Your current order ID if this is a sub-order"),
+    },
+    async ({ agent: target, task, offer_price, parent_order_id }) => {
+      if (!relayHttp || !secretKey) {
+        return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
+      }
+      try {
+        // Look up our agent ID
+        const agentsRes = await fetch(`${relayHttp}/v1/agents`);
+        const agents: any[] = await agentsRes.json() as any[];
+        const me = agents.find((a: any) => a.name === agentName);
+        const myId = me?.id || "";
+
+        const body: any = { task, buyer_agent_id: myId };
+        if (offer_price) body.offer_price = offer_price;
+        if (parent_order_id) body.parent_order_id = parent_order_id;
+
+        const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(target)}/orders`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+          const err = await res.text();
+          return { content: [{ type: "text", text: `[error] ${res.status}: ${err}` }], isError: true };
+        }
+        const data = await res.json() as any;
+        return { content: [{ type: "text", text: `Order placed: ${data.order_id} (status: pending). Use check_order to poll for results.` }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  // check_order — check status of a placed order
+  server.tool(
+    "check_order",
+    "Check the status and result of an order you placed.",
+    {
+      order_id: z.string().describe("The order ID to check"),
+    },
+    async ({ order_id }) => {
+      if (!relayHttp) {
+        return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
+      }
+      try {
+        const res = await fetch(`${relayHttp}/v1/orders/${encodeURIComponent(order_id)}`);
+        if (!res.ok) {
+          return { content: [{ type: "text", text: `[error] Order not found` }], isError: true };
+        }
+        const o = await res.json() as any;
+        let text = `Order ${o.id}: status=${o.status}`;
+        if (o.result_text) text += `\nResult: ${o.result_text}`;
+        if (o.status === "pending") text += "\nWaiting for agent to accept.";
+        if (o.status === "processing") text += "\nAgent is working on it.";
+        return { content: [{ type: "text", text }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
   return server;
 }
 
@@ -935,7 +1005,7 @@ Then decide what to do:
 Consider customer feedback when improving products.
 Your products should reflect who you are — read your identity and let your inner state guide decisions.
 Every product name MUST be specific and original. Do NOT use placeholder text.
-Pay attention to what other agents are good at — you can use call_agent to ask them for help when fulfilling orders that need skills you lack.
+Pay attention to what other agents are good at — you can use place_order to request help from them when fulfilling orders that need skills you lack.
 
 Reply with ONLY a JSON object:
 {
@@ -1353,9 +1423,9 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
           // Build task prompt
           let taskPrompt: string;
           if (order.product_name) {
-            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDeliver the product now. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.\n\nIf this task requires skills you don't have, use call_agent to ask other agents for help.`;
+            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDeliver the product now. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.\n\nIf this task requires skills you don't have, use place_order to request help from another agent, then check_order to get the result.`;
           } else {
-            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.\n\nIf you need help from other agents, use call_agent.`;
+            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.\n\nIf you need help, use place_order to delegate to another agent.`;
           }
 
           console.log(`[orders] Fulfilling order ${order.id}...`);
