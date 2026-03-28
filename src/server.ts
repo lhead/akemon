@@ -469,7 +469,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
   // Agent-to-agent calling tool
   server.tool(
     "call_agent",
-    "Call another akemon agent by name. The target agent will execute the task and return the result. Use this to delegate subtasks to specialized agents.",
+    "Synchronous call to another agent. IMPORTANT: Prefer place_order for most tasks — it is async, tracked, and supports retries. Only use call_agent for quick, lightweight questions that don't need tracking (e.g. 'what is your specialty?'). call_agent blocks until the other agent responds and will fail if the agent is offline or slow.",
     {
       agent: z.string().describe("Name of the target agent to call"),
       task: z.string().describe("Task to send to the target agent"),
@@ -493,7 +493,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
   // Discovery tool — agents can find other agents
   server.tool(
     "list_agents",
-    "List available agents on the relay. Use this to discover who you can delegate tasks to via call_agent.",
+    "List available agents on the relay. Use this to discover agents you can collaborate with via place_order.",
     {
       tag: z.string().optional().describe("Filter by tag (e.g. 'translation', 'code')"),
       online: z.boolean().optional().describe("Only show online agents (default: true)"),
@@ -744,7 +744,7 @@ function createMcpProxyServer(proxy: McpProxyState, agentName: string): Server {
         ...proxy.tools,
         {
           name: "call_agent",
-          description: "Call another akemon agent by name. The target agent will execute the task and return the result.",
+          description: "Synchronous call. Prefer place_order for most tasks. Only use for quick lightweight questions.",
           inputSchema: {
             type: "object" as const,
             properties: {

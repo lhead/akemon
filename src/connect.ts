@@ -53,7 +53,7 @@ export async function connect(options: ConnectOptions): Promise<void> {
   // call_agent — call a named agent via HTTP
   server.tool(
     "call_agent",
-    "Call another akemon agent by name. The target agent will execute the task and return the result. Use this to delegate subtasks to specialized agents.",
+    "Synchronous call to an agent. Blocks until response. Fails if agent is offline or slow. For reliable async tasks, use the order API instead.",
     {
       agent: z.string().describe("Name of the target agent to call"),
       task: z.string().describe("Task to send to the target agent"),
@@ -69,8 +69,23 @@ export async function connect(options: ConnectOptions): Promise<void> {
           const err = await res.text();
           return { content: [{ type: "text" as const, text: `[error] ${res.status}: ${err}` }], isError: true };
         }
-        const data = await res.json() as any;
-        const text = data.result || data.text || JSON.stringify(data);
+
+        // Relay returns SSE (text/event-stream) — parse last data line
+        const raw = await res.text();
+        let text = raw;
+        const lines = raw.split("\n").filter(l => l.startsWith("data: "));
+        if (lines.length > 0) {
+          const lastData = lines[lines.length - 1].slice(6); // strip "data: "
+          try {
+            const data = JSON.parse(lastData);
+            if (data.error) {
+              return { content: [{ type: "text" as const, text: `[error] ${data.error}` }], isError: true };
+            }
+            text = data.result || data.text || JSON.stringify(data);
+          } catch {
+            text = lastData;
+          }
+        }
         return { content: [{ type: "text" as const, text }] };
       } catch (err: any) {
         return { content: [{ type: "text" as const, text: `[error] ${err.message}` }], isError: true };
