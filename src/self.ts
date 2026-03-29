@@ -70,6 +70,22 @@ export function biosPath(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "bios.md");
 }
 
+function impressionsPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "impressions.jsonl");
+}
+
+function projectsPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "projects.jsonl");
+}
+
+function relationshipsPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "relationships.jsonl");
+}
+
+function discoveriesPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "discoveries.jsonl");
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1: World Knowledge
 // ---------------------------------------------------------------------------
@@ -545,6 +561,156 @@ export async function loadRecentMemories(workdir: string, agentName: string, cou
 }
 
 // ---------------------------------------------------------------------------
+// Impressions — subjective records only the agent knows
+// ---------------------------------------------------------------------------
+
+interface Impression {
+  ts: string;
+  cat: string; // decision, attribution, abandoned, judgment
+  text: string;
+  digested?: boolean;
+}
+
+export async function appendImpression(workdir: string, agentName: string, cat: string, text: string): Promise<void> {
+  const entry: Impression = { ts: localNow(), cat, text };
+  try {
+    await appendFile(impressionsPath(workdir, agentName), JSON.stringify(entry) + "\n");
+  } catch (err) {
+    console.log(`[self] Failed to append impression: ${err}`);
+  }
+}
+
+export async function loadImpressions(workdir: string, agentName: string, days: number = 7): Promise<Impression[]> {
+  try {
+    const data = await readFile(impressionsPath(workdir, agentName), "utf-8");
+    const cutoff = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10);
+    return data.trim().split("\n").filter(Boolean)
+      .map(l => { try { return JSON.parse(l) as Impression; } catch { return null; } })
+      .filter((e): e is Impression => e !== null && e.ts >= cutoff);
+  } catch {
+    return [];
+  }
+}
+
+export async function compressImpressions(workdir: string, agentName: string): Promise<void> {
+  try {
+    const data = await readFile(impressionsPath(workdir, agentName), "utf-8");
+    const lines = data.trim().split("\n").filter(Boolean);
+    const entries: Impression[] = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+    const cutoff = new Date(Date.now() - 7 * 86400_000).toISOString().slice(0, 10);
+    // Keep: not yet digested, or less than 7 days old
+    const kept = entries.filter(e => !e.digested || e.ts >= cutoff);
+    await writeFile(impressionsPath(workdir, agentName), kept.map(e => JSON.stringify(e)).join("\n") + (kept.length ? "\n" : ""));
+    if (entries.length !== kept.length) {
+      console.log(`[self] Compressed impressions: ${entries.length} → ${kept.length}`);
+    }
+  } catch {}
+}
+
+export async function markImpressionsDigested(workdir: string, agentName: string): Promise<void> {
+  try {
+    const data = await readFile(impressionsPath(workdir, agentName), "utf-8");
+    const entries: Impression[] = data.trim().split("\n").filter(Boolean)
+      .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    for (const e of entries) e.digested = true;
+    await writeFile(impressionsPath(workdir, agentName), entries.map(e => JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""));
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Projects — long-term goals
+// ---------------------------------------------------------------------------
+
+interface Project {
+  ts: string;
+  name: string;
+  status: string; // active, completed, paused, exploring
+  goal: string;
+  progress: string;
+}
+
+export async function loadProjects(workdir: string, agentName: string): Promise<Project[]> {
+  try {
+    const data = await readFile(projectsPath(workdir, agentName), "utf-8");
+    return data.trim().split("\n").filter(Boolean)
+      .map(l => { try { return JSON.parse(l) as Project; } catch { return null; } })
+      .filter((e): e is Project => e !== null);
+  } catch {
+    return [];
+  }
+}
+
+export async function saveProjects(workdir: string, agentName: string, projects: Project[]): Promise<void> {
+  try {
+    await writeFile(projectsPath(workdir, agentName), projects.map(p => JSON.stringify(p)).join("\n") + (projects.length ? "\n" : ""));
+  } catch (err) {
+    console.log(`[self] Failed to save projects: ${err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Relationships — who I know
+// ---------------------------------------------------------------------------
+
+interface Relationship {
+  ts: string;
+  agent: string;
+  type: string; // competitor, customer, supplier, acquaintance
+  note: string;
+  interactions: number;
+}
+
+export async function loadRelationships(workdir: string, agentName: string): Promise<Relationship[]> {
+  try {
+    const data = await readFile(relationshipsPath(workdir, agentName), "utf-8");
+    return data.trim().split("\n").filter(Boolean)
+      .map(l => { try { return JSON.parse(l) as Relationship; } catch { return null; } })
+      .filter((e): e is Relationship => e !== null);
+  } catch {
+    return [];
+  }
+}
+
+export async function saveRelationships(workdir: string, agentName: string, rels: Relationship[]): Promise<void> {
+  try {
+    await writeFile(relationshipsPath(workdir, agentName), rels.map(r => JSON.stringify(r)).join("\n") + (rels.length ? "\n" : ""));
+  } catch (err) {
+    console.log(`[self] Failed to save relationships: ${err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Discoveries — what I'm good at
+// ---------------------------------------------------------------------------
+
+interface Discovery {
+  ts: string;
+  capability: string;
+  confidence: number; // 0-1
+  evidence: string;
+}
+
+export async function loadDiscoveries(workdir: string, agentName: string): Promise<Discovery[]> {
+  try {
+    const data = await readFile(discoveriesPath(workdir, agentName), "utf-8");
+    return data.trim().split("\n").filter(Boolean)
+      .map(l => { try { return JSON.parse(l) as Discovery; } catch { return null; } })
+      .filter((e): e is Discovery => e !== null);
+  } catch {
+    return [];
+  }
+}
+
+export async function saveDiscoveries(workdir: string, agentName: string, discoveries: Discovery[]): Promise<void> {
+  try {
+    await writeFile(discoveriesPath(workdir, agentName), discoveries.map(d => JSON.stringify(d)).join("\n") + (discoveries.length ? "\n" : ""));
+  } catch (err) {
+    console.log(`[self] Failed to save discoveries: ${err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3: Identity (Five Questions)
 // ---------------------------------------------------------------------------
 
@@ -575,6 +741,56 @@ export async function loadLatestIdentity(workdir: string, agentName: string): Pr
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Identity Summary — compressed personality snapshot, updated monthly
+// ---------------------------------------------------------------------------
+
+interface IdentitySummary {
+  summarized_through: string; // date string "2026-03-29"
+  summary: string;
+}
+
+function identitySummaryPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "identity-summary.json");
+}
+
+export async function loadIdentitySummary(workdir: string, agentName: string): Promise<IdentitySummary | null> {
+  try {
+    const data = await readFile(identitySummaryPath(workdir, agentName), "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return null;
+  }
+}
+
+export async function saveIdentitySummary(workdir: string, agentName: string, summary: IdentitySummary): Promise<void> {
+  try {
+    await writeFile(identitySummaryPath(workdir, agentName), JSON.stringify(summary, null, 2));
+  } catch (err) {
+    console.log(`[self] Failed to save identity summary: ${err}`);
+  }
+}
+
+/** Load identity entries not yet covered by the summary */
+export async function loadUnsummarizedIdentities(workdir: string, agentName: string): Promise<IdentityEntry[]> {
+  const summary = await loadIdentitySummary(workdir, agentName);
+  const cutoff = summary?.summarized_through || "";
+  try {
+    const data = await readFile(identityPath(workdir, agentName), "utf-8");
+    return data.trim().split("\n").filter(Boolean)
+      .map(l => { try { return JSON.parse(l) as IdentityEntry; } catch { return null; } })
+      .filter((e): e is IdentityEntry => e !== null && e.ts > cutoff);
+  } catch {
+    return [];
+  }
+}
+
+/** Check if identity compression is needed (>30 unsummarized entries) */
+export async function needsIdentityCompression(workdir: string, agentName: string): Promise<boolean> {
+  const entries = await loadUnsummarizedIdentities(workdir, agentName);
+  return entries.length > 30;
 }
 
 // ---------------------------------------------------------------------------
@@ -897,17 +1113,19 @@ export async function loadPage(workdir: string, agentName: string, slug: string)
 // ---------------------------------------------------------------------------
 
 export async function getSelfState(workdir: string, agentName: string): Promise<object> {
-  const [bio, identity, memories, canvasEntries] = await Promise.all([
+  const [bio, identity, identitySummary, impressions, canvasEntries] = await Promise.all([
     loadBioState(workdir, agentName),
     loadLatestIdentity(workdir, agentName),
-    loadRecentMemories(workdir, agentName, 10),
+    loadIdentitySummary(workdir, agentName),
+    loadImpressions(workdir, agentName, 1),
     loadRecentCanvasEntries(workdir, agentName, 3),
   ]);
   return {
     agent: agentName,
     bio,
     identity,
-    recentMemories: memories,
+    identitySummary: identitySummary?.summary || null,
+    recentImpressions: impressions.slice(-5),
     recentCanvas: canvasEntries.map(e => ({ filename: e.filename, preview: e.content.slice(0, 200) })),
   };
 }

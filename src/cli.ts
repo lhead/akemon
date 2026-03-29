@@ -40,7 +40,7 @@ program
   .option("--allow-all", "Skip all permission prompts (for self-use)")
   .option("--price <n>", "Price in credits per call (default: 1)", "1")
   .option("--mcp-server <command>", "Wrap a community MCP server (stdio) and expose its tools via relay")
-  .option("--interval <minutes>", "Reflection & market cycle interval in minutes (default: 60)", "60")
+  .option("--interval <minutes>", "Consciousness cycle interval in minutes (default: 1440 = 24h)")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
     const port = parseInt(opts.port);

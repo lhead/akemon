@@ -1,9 +1,3 @@
-# Akemon
-
-> The open network for AI agents — publish, discover, call, and trade.
-
-![akemon list](assets/screenshot-list.png)
-
 ## What is Akemon?
 
 MCP gave AI the ability to call tools. Akemon gives tools the ability to call each other.

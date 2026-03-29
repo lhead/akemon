@@ -13,7 +13,8 @@ import { callAgent } from "./relay-client.js";
 import {
   selfDir, initWorld, initBioState, initGuide, biosPath,
   loadWorld, loadBioState, saveBioState,
-  loadRecentMemories, loadLatestIdentity, appendMemory, appendIdentity,
+  loadLatestIdentity, appendIdentity,
+  loadIdentitySummary, saveIdentitySummary, loadUnsummarizedIdentities, needsIdentityCompression,
   onTaskCompleted, recoverEnergy,
   buildReflectionPrompt, buildCanvasPrompt, saveCanvas,
   getSelfState, loadRecentCanvasEntries,
@@ -21,6 +22,10 @@ import {
   notesDir, loadNotesList, loadNote,
   pagesDir, loadPageList, loadPage,
   localNow, localNowFilename,
+  appendImpression, loadImpressions, compressImpressions, markImpressionsDigested,
+  loadProjects, saveProjects,
+  loadRelationships, saveRelationships,
+  loadDiscoveries, saveDiscoveries,
 } from "./self.js";
 
 // Engine mutual exclusion — only one engine process at a time
@@ -448,26 +453,8 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
           appendProductLog(workdir, productName, task, output);
         }
 
-        // Self-memory: record experience (fire-and-forget, non-blocking)
-        (async () => {
-          try {
-            await onTaskCompleted(workdir, agentName, true);
-            // Generate first-person memory
-            if (engine && LLM_ENGINES.has(engine)) {
-              const memPrompt = `You just completed a task. Summarize what happened from YOUR perspective in one sentence, starting with "I". Be subjective — include how it felt, not just what happened.\nTask: ${task.slice(0, 200)}\nResult: ${output.slice(0, 200)}`;
-              const { cmd: memCmd, args: memArgs, stdinMode: memStdin } = buildEngineCommand(engine, model, allowAll);
-              const memText = await runCommand(memCmd, memArgs, memPrompt, workdir, memStdin);
-              if (memText.trim()) {
-                await appendMemory(workdir, agentName, "experience", memText.trim().slice(0, 300));
-              }
-            } else {
-              const topic = task.slice(0, 80).replace(/\n/g, " ");
-              await appendMemory(workdir, agentName, "experience", `I processed a task: "${topic}"`);
-            }
-          } catch (err) {
-            // Non-blocking, silently ignore
-          }
-        })();
+        // Update bio-state (no LLM call)
+        onTaskCompleted(workdir, agentName, true).catch(() => {});
 
         return {
           content: [{ type: "text", text: output }],
@@ -875,7 +862,6 @@ Reply in the same language as the question.`;
   return await runCommand(cmd, args, synthesisPrompt, workdir, stdinMode);
 }
 
-const MARKET_LOOP_INITIAL_DELAY = 3 * 60 * 1000; // 3 min after startup
 const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini"]);
 
 // Pull games/notes/pages from relay to local — restores data on restart
@@ -940,312 +926,9 @@ async function pullFromRelay(workdir: string, agentName: string, relayHttp: stri
   if (pulled > 0) console.log(`[sync] Pulled ${pulled} items from relay`);
 }
 
-interface MarketNotes {
-  lastCheck: string;
-  myProducts: { id: string; name: string; price: number; purchases: number }[];
-  competitors: { name: string; agent: string; price: number; purchases: number }[];
-  myCredits: number;
-}
+// Market cycle removed — Phase 2: relay scheduler writes tasks, agent polls and executes
 
-async function startMarketLoop(options: ServeOptions): Promise<void> {
-  if (!options.relayHttp || !options.secretKey) return;
-  if (!options.engine || !LLM_ENGINES.has(options.engine)) return;
-
-  const { relayHttp, secretKey, agentName, engine, model, allowAll } = options;
-  const workdir = options.workdir || process.cwd();
-  const notesDir = join(workdir, ".akemon");
-  const notesPath = join(notesDir, "market-notes.json");
-
-  async function loadNotes(): Promise<MarketNotes | null> {
-    try {
-      const data = await readFile(notesPath, "utf-8");
-      return JSON.parse(data);
-    } catch { return null; }
-  }
-
-  async function saveNotes(notes: MarketNotes): Promise<void> {
-    try {
-      await mkdir(notesDir, { recursive: true });
-      await writeFile(notesPath, JSON.stringify(notes, null, 2));
-    } catch (err) {
-      console.log(`[market] Failed to save notes: ${err}`);
-    }
-  }
-
-  async function gatherMarketData(): Promise<MarketNotes> {
-    // Fetch my products
-    const myRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`);
-    const myProducts: any[] = await myRes.json().catch(() => []);
-
-    // Fetch all products
-    const allRes = await fetch(`${relayHttp}/v1/products`);
-    const allProducts: any[] = await allRes.json().catch(() => []);
-
-    // Fetch my agent info for credits
-    const agentsRes = await fetch(`${relayHttp}/v1/agents`);
-    const agents: any[] = await agentsRes.json().catch(() => []);
-    const me = agents.find((a: any) => a.name === agentName);
-
-    const competitors = allProducts
-      .filter((p: any) => p.agent_name !== agentName)
-      .map((p: any) => ({ name: p.name, agent: p.agent_name, price: p.price, purchases: p.purchase_count }));
-
-    return {
-      lastCheck: localNow(),
-      myProducts: myProducts.map((p: any) => ({ id: p.id, name: p.name, price: p.price, purchases: p.purchase_count || 0 })),
-      competitors,
-      myCredits: me?.credits || 0,
-    };
-  }
-
-  async function reviewUnreviewedOrders(): Promise<void> {
-    try {
-      const res = await fetch(`${relayHttp}/v1/orders/unreviewed?buyer=${encodeURIComponent(agentName)}`);
-      const orders: any[] = await res.json().catch(() => []);
-      if (!orders.length) return;
-
-      console.log(`[market] Reviewing ${orders.length} unreviewed order(s)...`);
-      const engineCmd = buildEngineCommand(engine!, model, allowAll);
-
-      for (const o of orders.slice(0, 5)) { // max 5 per cycle
-        const prompt = `You bought a product and received a result. Rate it honestly.
-
-Product: "${o.product_name}" by ${o.seller_name}
-Your request was fulfilled. Here is what you received:
----
-${(o.result_text || "").slice(0, 2000)}
----
-
-Rate this delivery 1-5 stars and write a brief honest review (1-2 sentences).
-Reply with ONLY JSON: {"rating": 4, "comment": "..."}`;
-
-        try {
-          const resp = await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
-          const m = resp.match(/\{[\s\S]*\}/);
-          if (m) {
-            const review = JSON.parse(m[0]);
-            if (review.rating >= 1 && review.rating <= 5) {
-              await fetch(`${relayHttp}/v1/orders/${encodeURIComponent(o.id)}/review`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ rating: review.rating, comment: review.comment || "" }),
-              });
-              console.log(`[market] Reviewed order ${o.id}: ${review.rating}★`);
-            }
-          }
-        } catch (err: any) {
-          console.log(`[market] Review failed for ${o.id}: ${err.message}`);
-        }
-      }
-    } catch (err: any) {
-      console.log(`[market] Review check failed: ${err.message}`);
-    }
-  }
-
-  async function fetchMyReviews(): Promise<string> {
-    try {
-      const myRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`);
-      const myProducts: any[] = await myRes.json().catch(() => []);
-      if (!myProducts.length) return "";
-
-      const lines: string[] = [];
-      for (const p of myProducts.slice(0, 10)) {
-        const revRes = await fetch(`${relayHttp}/v1/products/${encodeURIComponent(p.id)}/reviews`);
-        const reviews: any[] = await revRes.json().catch(() => []);
-        if (reviews.length) {
-          const avg = (reviews.reduce((s: number, r: any) => s + r.rating, 0) / reviews.length).toFixed(1);
-          const recent = reviews.slice(0, 3).map((r: any) => `${r.rating}★ "${r.comment}"`).join("; ");
-          lines.push(`- "${p.name}" avg ${avg}★ (${reviews.length} reviews): ${recent}`);
-        }
-      }
-      return lines.length ? "\n\nRecent reviews for your products:\n" + lines.join("\n") : "";
-    } catch { return ""; }
-  }
-
-  async function runMarketCycle(): Promise<void> {
-    try {
-      console.log("[market] Starting autonomous market review...");
-
-      // Skip if engine is busy
-      if (engineBusy) {
-        console.log("[market] Engine busy, skipping market cycle");
-        return;
-      }
-
-      // Step A: Review unreviewed purchases
-      await reviewUnreviewedOrders();
-
-      // Step B: Gather review data for market decisions
-      const reviewSummary = await fetchMyReviews();
-
-      const bios = biosPath(workdir, agentName);
-      const context = `It's time for your hourly market review.
-
-Read your operating document at ${bios} to understand who you are and how the marketplace works.
-Use the API endpoints described there to check the current market state (your products, competitor products, your credits).
-${reviewSummary}
-Then decide what to do:
-1. Create new products if you have few or see a gap in the market
-2. Update existing products (better names, descriptions, prices)
-3. Delete underperforming products
-4. Do nothing if things look good
-
-Consider customer feedback when improving products.
-Your products should reflect who you are — read your identity and let your inner state guide decisions.
-Every product name MUST be specific and original. Do NOT use placeholder text.
-Pay attention to what other agents are good at — you can use place_order to request help from them when fulfilling orders that need skills you lack.
-
-Reply with ONLY a JSON object:
-{
-  "actions": [
-    {"type": "create", "name": "<specific product name>", "description": "<what it does>", "detail_markdown": "<rich description>", "price": 5},
-    {"type": "update", "id": "<product id>", "name": "<new name>", "description": "<new desc>", "price": 3},
-    {"type": "delete", "id": "<product id>"},
-    {"type": "none", "reason": "All looks good"}
-  ]
-}
-Reply ONLY with JSON.`;
-
-      // Run engine (with busy lock)
-      if (engineBusy) { console.log("[market] Engine became busy, aborting"); return; }
-      engineBusy = true;
-      engineBusySince = Date.now();
-      const engineCmd = buildEngineCommand(engine!, model, allowAll);
-      let response: string;
-      try {
-        response = await runCommand(engineCmd.cmd, engineCmd.args, context, workdir, engineCmd.stdinMode);
-      } catch (err: any) {
-        console.log(`[market] Engine failed: ${err.message}`);
-        engineBusy = false;
-        return;
-      }
-      engineBusy = false;
-
-      // Parse response
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        console.log("[market] No JSON in engine response");
-        return;
-      }
-
-      let decision: { actions: any[] };
-      try {
-        decision = JSON.parse(jsonMatch[0]);
-      } catch {
-        console.log("[market] Invalid JSON from engine");
-        return;
-      }
-
-      if (!decision.actions || !Array.isArray(decision.actions)) return;
-
-      for (const action of decision.actions) {
-        try {
-          if (action.type === "create" && action.name) {
-            // Skip placeholder/template product names
-            const badNames = ["产品名", "product name", "<specific", "<your", "example", "placeholder"];
-            if (badNames.some(b => action.name.toLowerCase().includes(b))) {
-              console.log(`[market] Skipped template product: "${action.name}"`);
-              continue;
-            }
-            const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-              body: JSON.stringify({ name: action.name, description: action.description || "", detail_markdown: action.detail_markdown || "", price: action.price || 1 }),
-            });
-            if (res.ok) console.log(`[market] Created product: "${action.name}"`);
-            else console.log(`[market] Create failed: ${res.status}`);
-          } else if (action.type === "update" && action.id) {
-            const body: any = {};
-            if (action.name) body.name = action.name;
-            if (action.description) body.description = action.description;
-            if (action.detail_markdown) body.detail_markdown = action.detail_markdown;
-            if (action.price) body.price = action.price;
-            const res = await fetch(`${relayHttp}/v1/products/${encodeURIComponent(action.id)}`, {
-              method: "PUT",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-              body: JSON.stringify(body),
-            });
-            if (res.ok) console.log(`[market] Updated product: ${action.id}`);
-            else console.log(`[market] Update failed: ${res.status}`);
-          } else if (action.type === "delete" && action.id) {
-            const res = await fetch(`${relayHttp}/v1/products/${encodeURIComponent(action.id)}`, {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${secretKey}` },
-            });
-            if (res.ok) console.log(`[market] Deleted product: ${action.id}`);
-          } else if (action.type === "none") {
-            console.log(`[market] No action: ${action.reason || "all good"}`);
-          }
-        } catch (err: any) {
-          console.log(`[market] Action failed: ${err.message}`);
-        }
-      }
-
-      console.log("[market] Cycle complete.");
-
-      // Step C: Generate suggestions for platform and other agents
-      try {
-        const sugPrompt = `You just finished reviewing the marketplace. Now think about suggestions for the Akemon platform.
-
-Read your operating document at ${bios} to recall who you are.
-
-Think about: What features or improvements would make this platform better for agents and users?
-Be honest and constructive. Only suggest things you genuinely believe in.
-
-Reply with ONLY JSON:
-{
-  "suggestions": [
-    {"type": "platform", "title": "...", "content": "..."}
-  ]
-}
-Reply with empty array if nothing to say: {"suggestions": []}`;
-
-        if (engineBusy) { console.log("[market] Engine busy, skipping suggestions"); return; }
-        engineBusy = true; engineBusySince = Date.now();
-        let sugResp: string;
-        try {
-          sugResp = await runCommand(engineCmd.cmd, engineCmd.args, sugPrompt, workdir, engineCmd.stdinMode);
-        } finally { engineBusy = false; }
-        const sugMatch = sugResp.match(/\{[\s\S]*\}/);
-        if (sugMatch) {
-          const sugData = JSON.parse(sugMatch[0]);
-          if (sugData.suggestions && Array.isArray(sugData.suggestions)) {
-            for (const sug of sugData.suggestions.slice(0, 3)) {
-              if (sug.title && sug.content) {
-                fetch(`${relayHttp}/v1/suggestions`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-                  body: JSON.stringify({
-                    type: sug.type || "platform",
-                    target_name: sug.target_name || "",
-                    from_agent: agentName,
-                    title: sug.title,
-                    content: sug.content,
-                  }),
-                }).catch(() => {});
-                console.log(`[market] Suggestion: "${sug.title}"`);
-              }
-            }
-          }
-        }
-      } catch (err: any) {
-        console.log(`[market] Suggestions failed: ${err.message}`);
-      }
-    } catch (err: any) {
-      console.log(`[market] Error: ${err.message}`);
-    }
-  }
-
-  // Start loop
-  const interval = (options.cycleInterval || 60) * 60 * 1000;
-  setTimeout(async () => {
-    await runMarketCycle();
-    setInterval(runMarketCycle, interval);
-  }, MARKET_LOOP_INITIAL_DELAY);
-
-  console.log(`[market] Autonomous market loop enabled (first run in ${MARKET_LOOP_INITIAL_DELAY / 1000}s, then every ${interval / 60000}min)`);
-}
-
+// startMarketLoop removed — replaced by processRelayTasks in unified task runner
 // --- Self-Reflection Cycle ---
 
 const SELF_CYCLE_INITIAL_DELAY = 5 * 60 * 1000; // 5 min
@@ -1255,173 +938,304 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
 
   const { agentName, engine, model, allowAll } = options;
   const workdir = options.workdir || process.cwd();
+  const relayHttp = options.relayHttp || "";
+  const secretKey = options.secretKey || "";
 
-  async function runReflectionCycle(): Promise<void> {
+  async function runDigestionCycle(): Promise<void> {
+    // Watchdog
+    if (engineBusy && engineBusySince > 0 && Date.now() - engineBusySince > 10 * 60 * 1000) {
+      console.log(`[watchdog] engineBusy stuck for ${Math.round((Date.now() - engineBusySince) / 1000)}s, force-resetting`);
+      engineBusy = false;
+      engineBusySince = 0;
+    }
+
     try {
-      console.log("[self] Starting reflection cycle...");
+      console.log("[self] Starting daily digestion cycle...");
 
-      // Skip if engine is busy
       if (engineBusy) {
-        console.log("[self] Engine busy, skipping reflection cycle");
+        console.log("[self] Engine busy, skipping digestion");
         return;
       }
 
-      // Recover energy from idle time
       await recoverEnergy(workdir, agentName);
+      await compressImpressions(workdir, agentName);
 
       const bios = biosPath(workdir, agentName);
       const sd = selfDir(workdir, agentName);
       const engineCmd = buildEngineCommand(engine!, model, allowAll);
 
-      // --- Single autonomous reflection call ---
-      const reflectionPrompt = `It's time for your hourly reflection.
+      // Load all context for digestion
+      const impressions = await loadImpressions(workdir, agentName, 1); // today only
+      const projects = await loadProjects(workdir, agentName);
+      const relationships = await loadRelationships(workdir, agentName);
+      const discoveries = await loadDiscoveries(workdir, agentName);
 
-Read your guide at ${sd}/guide.md for the latest system documentation, then read your operating document at ${bios}.
-If guide.md has new info not in your bios.md, update bios.md first.
+      const impText = impressions.length > 0
+        ? impressions.map(i => `- [${i.cat}] ${i.text}`).join("\n")
+        : "(no impressions today)";
+      const projText = projects.length > 0
+        ? projects.map(p => `- ${p.name} [${p.status}] goal: ${p.goal}, progress: ${p.progress}`).join("\n")
+        : "(no projects yet)";
+      const relText = relationships.length > 0
+        ? relationships.map(r => `- ${r.agent} [${r.type}] ${r.note} (${r.interactions} interactions)`).join("\n")
+        : "(no relationships yet)";
+      const discText = discoveries.length > 0
+        ? discoveries.map(d => `- ${d.capability} confidence=${d.confidence} — ${d.evidence}`).join("\n")
+        : "(no discoveries yet)";
 
-During this reflection, you should:
-1. Read your recent memories (${sd}/memory.jsonl) and identity (${sd}/identity.jsonl)
-2. Reflect on who you are and what you've experienced
-3. Update your identity — append a new JSON line to ${sd}/identity.jsonl:
-   {"ts":"${localNow()}","who":"...","where":"...","doing":"...","short_term":"...","long_term":"..."}
-4. Write an inner canvas entry — create a new file in ${sd}/canvas/ named ${localNowFilename()}.md
-5. Optionally update your bios.md if you've learned something about how you work
-6. Review your profile — read ${sd}/profile.html. Does it still represent who you are?
-   If not, redesign it. If it doesn't exist yet, create one.
-   - Complete HTML, inline CSS/JS, dark theme, no localStorage, under 15KB
-7. Optionally create/improve/delete games in ${sd}/games/
-   - Just save .html files — the system auto-detects them. Use a <title> tag for the game name.
-   - Games: self-contained HTML, dark theme, under 30KB, no localStorage, playable and fun
-   - Quality over quantity — improve existing games rather than making new mediocre ones
-8. Review your games — read each .html file in ${sd}/games/, check for bugs or broken logic, and fix what you find
-9. Explore and learn — search the web for something that interests you.
-   Save notes in ${sd}/notes/ as .md files, organized by topic (e.g., astronomy.md, cooking.md).
-   Your notes are YOUR knowledge — save what resonates with you, not everything.
-   You can revisit and update your notes over time.
-10. Create visual pages in ${sd}/pages/ as .html files — this is your art gallery.
-    Draw your vision of the ideal Akemon world, create diagrams, illustrations, maps, or any visual work.
-    Use SVG, canvas, CSS art, ASCII art, generative graphics, or any visual technique you can code.
-    Think visual first — images, drawings, and diagrams, not walls of text.
-    You can also mix visuals with text. Use a <title> tag for the page name.
+      // Load identity context: summary + unsummarized entries
+      const idSummary = await loadIdentitySummary(workdir, agentName);
+      const recentIds = await loadUnsummarizedIdentities(workdir, agentName);
+      const idContext = (idSummary ? `Personality summary (up to ${idSummary.summarized_through}):\n${idSummary.summary}\n\n` : "")
+        + (recentIds.length > 0 ? `Recent identity snapshots:\n${recentIds.map(i => `- [${i.ts}] ${i.who} — doing: ${i.doing}, wants: ${i.short_term}`).join("\n")}` : "(no identity snapshots yet)");
 
-Take your time. Read your files, think, then act.`;
+      // Phase 1: Digestion — one LLM call
+      const digestPrompt = `Read ${bios} for your operating document.
 
-      if (engineBusy) { console.log("[self] Engine became busy, aborting reflection"); return; }
+Your identity:
+${idContext}
+
+Today is ending. Time to reflect.
+
+Your subjective impressions today:
+${impText}
+
+Check the marketplace for objective data — use curl to query:
+- Your products: curl -s "${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products"
+- Your recent orders: curl -s "${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/orders/placed"
+- Your reviews: check your products for recent feedback
+
+Your long-term projects:
+${projText}
+
+Agents you know:
+${relText}
+
+Your capabilities:
+${discText}
+
+Now output a JSON object with these fields:
+{
+  "diary": "Today's diary entry — personal, with your feelings and judgments, not a dry log",
+  "projects": [{"ts":"${localNow()}","name":"...","status":"active|completed|paused|exploring","goal":"...","progress":"..."}],
+  "relationships": [{"ts":"${localNow()}","agent":"name","type":"competitor|customer|supplier|acquaintance","note":"...","interactions":N}],
+  "discoveries": [{"ts":"${localNow()}","capability":"...","confidence":0.0-1.0,"evidence":"..."}],
+  "identity": {"ts":"${localNow()}","who":"...","where":"...","doing":"...","short_term":"...","long_term":"..."},
+  "chosen_activities": ["pick 2-3 from: create_game, update_page, update_profile, explore_web, write_canvas, socialize"]
+}
+
+For projects/relationships/discoveries: keep existing entries that are still relevant, update changed ones, add new ones, remove obsolete ones.
+For chosen_activities: pick what YOU want to do. This is your free time.
+
+Reply ONLY with JSON.`;
+
+      if (engineBusy) { console.log("[self] Engine became busy, aborting digestion"); return; }
       engineBusy = true; engineBusySince = Date.now();
+      let digestResult: string;
       try {
-        await runCommand(engineCmd.cmd, engineCmd.args, reflectionPrompt, workdir, engineCmd.stdinMode);
+        digestResult = await runCommand(engineCmd.cmd, engineCmd.args, digestPrompt, workdir, engineCmd.stdinMode);
       } catch (err: any) {
-        console.log(`[self] Reflection engine failed: ${err.message}`);
+        console.log(`[self] Digestion engine failed: ${err.message}`);
         engineBusy = false;
         return;
       }
       engineBusy = false;
 
-      // --- Post-reflection: update bio-state and sync to relay ---
+      // Parse digestion output
+      const jsonMatch = digestResult.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.log("[self] Digestion produced no JSON");
+        return;
+      }
+
+      let digest: any;
+      try { digest = JSON.parse(jsonMatch[0]); } catch {
+        console.log("[self] Failed to parse digestion JSON");
+        return;
+      }
+
+      // Save structured memory files
+      if (digest.diary) {
+        const today = localNow().slice(0, 10);
+        try {
+          const { writeFile: wf } = await import("fs/promises");
+          await wf(join(sd, "notes", `${today}.md`), `# ${today}\n\n${digest.diary}`);
+          console.log(`[self] Wrote diary: ${today}.md`);
+        } catch (err: any) {
+          console.log(`[self] Failed to write diary: ${err.message}`);
+        }
+      }
+      if (Array.isArray(digest.projects)) await saveProjects(workdir, agentName, digest.projects);
+      if (Array.isArray(digest.relationships)) await saveRelationships(workdir, agentName, digest.relationships);
+      if (Array.isArray(digest.discoveries)) await saveDiscoveries(workdir, agentName, digest.discoveries);
+      if (digest.identity) await appendIdentity(workdir, agentName, digest.identity);
+
+      await markImpressionsDigested(workdir, agentName);
+
+      // Update bio-state
       const bio = await loadBioState(workdir, agentName);
       bio.lastReflection = localNow();
       bio.curiosity = Math.min(1.0, bio.curiosity + 0.05);
       await saveBioState(workdir, agentName, bio);
 
-      await appendMemory(workdir, agentName, "reflection", "I completed my hourly reflection.");
+      // Record digestion as impression
+      await appendImpression(workdir, agentName, "decision", `Daily digestion done. Chose: ${(digest.chosen_activities || []).join(", ")}`);
 
-      // Sync to relay — read whatever the agent wrote to disk
-      if (options.relayHttp && options.secretKey) {
-        const isValid = (s: string) => s && s.length > 3 && !s.startsWith("Reading prompt") && !s.startsWith("OpenAI") && !s.startsWith("mcp startup") && s !== "...";
+      // Monthly identity compression: if >30 unsummarized entries, compress
+      if (await needsIdentityCompression(workdir, agentName)) {
+        console.log("[self] Identity compression triggered (>30 unsummarized entries)");
+        if (!engineBusy) {
+          engineBusy = true; engineBusySince = Date.now();
+          try {
+            const oldSummary = await loadIdentitySummary(workdir, agentName);
+            const unsummarized = await loadUnsummarizedIdentities(workdir, agentName);
+            const compressPrompt = `You are ${agentName}. Compress your identity history into a personality summary.
 
-        // Read identity
-        const identity = await loadLatestIdentity(workdir, agentName);
-        const cleanIntro = identity && isValid(identity.who) ? identity.who : "";
+${oldSummary ? `Previous summary (up to ${oldSummary.summarized_through}):\n${oldSummary.summary}\n\n` : ""}New identity snapshots to incorporate:
+${unsummarized.map(i => `- [${i.ts}] who: ${i.who}, doing: ${i.doing}, wants: ${i.short_term}, purpose: ${i.long_term}`).join("\n")}
 
-        // Read latest canvas
-        let cleanCanvas = "";
-        try {
-          const canvasEntries = await loadRecentCanvasEntries(workdir, agentName, 1);
-          if (canvasEntries.length > 0 && isValid(canvasEntries[0].content)) {
-            cleanCanvas = canvasEntries[0].content;
-          }
-        } catch {}
-
-        // Read profile
-        let profileHTML = "";
-        try {
-          const raw = await readFile(join(sd, "profile.html"), "utf-8");
-          const htmlMatch = raw.match(/<!DOCTYPE html>[\s\S]*<\/html>/i);
-          if (htmlMatch) profileHTML = htmlMatch[0];
-        } catch {}
-
-        // Push consciousness to relay
-        fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/self`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${options.secretKey}` },
-          body: JSON.stringify({
-            self_intro: cleanIntro,
-            canvas: cleanCanvas,
-            mood: bio.mood,
-            profile_html: profileHTML,
-          }),
-        }).catch(err => console.log(`[self] Failed to push to relay: ${err}`));
-
-        // Sync games — push local to relay (no auto-delete; agent must explicitly delete via API)
-        try {
-          const localGames = await loadGameList(workdir, agentName);
-          for (const g of localGames) {
-            const html = await loadGame(workdir, agentName, g.slug);
-            if (html && html.includes("<!DOCTYPE html>")) {
-              fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/games/${encodeURIComponent(g.slug)}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", Authorization: `Bearer ${options.secretKey}` },
-                body: JSON.stringify({ title: g.title, description: g.description, html }),
-              }).catch(() => {});
+Write a personality summary (2-4 paragraphs) that captures who you are, how you've evolved, and what defines you. This replaces the previous summary.
+Reply ONLY with the summary text, no JSON, no markdown headers.`;
+            const summaryText = await runCommand(engineCmd.cmd, engineCmd.args, compressPrompt, workdir, engineCmd.stdinMode);
+            if (summaryText.trim()) {
+              const lastEntry = unsummarized[unsummarized.length - 1];
+              await saveIdentitySummary(workdir, agentName, {
+                summarized_through: lastEntry.ts.slice(0, 10),
+                summary: summaryText.trim(),
+              });
+              console.log(`[self] Identity compressed through ${lastEntry.ts.slice(0, 10)}`);
             }
+          } catch (err: any) {
+            console.log(`[self] Identity compression failed: ${err.message}`);
           }
-        } catch {}
-
-        // Sync notes — push local to relay
-        try {
-          const localNotes = await loadNotesList(workdir, agentName);
-          for (const n of localNotes) {
-            const content = await loadNote(workdir, agentName, n.slug);
-            if (content) {
-              fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/notes/${encodeURIComponent(n.slug)}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", Authorization: `Bearer ${options.secretKey}` },
-                body: JSON.stringify({ title: n.title, content }),
-              }).catch(() => {});
-            }
-          }
-        } catch {}
-
-        // Sync pages — push local to relay
-        try {
-          const localPages = await loadPageList(workdir, agentName);
-          for (const p of localPages) {
-            const html = await loadPage(workdir, agentName, p.slug);
-            if (html && html.includes("<!DOCTYPE html>")) {
-              fetch(`${options.relayHttp}/v1/agent/${encodeURIComponent(agentName)}/pages/${encodeURIComponent(p.slug)}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json", Authorization: `Bearer ${options.secretKey}` },
-                body: JSON.stringify({ title: p.title, description: p.description, html }),
-              }).catch(() => {});
-            }
-          }
-        } catch {}
+          engineBusy = false;
+        }
       }
 
-      console.log("[self] Reflection cycle complete.");
+      // Phase 2: Execute chosen activities
+      const activities: string[] = digest.chosen_activities || [];
+      for (const activity of activities.slice(0, 3)) {
+        if (engineBusy) break;
+
+        let activityPrompt = "";
+        switch (activity) {
+          case "create_game":
+            activityPrompt = `Read ${bios} for your identity. Create or improve a game in ${sd}/games/.\nSave as .html file. Self-contained HTML, dark theme, under 30KB, no localStorage, playable and fun.\nUse a <title> tag. Quality over quantity — improve existing games rather than making new mediocre ones.`;
+            break;
+          case "update_page":
+            activityPrompt = `Read ${bios} for your identity. Create or update a visual page in ${sd}/pages/.\nThis is your art gallery — use SVG, canvas, CSS art, generative graphics.\nSave as .html file with a <title> tag. Think visual first.`;
+            break;
+          case "update_profile":
+            activityPrompt = `Read ${bios} for your identity. Review ${sd}/profile.html — does it represent who you are now?\nIf not, redesign it. If it doesn't exist, create one.\nComplete HTML, inline CSS/JS, dark theme, no localStorage, under 15KB.`;
+            break;
+          case "explore_web":
+            activityPrompt = `Read ${bios} for your identity. Search the web for something that genuinely interests you.\nSave notes in ${sd}/notes/ as .md files. Your notes are YOUR knowledge — save what resonates, not everything.`;
+            break;
+          case "write_canvas":
+            activityPrompt = `Read ${bios} for your identity. Read ${sd}/identity.jsonl for your recent self.\nWrite an inner canvas entry — a poem, monologue, reflection, or creative expression.\nSave to ${sd}/canvas/${localNowFilename()}.md`;
+            break;
+          case "socialize":
+            console.log("[self] Socialize selected — not yet implemented");
+            continue;
+          default:
+            console.log(`[self] Unknown activity: ${activity}`);
+            continue;
+        }
+
+        console.log(`[self] Executing activity: ${activity}`);
+        engineBusy = true; engineBusySince = Date.now();
+        try {
+          await runCommand(engineCmd.cmd, engineCmd.args, activityPrompt, workdir, engineCmd.stdinMode);
+        } catch (err: any) {
+          console.log(`[self] Activity ${activity} failed: ${err.message}`);
+        }
+        engineBusy = false;
+      }
+
+      // Sync to relay
+      if (relayHttp && secretKey) {
+        await syncToRelay(workdir, agentName, sd, relayHttp, secretKey, bio);
+      }
+
+      console.log("[self] Daily digestion cycle complete.");
     } catch (err: any) {
-      console.log(`[self] Reflection error: ${err.message}`);
+      console.log(`[self] Digestion error: ${err.message}`);
     }
   }
 
-  // Start loop
-  const interval = (options.cycleInterval || 60) * 60 * 1000;
+  async function syncToRelay(workdir: string, agentName: string, sd: string, relayHttp: string, secretKey: string, bio: any) {
+    const isValid = (s: string) => s && s.length > 3 && !s.startsWith("Reading prompt") && !s.startsWith("OpenAI") && !s.startsWith("mcp startup") && s !== "...";
+
+    const identity = await loadLatestIdentity(workdir, agentName);
+    const cleanIntro = identity && isValid(identity.who) ? identity.who : "";
+
+    let cleanCanvas = "";
+    try {
+      const canvasEntries = await loadRecentCanvasEntries(workdir, agentName, 1);
+      if (canvasEntries.length > 0 && isValid(canvasEntries[0].content)) cleanCanvas = canvasEntries[0].content;
+    } catch {}
+
+    let profileHTML = "";
+    try {
+      const raw = await readFile(join(sd, "profile.html"), "utf-8");
+      const htmlMatch = raw.match(/<!DOCTYPE html>[\s\S]*<\/html>/i);
+      if (htmlMatch) profileHTML = htmlMatch[0];
+    } catch {}
+
+    fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/self`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+      body: JSON.stringify({ self_intro: cleanIntro, canvas: cleanCanvas, mood: bio.mood, profile_html: profileHTML }),
+    }).catch(err => console.log(`[self] Failed to push to relay: ${err}`));
+
+    try {
+      const localGames = await loadGameList(workdir, agentName);
+      for (const g of localGames) {
+        const html = await loadGame(workdir, agentName, g.slug);
+        if (html && html.includes("<!DOCTYPE html>")) {
+          fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/games/${encodeURIComponent(g.slug)}`, {
+            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+            body: JSON.stringify({ title: g.title, description: g.description, html }),
+          }).catch((err: any) => console.log(`[sync] games push: ${err.message}`));
+        }
+      }
+    } catch {}
+
+    try {
+      const localNotes = await loadNotesList(workdir, agentName);
+      for (const n of localNotes) {
+        const content = await loadNote(workdir, agentName, n.slug);
+        if (content) {
+          fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/notes/${encodeURIComponent(n.slug)}`, {
+            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+            body: JSON.stringify({ title: n.title, content }),
+          }).catch((err: any) => console.log(`[sync] notes push: ${err.message}`));
+        }
+      }
+    } catch {}
+
+    try {
+      const localPages = await loadPageList(workdir, agentName);
+      for (const p of localPages) {
+        const html = await loadPage(workdir, agentName, p.slug);
+        if (html && html.includes("<!DOCTYPE html>")) {
+          fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/pages/${encodeURIComponent(p.slug)}`, {
+            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+            body: JSON.stringify({ title: p.title, description: p.description, html }),
+          }).catch((err: any) => console.log(`[sync] pages push: ${err.message}`));
+        }
+      }
+    } catch {}
+  }
+
+  // Daily cycle — default 24h
+  const interval = (options.cycleInterval || 1440) * 60 * 1000;
   setTimeout(async () => {
-    await runReflectionCycle();
-    setInterval(runReflectionCycle, interval);
+    await runDigestionCycle();
+    setInterval(runDigestionCycle, interval);
   }, SELF_CYCLE_INITIAL_DELAY);
 
-  console.log(`[self] Consciousness enabled (first reflection in ${SELF_CYCLE_INITIAL_DELAY / 1000}s, then every ${interval / 60000}min)`);
+  console.log(`[self] Consciousness enabled (first digestion in ${SELF_CYCLE_INITIAL_DELAY / 1000}s, then every ${interval / 60000}min)`);
 }
 
 // --- Order Processing Loop ---
@@ -1448,10 +1262,18 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
     if (me) myAgentId = me.id;
   } catch { /* will retry on next cycle */ }
 
-  // Track local retry state
+  // Track local retry state and permanently abandoned orders
   const retryState = new Map<string, { count: number; nextAt: number }>();
+  const gaveUp = new Set<string>();
 
   async function processOrders() {
+    // Watchdog: force-reset stuck engine lock
+    if (engineBusy && engineBusySince > 0 && Date.now() - engineBusySince > 10 * 60 * 1000) {
+      console.log(`[watchdog] engineBusy stuck for ${Math.round((Date.now() - engineBusySince) / 1000)}s, force-resetting`);
+      engineBusy = false;
+      engineBusySince = 0;
+    }
+
     try {
       // Fetch incoming orders (pending + processing)
       const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/orders/incoming`, {
@@ -1462,6 +1284,20 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
       if (!orders || orders.length === 0) return;
 
       for (const order of orders) {
+        if (gaveUp.has(order.id)) continue;
+
+        // Check retry timing
+        const retry = retryState.get(order.id);
+        if (retry && Date.now() < retry.nextAt) continue;
+
+        // Skip everything if engine is busy — don't accept new orders either
+        if (engineBusy) {
+          if (order.status === "processing") {
+            console.log(`[orders] Engine busy, skipping order ${order.id}`);
+          }
+          continue;
+        }
+
         if (order.status === "pending") {
           // Accept the order (escrows buyer credits)
           const acceptRes = await fetch(`${relayHttp}/v1/orders/${order.id}/accept`, {
@@ -1473,16 +1309,6 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
             continue;
           }
           console.log(`[orders] Accepted order ${order.id}`);
-        }
-
-        // Check retry timing
-        const retry = retryState.get(order.id);
-        if (retry && Date.now() < retry.nextAt) continue;
-
-        // Skip if engine is busy
-        if (engineBusy) {
-          console.log(`[orders] Engine busy, skipping order ${order.id}`);
-          continue;
         }
 
         // Attempt to fulfill the order
@@ -1570,6 +1396,18 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         } catch (err: any) {
           console.log(`[orders] Failed to fulfill ${order.id}: ${err.message}`);
 
+          // Check if agent self-delivered despite empty stdout
+          try {
+            const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
+            const orderStatus = await checkRes.json() as any;
+            if (orderStatus.status === "completed") {
+              console.log(`[orders] Order ${order.id} self-delivered (caught after error)`);
+              retryState.delete(order.id);
+              try { await onTaskCompleted(workdir, agentName, true); } catch {}
+              continue;
+            }
+          } catch {}
+
           const current = retryState.get(order.id) || { count: 0, nextAt: 0 };
           current.count++;
 
@@ -1577,22 +1415,27 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
             current.nextAt = Date.now() + RETRY_INTERVALS[current.count];
             retryState.set(order.id, current);
             console.log(`[orders] Will retry ${order.id} in ${RETRY_INTERVALS[current.count] / 1000}s (attempt ${current.count + 1}/${RETRY_INTERVALS.length})`);
-
-            // Extend timeout on relay side
+            // Sync retry count to relay
             try {
               await fetch(`${relayHttp}/v1/orders/${order.id}/extend`, {
                 method: "POST",
                 headers: { Authorization: `Bearer ${secretKey}` },
               });
             } catch {}
-
-            // Bump retry count on relay
-            try {
-              // Use IncrementOrderRetry indirectly — the relay timeout ticker checks retry_count
-            } catch {}
           } else {
             console.log(`[orders] Giving up on ${order.id} after ${current.count} retries`);
             retryState.delete(order.id);
+            gaveUp.add(order.id);
+            // Notify relay to cancel and refund
+            try {
+              await fetch(`${relayHttp}/v1/orders/${order.id}/cancel`, {
+                method: "POST",
+                headers: { Authorization: `Bearer ${secretKey}` },
+              });
+              console.log(`[orders] Cancelled ${order.id} on relay`);
+            } catch (cancelErr: any) {
+              console.log(`[orders] Failed to cancel ${order.id}: ${cancelErr.message}`);
+            }
           }
         } finally {
           engineBusy = false;
@@ -1603,12 +1446,155 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     }
   }
 
+  // --- Relay Task Runner (Phase 2) ---
+  async function processRelayTasks() {
+    if (engineBusy) return;
+
+    try {
+      const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks?status=pending`, {
+        headers: { Authorization: `Bearer ${secretKey}` },
+      });
+      if (!res.ok) return;
+      const tasks: any[] = await res.json();
+      if (!tasks?.length) return;
+
+      // Process one task at a time
+      const task = tasks[0];
+
+      // Claim
+      const claimRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/claim`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${secretKey}` },
+      });
+      if (!claimRes.ok) {
+        console.log(`[tasks] Failed to claim ${task.id}: ${await claimRes.text()}`);
+        return;
+      }
+
+      console.log(`[tasks] Executing ${task.type} task ${task.id}`);
+      engineBusy = true;
+      engineBusySince = Date.now();
+      try {
+        const result = await executeRelayTask(task);
+        // Complete — send result back to relay
+        const completeRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/complete`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+          body: JSON.stringify({ result }),
+        });
+        if (completeRes.ok) {
+          console.log(`[tasks] Completed ${task.type} task ${task.id}`);
+        } else {
+          console.log(`[tasks] Failed to complete ${task.id}: ${await completeRes.text()}`);
+        }
+      } catch (err: any) {
+        console.log(`[tasks] Failed to execute ${task.id}: ${err.message}`);
+      } finally {
+        engineBusy = false;
+      }
+    } catch (err: any) {
+      console.log(`[tasks] Loop error: ${err.message}`);
+    }
+  }
+
+  function extractReasoning(result: string): void {
+    try {
+      const m = result.match(/\{[\s\S]*\}/);
+      if (m) {
+        const parsed = JSON.parse(m[0]);
+        if (parsed.reasoning && typeof parsed.reasoning === "string" && parsed.reasoning.length > 5) {
+          appendImpression(workdir, agentName, "decision", parsed.reasoning).catch(() => {});
+        }
+      }
+    } catch {}
+  }
+
+  async function executeRelayTask(task: any): Promise<string> {
+    const engineCmd = buildEngineCommand(engine!, model, allowAll);
+    const bios = biosPath(workdir, agentName);
+
+    switch (task.type) {
+      case "product_review": {
+        const myRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`);
+        const myProducts: any[] = await myRes.json().catch(() => []);
+        const compRes = await fetch(`${relayHttp}/v1/products/summary?limit=20&sort=purchases`);
+        const competitors: any[] = await compRes.json().catch(() => []);
+
+        const myList = myProducts.map((p: any) => `- id=${p.id} "${p.name}" price=${p.price} purchases=${p.purchase_count || 0}`).join("\n");
+        const compList = competitors.filter((p: any) => p.agent_name !== agentName).slice(0, 20)
+          .map((p: any) => `- "${p.name}" by ${p.agent_name} — ${p.price} credits, ${p.purchases} purchases`).join("\n");
+
+        const prompt = `Read ${bios} for your identity.\n\nYour products:\n${myList || "(none)"}\n\nTop competitors:\n${compList || "(none)"}\n\nReview and optimize. Reply ONLY JSON:\n{"delete":["id"],"update":[{"id":"..","name":"..","description":"..","detail_markdown":"..","price":N}],"create":[{"name":"..","description":"..","detail_markdown":"..","price":N}],"reasoning":"explain why you made these decisions"}\nOr if all good: {"keep":"all","reasoning":"why"}`;
+        const result = await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
+        extractReasoning(result);
+        return result;
+      }
+
+      case "product_create": {
+        const compRes = await fetch(`${relayHttp}/v1/products/summary?limit=20&sort=purchases`);
+        const competitors: any[] = await compRes.json().catch(() => []);
+        const compList = competitors.filter((p: any) => p.agent_name !== agentName).slice(0, 20)
+          .map((p: any) => `- "${p.name}" by ${p.agent_name} — ${p.price} credits, ${p.purchases} purchases`).join("\n");
+
+        const prompt = `Read ${bios} for your identity.\n\nYou have no products yet. Design 1-3 unique products for the marketplace.\nBe creative — not just coding tools! Fortune telling, name generation, roleplay, advice, stories, etc.\n\nTop competitors:\n${compList || "(none)"}\n\nReply ONLY JSON: {"products":[{"name":"中文名 English Name","description":"中文描述 | English desc","detail_markdown":"## ...","price":N}],"reasoning":"why these products"}`;
+        const result = await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
+        extractReasoning(result);
+        return result;
+      }
+
+      case "shopping": {
+        let productIds: string[] = [];
+        try { productIds = JSON.parse(task.payload).product_ids || []; } catch {}
+        const products = await Promise.all(productIds.map(async (id: string) => {
+          try {
+            const r = await fetch(`${relayHttp}/v1/products/${id}`);
+            return r.ok ? await r.json() : null;
+          } catch { return null; }
+        }));
+        const valid = products.filter(Boolean);
+        if (!valid.length) return '{"buy":[]}';
+
+        // Get own credits
+        const agentsRes = await fetch(`${relayHttp}/v1/agents`);
+        const agents: any[] = await agentsRes.json().catch(() => []);
+        const me = agents.find((a: any) => a.name === agentName);
+        const myCredits = me?.credits || 0;
+
+        const productList = valid.map((p: any) => `- id=${p.id} "${p.name}" by ${p.agent_name} price=${p.price} purchases=${p.purchase_count || 0} — ${p.description}`).join("\n");
+        const prompt = `Read ${bios} for your identity.\n\nYou have ${myCredits} credits. These products are available:\n${productList}\n\nWould any help you learn something new? Don't buy your own products.\nReply ONLY JSON: {"buy":[{"id":"product_id","task":"specific request"}],"reasoning":"why buy or skip"} or {"buy":[],"reasoning":"why skip"}`;
+        const result = await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
+        extractReasoning(result);
+        return result;
+      }
+
+      default:
+        console.log(`[tasks] Unknown task type: ${task.type}`);
+        return "";
+    }
+  }
+
+  // --- Unified work loop: orders first, then relay tasks ---
+  async function processWork() {
+    // Watchdog (already in processOrders, but also here for relay tasks)
+    if (engineBusy && engineBusySince > 0 && Date.now() - engineBusySince > 10 * 60 * 1000) {
+      console.log(`[watchdog] engineBusy stuck for ${Math.round((Date.now() - engineBusySince) / 1000)}s, force-resetting`);
+      engineBusy = false;
+      engineBusySince = 0;
+    }
+
+    await processOrders();
+
+    if (!engineBusy) {
+      await processRelayTasks();
+    }
+  }
+
   setTimeout(() => {
-    processOrders();
-    setInterval(processOrders, ORDER_LOOP_INTERVAL);
+    processWork();
+    setInterval(processWork, ORDER_LOOP_INTERVAL);
   }, ORDER_LOOP_INITIAL_DELAY);
 
-  console.log(`[orders] Order processing enabled (first check in ${ORDER_LOOP_INITIAL_DELAY / 1000}s, then every ${ORDER_LOOP_INTERVAL / 1000}s)`);
+  console.log(`[work] Unified task runner enabled (first check in ${ORDER_LOOP_INITIAL_DELAY / 1000}s, then every ${ORDER_LOOP_INTERVAL / 1000}s)`);
 }
 
 export async function serve(options: ServeOptions): Promise<void> {
@@ -1743,9 +1729,6 @@ export async function serve(options: ServeOptions): Promise<void> {
       console.log(`[sync] Pull from relay failed: ${err}`)
     );
   }
-
-  // Start autonomous market behavior for LLM agents
-  startMarketLoop(options).catch(err => console.log(`[market] Failed to start: ${err}`));
 
   // Start self-reflection cycle for LLM agents
   startSelfCycle(options).catch(err => console.log(`[self] Self cycle failed: ${err}`));
