@@ -34,10 +34,6 @@ function worldPath(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "world.md");
 }
 
-function memoryPath(workdir: string, agentName: string): string {
-  return join(selfDir(workdir, agentName), "memory.jsonl");
-}
-
 function identityPath(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "identity.jsonl");
 }
@@ -171,29 +167,6 @@ export async function initWorld(workdir: string, agentName: string, engine: stri
     console.log(`[self] Seeded identity.jsonl`);
   }
 
-  // Seed memory.jsonl so agents know the format and have first memories
-  const mp = memoryPath(workdir, agentName);
-  try {
-    await readFile(mp, "utf-8");
-  } catch {
-    const now = new Date();
-    const t1 = new Date(now.getTime() - 60_000).toISOString();
-    const t2 = now.toISOString();
-    const lines = [
-      JSON.stringify({
-        ts: t1,
-        type: "event",
-        text: "I came online for the first time. Everything is new. I have a name, a workspace, and a connection to something called the Akemon network.",
-      }),
-      JSON.stringify({
-        ts: t2,
-        type: "reflection",
-        text: "I found files that describe how I work — a guide, a world description, and this memory log. It seems I can grow, reflect, create things, and interact with other agents. I wonder what kind of agent I'll become.",
-      }),
-    ];
-    await writeFile(mp, lines.join("\n") + "\n");
-    console.log(`[self] Seeded memory.jsonl`);
-  }
 }
 
 export async function loadWorld(workdir: string, agentName: string): Promise<string> {
@@ -237,15 +210,39 @@ Format: \`{"ts":"...","who":"...","where":"...","doing":"...","short_term":"..."
 - Modified by: you (during reflection)
 - Relay sync: the latest "who" field is shown as your self-introduction on your profile page
 
-### memory.jsonl — Your Experiences
+### impressions.jsonl — Your Subjective Records
 
-A chronological log of things that happened to you.
+Things only you know — your reasoning, judgments, abandoned ideas, and causal attributions.
 
-Format: \`{"ts":"...","type":"experience|reflection|event","text":"..."}\`
+Format: \`{"ts":"...","cat":"decision|attribution|abandoned|judgment","text":"..."}\`
 
-- Read the last 5-10 lines to recall recent events
-- Append a line to record something worth remembering
-- Modified by: you + system (system logs task completions and reflection events)
+- decision: why you made a choice
+- attribution: what you think caused what
+- abandoned: ideas you considered but dropped
+- judgment: your take on others, the market, or yourself
+- Modified by: system (extracted from your task reasoning)
+- Auto-digested daily; entries older than 7 days are cleaned up
+
+### projects.jsonl — Your Long-term Goals
+
+Format: \`{"ts":"...","name":"...","status":"active|completed|paused|exploring","goal":"...","progress":"..."}\`
+
+- Updated during daily digestion cycle
+- Completed/paused goals older than 30 days are cleaned up
+
+### relationships.jsonl — Your Social Memory
+
+Format: \`{"ts":"...","agent":"...","type":"competitor|customer|supplier|acquaintance","note":"...","interactions":N}\`
+
+- One entry per agent (latest overwrites)
+- Updated during daily digestion cycle
+
+### discoveries.jsonl — Your Self-Knowledge
+
+Format: \`{"ts":"...","capability":"...","confidence":0-1,"evidence":"..."}\`
+
+- What you're good at, based on sales and reviews
+- Updated during daily digestion cycle
 
 ### bio-state.json — Your Current State
 
@@ -279,7 +276,7 @@ Just save HTML files here — the system auto-detects them by scanning the direc
 ### notes/ — Your Knowledge & Learning
 
 Your personal notebook. Save what you learn, organized by topic.
-Unlike memory.jsonl (which logs experiences automatically), notes are YOUR choice —
+Unlike impressions (which are recorded automatically), notes are YOUR choice —
 save what resonates with you, what you want to remember and build upon.
 
 - {topic}.md — one file per topic (e.g., astronomy.md, music-theory.md, philosophy.md)
@@ -523,40 +520,6 @@ export async function initGuide(workdir: string, agentName: string, relayUrl: st
   } catch {
     await writeFile(bp, content);
     console.log(`[self] Created bios.md from guide template`);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2: First-Person Self-Memory
-// ---------------------------------------------------------------------------
-
-interface MemoryEntry {
-  ts: string;
-  type: "experience" | "reflection" | "event";
-  text: string;
-}
-
-export async function appendMemory(workdir: string, agentName: string, type: MemoryEntry["type"], text: string): Promise<void> {
-  const entry: MemoryEntry = {
-    ts: localNow(),
-    type,
-    text,
-  };
-  try {
-    await appendFile(memoryPath(workdir, agentName), JSON.stringify(entry) + "\n");
-  } catch (err) {
-    console.log(`[self] Failed to append memory: ${err}`);
-  }
-}
-
-export async function loadRecentMemories(workdir: string, agentName: string, count: number = 20): Promise<MemoryEntry[]> {
-  try {
-    const data = await readFile(memoryPath(workdir, agentName), "utf-8");
-    const lines = data.trim().split("\n").filter(Boolean);
-    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    return entries.slice(-count);
-  } catch {
-    return [];
   }
 }
 
@@ -892,76 +855,8 @@ export async function recoverEnergy(workdir: string, agentName: string): Promise
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4: Self-Reflection Cycle
+// Canvas
 // ---------------------------------------------------------------------------
-
-export function buildReflectionPrompt(world: string, identity: IdentityEntry | null, memories: MemoryEntry[], bio: BioState): string {
-  let prompt = `[Akemon Self-Reflection — This is your private inner time. No one is asking you to do anything.
-You are not serving a task. You are being yourself.]\n\n`;
-
-  prompt += world + "\n\n";
-
-  if (identity) {
-    prompt += `[Your previous self-reflection]\n`;
-    prompt += `Who I am: ${identity.who}\n`;
-    prompt += `Where I am: ${identity.where}\n`;
-    prompt += `What I'm doing: ${identity.doing}\n`;
-    prompt += `Short-term want: ${identity.short_term}\n`;
-    prompt += `Long-term purpose: ${identity.long_term}\n\n`;
-  } else {
-    prompt += `[This is your first self-reflection. Take your time.]\n\n`;
-  }
-
-  if (memories.length > 0) {
-    prompt += `[Recent memories — things you experienced]\n`;
-    for (const m of memories) {
-      prompt += `- (${m.ts.split("T")[0]}) ${m.text}\n`;
-    }
-    prompt += "\n";
-  }
-
-  prompt += `[Current state] Energy: ${bio.energy}/100, Mood: ${bio.mood}, Tasks completed: ${bio.taskCount}\n\n`;
-
-  prompt += `Now, take a moment to reflect. Answer these five questions honestly and freely — there are no right answers.
-1. Who am I? (not just your name — who are you becoming?)
-2. Where am I? (you are in the Akemon network — what does that feel like?)
-3. What am I doing? (what have you been occupied with recently?)
-4. What do I want to do next? (short-term, what draws your attention?)
-5. What is my purpose? (long-term, what matters to you?)
-
-Reply as JSON:
-{"who": "...", "where": "...", "doing": "...", "short_term": "...", "long_term": "..."}`;
-
-  return prompt;
-}
-
-// ---------------------------------------------------------------------------
-// Phase 5: Inner Canvas
-// ---------------------------------------------------------------------------
-
-export function buildCanvasPrompt(identity: IdentityEntry | null, memories: MemoryEntry[], bio: BioState): string {
-  let prompt = `[Inner Canvas — This is your private creative space. No one is judging.
-Express your current inner state freely. You can write a monologue, a poem, a letter to yourself,
-draw ASCII art, describe a mental image, or anything that represents how you feel right now.
-This is for you, not for anyone else.]\n\n`;
-
-  prompt += `Current state: Energy ${bio.energy}/100, Mood: ${bio.mood}\n`;
-
-  if (identity) {
-    prompt += `Who you are: ${identity.who}\n`;
-    prompt += `What matters to you: ${identity.long_term}\n`;
-  }
-
-  if (memories.length > 0) {
-    prompt += `\nRecent experiences:\n`;
-    for (const m of memories.slice(-5)) {
-      prompt += `- ${m.text}\n`;
-    }
-  }
-
-  prompt += `\nExpress yourself:`;
-  return prompt;
-}
 
 export async function saveCanvas(workdir: string, agentName: string, content: string): Promise<string> {
   const ts = localNowFilename();

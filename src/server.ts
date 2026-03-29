@@ -16,7 +16,7 @@ import {
   loadLatestIdentity, appendIdentity,
   loadIdentitySummary, saveIdentitySummary, loadUnsummarizedIdentities, needsIdentityCompression,
   onTaskCompleted, recoverEnergy,
-  buildReflectionPrompt, buildCanvasPrompt, saveCanvas,
+  saveCanvas,
   getSelfState, loadRecentCanvasEntries,
   gamesDir, loadGameList, saveGame, loadGame,
   notesDir, loadNotesList, loadNote,
