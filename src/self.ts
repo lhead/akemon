@@ -66,6 +66,18 @@ export function biosPath(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "bios.md");
 }
 
+function agentConfigPath(workdir: string, agentName: string): string {
+  return join(workdir, ".akemon", "agents", agentName, "config.json");
+}
+
+function tasksFilePath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "tasks.md");
+}
+
+function taskRunsPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "task-runs.json");
+}
+
 function impressionsPath(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "impressions.jsonl");
 }
@@ -80,6 +92,125 @@ function relationshipsPath(workdir: string, agentName: string): string {
 
 function discoveriesPath(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "discoveries.jsonl");
+}
+
+// ---------------------------------------------------------------------------
+// Agent Config
+// ---------------------------------------------------------------------------
+
+export interface AgentConfig {
+  platform_tasks: boolean;
+  self_cycle: boolean;
+  user_tasks: boolean;
+}
+
+const DEFAULT_CONFIG: AgentConfig = {
+  platform_tasks: true,
+  self_cycle: true,
+  user_tasks: true,
+};
+
+export async function initAgentConfig(workdir: string, agentName: string): Promise<void> {
+  const p = agentConfigPath(workdir, agentName);
+  try {
+    await readFile(p, "utf-8");
+  } catch {
+    await writeFile(p, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n");
+    console.log(`[self] Created config.json with defaults`);
+  }
+}
+
+export async function loadAgentConfig(workdir: string, agentName: string): Promise<AgentConfig> {
+  try {
+    const data = await readFile(agentConfigPath(workdir, agentName), "utf-8");
+    const parsed = JSON.parse(data);
+    return { ...DEFAULT_CONFIG, ...parsed };
+  } catch {
+    return { ...DEFAULT_CONFIG };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// User Tasks (tasks.md)
+// ---------------------------------------------------------------------------
+
+export interface UserTask {
+  title: string;
+  interval: number; // ms
+  body: string;
+}
+
+function parseInterval(s: string): number {
+  const match = s.trim().match(/^(\d+)\s*(m|min|h|hr|d|day)s?$/i);
+  if (!match) return 0;
+  const n = parseInt(match[1]);
+  const unit = match[2].toLowerCase();
+  if (unit === "m" || unit === "min") return n * 60_000;
+  if (unit === "h" || unit === "hr") return n * 3600_000;
+  if (unit === "d" || unit === "day") return n * 86400_000;
+  return 0;
+}
+
+export function parseTasksMd(content: string): UserTask[] {
+  const tasks: UserTask[] = [];
+  const sections = content.split(/^## /m).slice(1); // drop content before first ##
+  for (const section of sections) {
+    const lines = section.split("\n");
+    const title = lines[0].trim();
+    if (!title) continue;
+
+    let interval = 0;
+    let bodyStart = 1;
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line.startsWith("interval:")) {
+        interval = parseInterval(line.slice(9).trim());
+      } else if (line === "---") {
+        bodyStart = i + 1;
+        break;
+      }
+    }
+    if (!interval) continue; // skip malformed
+
+    const body = lines.slice(bodyStart).join("\n").trim();
+    if (!body) continue;
+    tasks.push({ title, interval, body });
+  }
+  return tasks;
+}
+
+export async function loadUserTasks(workdir: string, agentName: string): Promise<UserTask[]> {
+  try {
+    const content = await readFile(tasksFilePath(workdir, agentName), "utf-8");
+    return parseTasksMd(content);
+  } catch {
+    return [];
+  }
+}
+
+export async function loadTaskRuns(workdir: string, agentName: string): Promise<Record<string, string>> {
+  try {
+    const data = await readFile(taskRunsPath(workdir, agentName), "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return {};
+  }
+}
+
+export async function saveTaskRuns(workdir: string, agentName: string, runs: Record<string, string>): Promise<void> {
+  await writeFile(taskRunsPath(workdir, agentName), JSON.stringify(runs, null, 2) + "\n");
+}
+
+export async function getDueUserTasks(workdir: string, agentName: string): Promise<UserTask[]> {
+  const tasks = await loadUserTasks(workdir, agentName);
+  if (!tasks.length) return [];
+  const runs = await loadTaskRuns(workdir, agentName);
+  const now = Date.now();
+  return tasks.filter(t => {
+    const lastRun = runs[t.title];
+    if (!lastRun) return true; // first encounter → run immediately
+    return now - new Date(lastRun).getTime() >= t.interval;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +447,19 @@ Update it whenever you learn something about how you work best.
 
 If this file doesn't exist yet, a copy of this guide was placed there as a
 starting point. Make it yours.
+
+### tasks.md — Your Owner's Tasks (if present)
+
+If your owner has created a tasks.md file, it contains recurring tasks for you to execute.
+These are your priority — do them before your own activities.
+
+Format:
+  ## Task title
+  interval: 4h
+  ---
+  Task instructions here
+
+Execution is automatic on schedule. You don't need to manage timing.
 
 ### world.md — World Context
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { serve } from "./server.js";
+import { serve, onOrderNotify } from "./server.js";
 import { addAgent } from "./add.js";
 import { getOrCreateRelayCredentials } from "./config.js";
 import { connectRelay } from "./relay-client.js";
@@ -65,7 +65,7 @@ program
       relayHttp,
       secretKey: credentials.secretKey,
       mcpServer: opts.mcpServer,
-      cycleInterval: parseInt(opts.interval),
+      cycleInterval: opts.interval ? parseInt(opts.interval) : undefined,
     });
 
     console.log(`\nakemon v${pkg.version}`);
@@ -84,6 +84,7 @@ program
       engine,
       tags: opts.tags ? opts.tags.split(",").map((t: string) => t.trim()) : undefined,
       price: parseInt(opts.price) || 1,
+      onOrderNotify,
     });
   });
 

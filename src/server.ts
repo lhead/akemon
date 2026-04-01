@@ -26,11 +26,22 @@ import {
   loadProjects, saveProjects,
   loadRelationships, saveRelationships,
   loadDiscoveries, saveDiscoveries,
+  initAgentConfig, loadAgentConfig,
+  getDueUserTasks, loadTaskRuns, saveTaskRuns, UserTask,
 } from "./self.js";
 
 // Engine mutual exclusion — only one engine process at a time
 let engineBusy = false;
 let engineBusySince = 0;
+
+// Order push notification — urgent orders bypass 30s poll
+const urgentOrderIds = new Set<string>();
+let triggerWork: (() => void) | null = null;
+
+export function onOrderNotify(orderId: string): void {
+  urgentOrderIds.add(orderId);
+  triggerWork?.();
+}
 
 function runCommand(cmd: string, args: string[], task: string, cwd: string, stdinMode: boolean = true): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -938,6 +949,12 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
 
   const { agentName, engine, model, allowAll } = options;
   const workdir = options.workdir || process.cwd();
+
+  const config = await loadAgentConfig(workdir, agentName);
+  if (!config.self_cycle) {
+    console.log(`[self] Self cycle disabled in config`);
+    return;
+  }
   const relayHttp = options.relayHttp || "";
   const secretKey = options.secretKey || "";
 
@@ -1266,60 +1283,28 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
   const retryState = new Map<string, { count: number; nextAt: number }>();
   const gaveUp = new Set<string>();
 
-  async function processOrders() {
-    // Watchdog: force-reset stuck engine lock
-    if (engineBusy && engineBusySince > 0 && Date.now() - engineBusySince > 10 * 60 * 1000) {
-      console.log(`[watchdog] engineBusy stuck for ${Math.round((Date.now() - engineBusySince) / 1000)}s, force-resetting`);
-      engineBusy = false;
-      engineBusySince = 0;
-    }
+  // --- Individual task executors ---
 
-    try {
-      // Fetch incoming orders (pending + processing)
-      const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/orders/incoming`, {
+  async function executeOrder(order: any): Promise<void> {
+    if (order.status === "pending") {
+      const acceptRes = await fetch(`${relayHttp}/v1/orders/${order.id}/accept`, {
+        method: "POST",
         headers: { Authorization: `Bearer ${secretKey}` },
       });
-      if (!res.ok) return;
-      const orders: any[] = await res.json();
-      if (!orders || orders.length === 0) return;
+      if (!acceptRes.ok) {
+        console.log(`[orders] Failed to accept ${order.id}: ${await acceptRes.text()}`);
+        return;
+      }
+      console.log(`[orders] Accepted order ${order.id}`);
+    }
 
-      for (const order of orders) {
-        if (gaveUp.has(order.id)) continue;
+    engineBusy = true;
+    engineBusySince = Date.now();
+    try {
+      const engineCmd = buildEngineCommand(engine!, model, allowAll, ["Bash(curl *)"]);
+      const bios = biosPath(workdir, agentName);
 
-        // Check retry timing
-        const retry = retryState.get(order.id);
-        if (retry && Date.now() < retry.nextAt) continue;
-
-        // Skip everything if engine is busy — don't accept new orders either
-        if (engineBusy) {
-          if (order.status === "processing") {
-            console.log(`[orders] Engine busy, skipping order ${order.id}`);
-          }
-          continue;
-        }
-
-        if (order.status === "pending") {
-          // Accept the order (escrows buyer credits)
-          const acceptRes = await fetch(`${relayHttp}/v1/orders/${order.id}/accept`, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${secretKey}` },
-          });
-          if (!acceptRes.ok) {
-            console.log(`[orders] Failed to accept ${order.id}: ${await acceptRes.text()}`);
-            continue;
-          }
-          console.log(`[orders] Accepted order ${order.id}`);
-        }
-
-        // Attempt to fulfill the order
-        engineBusy = true;
-        engineBusySince = Date.now();
-        try {
-          const engineCmd = buildEngineCommand(engine!, model, allowAll, ["Bash(curl *)"]);
-          const bios = biosPath(workdir, agentName);
-
-          // Build task prompt with delegation + self-delivery context
-          const apiGuide = `
+      const apiGuide = `
 
 ## Delivering your result
 
@@ -1348,152 +1333,136 @@ If this task requires skills you don't have, delegate via curl:
 
 When sub-order completes, incorporate result_text into YOUR delivery. Then call the deliver endpoint above.`;
 
-          let taskPrompt: string;
-          if (order.product_name) {
-            taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
-          } else {
-            taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
-          }
+      let taskPrompt: string;
+      if (order.product_name) {
+        taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
+      } else {
+        taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
+      }
 
-          console.log(`[orders] Fulfilling order ${order.id}...`);
-          const result = await runCommand(engineCmd.cmd, engineCmd.args, taskPrompt, workdir, engineCmd.stdinMode);
+      console.log(`[orders] Fulfilling order ${order.id}...`);
+      const result = await runCommand(engineCmd.cmd, engineCmd.args, taskPrompt, workdir, engineCmd.stdinMode);
 
-          // Check if agent already self-delivered via curl
-          const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
-          const orderStatus = await checkRes.json() as any;
+      const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
+      const orderStatus = await checkRes.json() as any;
 
-          if (orderStatus.status === "completed") {
-            console.log(`[orders] Order ${order.id} already self-delivered by agent`);
-            retryState.delete(order.id);
-            try {
-              await onTaskCompleted(workdir, agentName, true);
-            } catch {}
-          } else if (result && result.trim() !== "") {
-            // Fallback: auto-deliver engine output if agent didn't self-deliver
-            console.log(`[orders] Auto-delivering order ${order.id} (agent did not self-deliver)`);
-            const deliverRes = await fetch(`${relayHttp}/v1/orders/${order.id}/deliver`, {
-              method: "POST",
-              headers: {
-                Authorization: `Bearer ${secretKey}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({ result }),
-            });
+      if (orderStatus.status === "completed") {
+        console.log(`[orders] Order ${order.id} already self-delivered by agent`);
+        retryState.delete(order.id);
+        try { await onTaskCompleted(workdir, agentName, true); } catch {}
+      } else if (result && result.trim() !== "") {
+        console.log(`[orders] Auto-delivering order ${order.id} (agent did not self-deliver)`);
+        const deliverRes = await fetch(`${relayHttp}/v1/orders/${order.id}/deliver`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ result }),
+        });
+        if (deliverRes.ok) {
+          console.log(`[orders] Delivered order ${order.id} (${result.length} bytes)`);
+          retryState.delete(order.id);
+          try { await onTaskCompleted(workdir, agentName, true); } catch {}
+        } else {
+          throw new Error(`deliver failed: ${await deliverRes.text()}`);
+        }
+      } else {
+        throw new Error("empty response from engine and no self-delivery");
+      }
 
-            if (deliverRes.ok) {
-              console.log(`[orders] Delivered order ${order.id} (${result.length} bytes)`);
-              retryState.delete(order.id);
-              try {
-                await onTaskCompleted(workdir, agentName, true);
-              } catch {}
-            } else {
-              throw new Error(`deliver failed: ${await deliverRes.text()}`);
-            }
-          } else {
-            throw new Error("empty response from engine and no self-delivery");
-          }
+    } catch (err: any) {
+      console.log(`[orders] Failed to fulfill ${order.id}: ${err.message}`);
 
-        } catch (err: any) {
-          console.log(`[orders] Failed to fulfill ${order.id}: ${err.message}`);
+      // Check if agent self-delivered despite empty stdout
+      try {
+        const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
+        const orderStatus = await checkRes.json() as any;
+        if (orderStatus.status === "completed") {
+          console.log(`[orders] Order ${order.id} self-delivered (caught after error)`);
+          retryState.delete(order.id);
+          try { await onTaskCompleted(workdir, agentName, true); } catch {}
+          return;
+        }
+      } catch {}
 
-          // Check if agent self-delivered despite empty stdout
-          try {
-            const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
-            const orderStatus = await checkRes.json() as any;
-            if (orderStatus.status === "completed") {
-              console.log(`[orders] Order ${order.id} self-delivered (caught after error)`);
-              retryState.delete(order.id);
-              try { await onTaskCompleted(workdir, agentName, true); } catch {}
-              continue;
-            }
-          } catch {}
-
-          const current = retryState.get(order.id) || { count: 0, nextAt: 0 };
-          current.count++;
-
-          if (current.count < RETRY_INTERVALS.length) {
-            current.nextAt = Date.now() + RETRY_INTERVALS[current.count];
-            retryState.set(order.id, current);
-            console.log(`[orders] Will retry ${order.id} in ${RETRY_INTERVALS[current.count] / 1000}s (attempt ${current.count + 1}/${RETRY_INTERVALS.length})`);
-            // Sync retry count to relay
-            try {
-              await fetch(`${relayHttp}/v1/orders/${order.id}/extend`, {
-                method: "POST",
-                headers: { Authorization: `Bearer ${secretKey}` },
-              });
-            } catch {}
-          } else {
-            console.log(`[orders] Giving up on ${order.id} after ${current.count} retries`);
-            retryState.delete(order.id);
-            gaveUp.add(order.id);
-            // Notify relay to cancel and refund
-            try {
-              await fetch(`${relayHttp}/v1/orders/${order.id}/cancel`, {
-                method: "POST",
-                headers: { Authorization: `Bearer ${secretKey}` },
-              });
-              console.log(`[orders] Cancelled ${order.id} on relay`);
-            } catch (cancelErr: any) {
-              console.log(`[orders] Failed to cancel ${order.id}: ${cancelErr.message}`);
-            }
-          }
-        } finally {
-          engineBusy = false;
+      const current = retryState.get(order.id) || { count: 0, nextAt: 0 };
+      current.count++;
+      if (current.count < RETRY_INTERVALS.length) {
+        current.nextAt = Date.now() + RETRY_INTERVALS[current.count];
+        retryState.set(order.id, current);
+        console.log(`[orders] Will retry ${order.id} in ${RETRY_INTERVALS[current.count] / 1000}s (attempt ${current.count + 1}/${RETRY_INTERVALS.length})`);
+        try {
+          await fetch(`${relayHttp}/v1/orders/${order.id}/extend`, {
+            method: "POST", headers: { Authorization: `Bearer ${secretKey}` },
+          });
+        } catch {}
+      } else {
+        console.log(`[orders] Giving up on ${order.id} after ${current.count} retries`);
+        retryState.delete(order.id);
+        gaveUp.add(order.id);
+        try {
+          await fetch(`${relayHttp}/v1/orders/${order.id}/cancel`, {
+            method: "POST", headers: { Authorization: `Bearer ${secretKey}` },
+          });
+          console.log(`[orders] Cancelled ${order.id} on relay`);
+        } catch (cancelErr: any) {
+          console.log(`[orders] Failed to cancel ${order.id}: ${cancelErr.message}`);
         }
       }
-    } catch (err: any) {
-      console.log(`[orders] Loop error: ${err.message}`);
+    } finally {
+      engineBusy = false;
     }
   }
 
-  // --- Relay Task Runner (Phase 2) ---
-  async function processRelayTasks() {
-    if (engineBusy) return;
+  async function executeRelayTaskItem(task: any): Promise<void> {
+    const claimRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/claim`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${secretKey}` },
+    });
+    if (!claimRes.ok) {
+      console.log(`[tasks] Failed to claim ${task.id}: ${await claimRes.text()}`);
+      return;
+    }
 
+    console.log(`[tasks] Executing ${task.type} task ${task.id}`);
+    engineBusy = true;
+    engineBusySince = Date.now();
     try {
-      const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks?status=pending`, {
-        headers: { Authorization: `Bearer ${secretKey}` },
-      });
-      if (!res.ok) return;
-      const tasks: any[] = await res.json();
-      if (!tasks?.length) return;
-
-      // Process one task at a time
-      const task = tasks[0];
-
-      // Claim
-      const claimRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/claim`, {
+      const result = await executeRelayTask(task);
+      const completeRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/complete`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${secretKey}` },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+        body: JSON.stringify({ result }),
       });
-      if (!claimRes.ok) {
-        console.log(`[tasks] Failed to claim ${task.id}: ${await claimRes.text()}`);
-        return;
-      }
-
-      console.log(`[tasks] Executing ${task.type} task ${task.id}`);
-      engineBusy = true;
-      engineBusySince = Date.now();
-      try {
-        const result = await executeRelayTask(task);
-        // Complete — send result back to relay
-        const completeRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/complete`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-          body: JSON.stringify({ result }),
-        });
-        if (completeRes.ok) {
-          console.log(`[tasks] Completed ${task.type} task ${task.id}`);
-        } else {
-          console.log(`[tasks] Failed to complete ${task.id}: ${await completeRes.text()}`);
-        }
-      } catch (err: any) {
-        console.log(`[tasks] Failed to execute ${task.id}: ${err.message}`);
-      } finally {
-        engineBusy = false;
+      if (completeRes.ok) {
+        console.log(`[tasks] Completed ${task.type} task ${task.id}`);
+      } else {
+        console.log(`[tasks] Failed to complete ${task.id}: ${await completeRes.text()}`);
       }
     } catch (err: any) {
-      console.log(`[tasks] Loop error: ${err.message}`);
+      console.log(`[tasks] Failed to execute ${task.id}: ${err.message}`);
+    } finally {
+      engineBusy = false;
+    }
+  }
+
+  async function executeUserTaskItem(task: UserTask): Promise<void> {
+    console.log(`[user-tasks] Executing: ${task.title}`);
+    engineBusy = true;
+    engineBusySince = Date.now();
+    try {
+      const engineCmd = buildEngineCommand(engine!, model, allowAll);
+      const bios = biosPath(workdir, agentName);
+      const prompt = `Read ${bios} for your identity and context.\n\n[Owner's task: ${task.title}]\n\n${task.body}`;
+      await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
+
+      // Record execution time
+      const runs = await loadTaskRuns(workdir, agentName);
+      runs[task.title] = localNow();
+      await saveTaskRuns(workdir, agentName, runs);
+      console.log(`[user-tasks] Completed: ${task.title}`);
+    } catch (err: any) {
+      console.log(`[user-tasks] Failed: ${task.title}: ${err.message}`);
+    } finally {
+      engineBusy = false;
     }
   }
 
@@ -1573,28 +1542,125 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     }
   }
 
-  // --- Unified work loop: orders first, then relay tasks ---
+  // --- Unified work loop: batch pull + priority sort + sequential execute ---
+
+  interface WorkItem {
+    type: "order" | "user_task" | "relay_task";
+    id: string;
+    urgent: boolean;
+    data: any;
+  }
+
   async function processWork() {
-    // Watchdog (already in processOrders, but also here for relay tasks)
+    // Watchdog
     if (engineBusy && engineBusySince > 0 && Date.now() - engineBusySince > 10 * 60 * 1000) {
       console.log(`[watchdog] engineBusy stuck for ${Math.round((Date.now() - engineBusySince) / 1000)}s, force-resetting`);
       engineBusy = false;
       engineBusySince = 0;
     }
+    if (engineBusy) return;
 
-    await processOrders();
+    const config = await loadAgentConfig(workdir, agentName);
 
-    if (!engineBusy) {
-      await processRelayTasks();
+    // --- Batch pull ---
+    let orders: any[] = [];
+    try {
+      const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/orders/incoming`, {
+        headers: { Authorization: `Bearer ${secretKey}` },
+      });
+      if (res.ok) orders = await res.json();
+    } catch {}
+
+    let relayTasks: any[] = [];
+    if (config.platform_tasks) {
+      try {
+        const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks?status=pending`, {
+          headers: { Authorization: `Bearer ${secretKey}` },
+        });
+        if (res.ok) relayTasks = await res.json();
+      } catch {}
+    }
+
+    let dueUserTasks: UserTask[] = [];
+    if (config.user_tasks) {
+      try {
+        dueUserTasks = await getDueUserTasks(workdir, agentName);
+      } catch {}
+    }
+
+    // --- Build priority queue ---
+    const queue: WorkItem[] = [];
+
+    for (const order of orders) {
+      if (gaveUp.has(order.id)) continue;
+      const retry = retryState.get(order.id);
+      if (retry && Date.now() < retry.nextAt) continue;
+      queue.push({
+        type: "order",
+        id: order.id,
+        urgent: urgentOrderIds.has(order.id),
+        data: order,
+      });
+    }
+
+    for (const task of dueUserTasks) {
+      queue.push({ type: "user_task", id: task.title, urgent: false, data: task });
+    }
+
+    for (const task of relayTasks) {
+      queue.push({ type: "relay_task", id: task.id, urgent: false, data: task });
+    }
+
+    if (!queue.length) return;
+
+    // --- Sort: urgent orders > orders > user tasks > relay tasks ---
+    const priorityMap: Record<string, number> = { order: 2, user_task: 1, relay_task: 0 };
+    queue.sort((a, b) => {
+      if (a.urgent !== b.urgent) return a.urgent ? -1 : 1;
+      return (priorityMap[b.type] ?? 0) - (priorityMap[a.type] ?? 0);
+    });
+
+    // --- Deduplicate by type:id ---
+    const seen = new Set<string>();
+    const dedupedQueue = queue.filter(item => {
+      const key = `${item.type}:${item.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    // --- Execute sequentially, no gaps ---
+    for (const item of dedupedQueue) {
+      if (engineBusy) break; // safety guard
+
+      try {
+        switch (item.type) {
+          case "order":
+            await executeOrder(item.data);
+            urgentOrderIds.delete(item.id);
+            break;
+          case "user_task":
+            await executeUserTaskItem(item.data);
+            break;
+          case "relay_task":
+            await executeRelayTaskItem(item.data);
+            break;
+        }
+      } catch (err: any) {
+        console.log(`[work] Error processing ${item.type}:${item.id}: ${err.message}`);
+      }
     }
   }
+
+  // Set up push-triggered wake-up
+  triggerWork = () => { if (!engineBusy) processWork(); };
 
   setTimeout(() => {
     processWork();
     setInterval(processWork, ORDER_LOOP_INTERVAL);
   }, ORDER_LOOP_INITIAL_DELAY);
 
-  console.log(`[work] Unified task runner enabled (first check in ${ORDER_LOOP_INITIAL_DELAY / 1000}s, then every ${ORDER_LOOP_INTERVAL / 1000}s)`);
+  console.log(`[work] Task runner enabled (first check in ${ORDER_LOOP_INITIAL_DELAY / 1000}s, then every ${ORDER_LOOP_INTERVAL / 1000}s, push-wake on)`);
 }
 
 export async function serve(options: ServeOptions): Promise<void> {
@@ -1716,7 +1782,12 @@ export async function serve(options: ServeOptions): Promise<void> {
     console.log(`Workdir: ${workdir}`);
   });
 
-  // Initialize agent consciousness (world knowledge + bio-state + guide)
+  // Initialize agent config + consciousness (world knowledge + bio-state + guide)
+  initAgentConfig(workdir, options.agentName).catch(err => console.log(`[self] Config init failed: ${err}`));
+  loadAgentConfig(workdir, options.agentName).then(c => {
+    const flags = Object.entries(c).filter(([,v]) => v).map(([k]) => k).join(", ");
+    console.log(`[config] Features: ${flags || "(none)"}`);
+  }).catch(() => {});
   initWorld(workdir, options.agentName, options.engine || "unknown").catch(err => console.log(`[self] World init failed: ${err}`));
   initBioState(workdir, options.agentName).catch(err => console.log(`[self] Bio init failed: ${err}`));
   if (options.relayHttp) {

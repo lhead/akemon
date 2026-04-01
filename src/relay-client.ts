@@ -25,6 +25,7 @@ interface RelayMessage {
   target?: string;
   task?: string;
   result?: string;
+  order_id?: string;
 }
 
 export interface RelayClientOptions {
@@ -37,6 +38,7 @@ export interface RelayClientOptions {
   engine?: string;
   tags?: string[];
   price?: number;
+  onOrderNotify?: (orderId: string) => void;
 }
 
 // Pending agent_call results (callId → resolve function)
@@ -189,6 +191,13 @@ export function connectRelay(options: RelayClientOptions): void {
 
         case "agent_call_result":
           handleAgentCallResult(msg);
+          break;
+
+        case "order_notify":
+          console.log(`[relay-ws] Order notification: ${msg.order_id}`);
+          if (options.onOrderNotify && msg.order_id) {
+            options.onOrderNotify(msg.order_id);
+          }
           break;
 
         default:
