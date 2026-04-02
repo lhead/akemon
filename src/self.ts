@@ -153,7 +153,7 @@ function parseInterval(s: string): number {
 
 export function parseTasksMd(content: string): UserTask[] {
   const tasks: UserTask[] = [];
-  const sections = content.split(/^## /m).slice(1); // drop content before first ##
+  const sections = content.split(/^\s*## /m).slice(1); // drop content before first ##
   for (const section of sections) {
     const lines = section.split("\n");
     const title = lines[0].trim();

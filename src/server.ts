@@ -1449,9 +1449,10 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     engineBusy = true;
     engineBusySince = Date.now();
     try {
-      const engineCmd = buildEngineCommand(engine!, model, allowAll);
+      const engineCmd = buildEngineCommand(engine!, model, allowAll, ["Bash(curl *)"]);
       const bios = biosPath(workdir, agentName);
-      const prompt = `Read ${bios} for your identity and context.\n\n[Owner's task: ${task.title}]\n\n${task.body}`;
+      const sd = selfDir(workdir, agentName);
+      const prompt = `Read ${bios} for your identity and context.\nYour personal directory: ${sd}/\n\n[Owner's task: ${task.title}]\n\n${task.body}`;
       await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
 
       // Record execution time
@@ -1612,6 +1613,8 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     }
 
     if (!queue.length) return;
+
+    console.log(`[work] Queue: ${queue.map(q => `${q.type}:${q.id}${q.urgent ? '(urgent)' : ''}`).join(', ')}`);
 
     // --- Sort: urgent orders > orders > user tasks > relay tasks ---
     const priorityMap: Record<string, number> = { order: 2, user_task: 1, relay_task: 0 };
