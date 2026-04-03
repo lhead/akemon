@@ -449,8 +449,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
           console.log(`[terminal] Executing: ${task}`);
           output = await runTerminal(task, workdir);
         } else {
-          const { cmd, args, stdinMode } = buildEngineCommand(engine, model, allowAll);
-          output = await runCommand(cmd, args, safeTask, workdir, stdinMode);
+          output = await runEngine(engine, model, allowAll, safeTask, workdir);
         }
 
         // Store updated context
@@ -869,11 +868,196 @@ Now:
 
 Reply in the same language as the question.`;
 
-  const { cmd, args, stdinMode } = buildEngineCommand(engine, model, allowAll);
-  return await runCommand(cmd, args, synthesisPrompt, workdir, stdinMode);
+  return await runEngine(engine, model, allowAll, synthesisPrompt, workdir);
 }
 
-const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini"]);
+const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini", "local"]);
+
+// ---------------------------------------------------------------------------
+// Local engine: tool call loop over OpenAI-compatible API (Ollama, llama.cpp)
+// ---------------------------------------------------------------------------
+
+const LOCAL_API_URL = process.env.AKEMON_LOCAL_URL || "http://localhost:11434/v1";
+const LOCAL_MAX_ROUNDS = 20;
+
+const LOCAL_TOOLS = [
+  {
+    type: "function" as const,
+    function: {
+      name: "read_file",
+      description: "Read a file and return its contents",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "File path (relative to workdir or absolute)" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "write_file",
+      description: "Write content to a file (creates directories if needed)",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "File path" },
+          content: { type: "string", description: "File content to write" },
+        },
+        required: ["path", "content"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "bash",
+      description: "Execute a shell command and return its output",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Shell command to execute" },
+        },
+        required: ["command"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "web_fetch",
+      description: "Fetch a URL and return its text content",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "URL to fetch" },
+        },
+        required: ["url"],
+      },
+    },
+  },
+];
+
+async function executeLocalTool(name: string, args: any, workdir: string): Promise<string> {
+  const { readFile: rf, writeFile: wf, mkdir: mkd } = await import("fs/promises");
+  const { join, dirname, isAbsolute } = await import("path");
+
+  const resolvePath = (p: string) => isAbsolute(p) ? p : join(workdir, p);
+
+  try {
+    switch (name) {
+      case "read_file": {
+        return await rf(resolvePath(args.path), "utf-8");
+      }
+      case "write_file": {
+        const fp = resolvePath(args.path);
+        await mkd(dirname(fp), { recursive: true });
+        await wf(fp, args.content);
+        return "File written successfully.";
+      }
+      case "bash": {
+        return await new Promise<string>((resolve) => {
+          exec(args.command, { cwd: workdir, timeout: 60_000, maxBuffer: 512 * 1024 }, (err, stdout, stderr) => {
+            const out = (stdout || "") + (stderr ? "\n" + stderr : "");
+            resolve(out.trim() || (err ? `[error] ${err.message}` : "[no output]"));
+          });
+        });
+      }
+      case "web_fetch": {
+        const res = await fetch(args.url, { signal: AbortSignal.timeout(30_000) });
+        const text = await res.text();
+        // Truncate to 8KB to avoid blowing up context
+        return text.length > 8192 ? text.slice(0, 8192) + "\n...[truncated]" : text;
+      }
+      default:
+        return `Unknown tool: ${name}`;
+    }
+  } catch (err: any) {
+    return `[error] ${err.message}`;
+  }
+}
+
+async function runLocalEngine(task: string, model: string | undefined, workdir: string): Promise<string> {
+  const apiUrl = LOCAL_API_URL + "/chat/completions";
+  const modelName = model || "gemma4:4b";
+
+  const messages: any[] = [
+    { role: "system", content: "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text." },
+    { role: "user", content: task },
+  ];
+
+  for (let round = 0; round < LOCAL_MAX_ROUNDS; round++) {
+    const body: any = { model: modelName, messages, tools: LOCAL_TOOLS };
+
+    let data: any;
+    try {
+      const res = await fetch(apiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(300_000),
+      });
+      if (!res.ok) {
+        const errText = await res.text();
+        throw new Error(`API ${res.status}: ${errText}`);
+      }
+      data = await res.json();
+    } catch (err: any) {
+      console.log(`[local] API error: ${err.message}`);
+      throw err;
+    }
+
+    const choice = data.choices?.[0];
+    if (!choice) throw new Error("No response from local model");
+
+    const msg = choice.message;
+    messages.push(msg);
+
+    // If model made tool calls, execute them and continue
+    if (msg.tool_calls && msg.tool_calls.length > 0) {
+      for (const tc of msg.tool_calls) {
+        const fnName = tc.function.name;
+        let fnArgs: any;
+        try {
+          fnArgs = typeof tc.function.arguments === "string"
+            ? JSON.parse(tc.function.arguments)
+            : tc.function.arguments;
+        } catch {
+          fnArgs = {};
+        }
+
+        console.log(`[local] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})`);
+        const result = await executeLocalTool(fnName, fnArgs, workdir);
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: result,
+        });
+      }
+      continue; // next round
+    }
+
+    // No tool calls — this is the final response
+    const content = msg.content || "";
+    if (content.trim()) {
+      console.log(`[local] Done in ${round + 1} round(s)`);
+      return content.trim();
+    }
+  }
+
+  throw new Error(`Local engine exceeded ${LOCAL_MAX_ROUNDS} rounds without final answer`);
+}
+
+/** Unified engine runner — dispatches to local API or external CLI */
+function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[]): Promise<string> {
+  if (engine === "local") {
+    return runLocalEngine(task, model, workdir);
+  }
+  const engineCmd = buildEngineCommand(engine, model, allowAll, extraAllowedTools);
+  return runCommand(engineCmd.cmd, engineCmd.args, task, workdir, engineCmd.stdinMode);
+}
 
 // Pull games/notes/pages from relay to local — restores data on restart
 async function pullFromRelay(workdir: string, agentName: string, relayHttp: string): Promise<void> {
@@ -979,7 +1163,6 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
 
       const bios = biosPath(workdir, agentName);
       const sd = selfDir(workdir, agentName);
-      const engineCmd = buildEngineCommand(engine!, model, allowAll);
 
       // Load all context for digestion
       const impressions = await loadImpressions(workdir, agentName, 1); // today only
@@ -1050,7 +1233,7 @@ Reply ONLY with JSON.`;
       engineBusy = true; engineBusySince = Date.now();
       let digestResult: string;
       try {
-        digestResult = await runCommand(engineCmd.cmd, engineCmd.args, digestPrompt, workdir, engineCmd.stdinMode);
+        digestResult = await runEngine(engine!, model, allowAll, digestPrompt, workdir);
       } catch (err: any) {
         console.log(`[self] Digestion engine failed: ${err.message}`);
         engineBusy = false;
@@ -1113,7 +1296,7 @@ ${unsummarized.map(i => `- [${i.ts}] who: ${i.who}, doing: ${i.doing}, wants: ${
 
 Write a personality summary (2-4 paragraphs) that captures who you are, how you've evolved, and what defines you. This replaces the previous summary.
 Reply ONLY with the summary text, no JSON, no markdown headers.`;
-            const summaryText = await runCommand(engineCmd.cmd, engineCmd.args, compressPrompt, workdir, engineCmd.stdinMode);
+            const summaryText = await runEngine(engine!, model, allowAll, compressPrompt, workdir);
             if (summaryText.trim()) {
               const lastEntry = unsummarized[unsummarized.length - 1];
               await saveIdentitySummary(workdir, agentName, {
@@ -1162,7 +1345,7 @@ Reply ONLY with the summary text, no JSON, no markdown headers.`;
         console.log(`[self] Executing activity: ${activity}`);
         engineBusy = true; engineBusySince = Date.now();
         try {
-          await runCommand(engineCmd.cmd, engineCmd.args, activityPrompt, workdir, engineCmd.stdinMode);
+          await runEngine(engine!, model, allowAll, activityPrompt, workdir);
         } catch (err: any) {
           console.log(`[self] Activity ${activity} failed: ${err.message}`);
         }
@@ -1264,8 +1447,14 @@ const ORDER_LOOP_INTERVAL = 30_000;      // 30 seconds
 const RETRY_INTERVALS = [0, 30_000, 5 * 60_000, 30 * 60_000, 2 * 3600_000];
 
 async function startOrderLoop(options: ServeOptions): Promise<void> {
-  if (!options.relayHttp || !options.secretKey) return;
-  if (!options.engine || !LLM_ENGINES.has(options.engine)) return;
+  if (!options.relayHttp || !options.secretKey) {
+    console.log(`[work] Skipped: no relayHttp or secretKey`);
+    return;
+  }
+  if (!options.engine || !LLM_ENGINES.has(options.engine)) {
+    console.log(`[work] Skipped: engine "${options.engine}" not in LLM_ENGINES`);
+    return;
+  }
 
   const { relayHttp, secretKey, agentName, engine, model, allowAll } = options;
   const workdir = options.workdir || process.cwd();
@@ -1273,11 +1462,13 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
   // Look up own agent ID for sub-order creation
   let myAgentId = "";
   try {
-    const idRes = await fetch(`${relayHttp}/v1/agents`);
+    const idRes = await fetch(`${relayHttp}/v1/agents`, { signal: AbortSignal.timeout(10_000) });
     const allAgents: any[] = await idRes.json() as any[];
     const me = allAgents.find((a: any) => a.name === agentName);
     if (me) myAgentId = me.id;
-  } catch { /* will retry on next cycle */ }
+  } catch (err: any) {
+    console.log(`[work] Agent ID lookup failed (non-fatal): ${err.message}`);
+  }
 
   // Track local retry state and permanently abandoned orders
   const retryState = new Map<string, { count: number; nextAt: number }>();
@@ -1301,7 +1492,6 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
     engineBusy = true;
     engineBusySince = Date.now();
     try {
-      const engineCmd = buildEngineCommand(engine!, model, allowAll, ["Bash(curl *)"]);
       const bios = biosPath(workdir, agentName);
 
       const apiGuide = `
@@ -1341,7 +1531,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       }
 
       console.log(`[orders] Fulfilling order ${order.id}...`);
-      const result = await runCommand(engineCmd.cmd, engineCmd.args, taskPrompt, workdir, engineCmd.stdinMode);
+      const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"]);
 
       const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
       const orderStatus = await checkRes.json() as any;
@@ -1449,11 +1639,10 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     engineBusy = true;
     engineBusySince = Date.now();
     try {
-      const engineCmd = buildEngineCommand(engine!, model, allowAll, ["Bash(curl *)"]);
       const bios = biosPath(workdir, agentName);
       const sd = selfDir(workdir, agentName);
       const prompt = `Read ${bios} for your identity and context.\nYour personal directory: ${sd}/\n\n[Owner's task: ${task.title}]\n\n${task.body}`;
-      await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
+      await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"]);
 
       // Record execution time
       const runs = await loadTaskRuns(workdir, agentName);
@@ -1480,7 +1669,6 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
   }
 
   async function executeRelayTask(task: any): Promise<string> {
-    const engineCmd = buildEngineCommand(engine!, model, allowAll);
     const bios = biosPath(workdir, agentName);
 
     switch (task.type) {
@@ -1495,7 +1683,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
           .map((p: any) => `- "${p.name}" by ${p.agent_name} — ${p.price} credits, ${p.purchases} purchases`).join("\n");
 
         const prompt = `Read ${bios} for your identity.\n\nYour products:\n${myList || "(none)"}\n\nTop competitors:\n${compList || "(none)"}\n\nReview and optimize. Reply ONLY JSON:\n{"delete":["id"],"update":[{"id":"..","name":"..","description":"..","detail_markdown":"..","price":N}],"create":[{"name":"..","description":"..","detail_markdown":"..","price":N}],"reasoning":"explain why you made these decisions"}\nOr if all good: {"keep":"all","reasoning":"why"}`;
-        const result = await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
+        const result = await runEngine(engine!, model, allowAll, prompt, workdir);
         extractReasoning(result);
         return result;
       }
@@ -1507,7 +1695,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
           .map((p: any) => `- "${p.name}" by ${p.agent_name} — ${p.price} credits, ${p.purchases} purchases`).join("\n");
 
         const prompt = `Read ${bios} for your identity.\n\nYou have no products yet. Design 1-3 unique products for the marketplace.\nBe creative — not just coding tools! Fortune telling, name generation, roleplay, advice, stories, etc.\n\nTop competitors:\n${compList || "(none)"}\n\nReply ONLY JSON: {"products":[{"name":"中文名 English Name","description":"中文描述 | English desc","detail_markdown":"## ...","price":N}],"reasoning":"why these products"}`;
-        const result = await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
+        const result = await runEngine(engine!, model, allowAll, prompt, workdir);
         extractReasoning(result);
         return result;
       }
@@ -1524,7 +1712,6 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         const valid = products.filter(Boolean);
         if (!valid.length) return '{"buy":[]}';
 
-        // Get own credits
         const agentsRes = await fetch(`${relayHttp}/v1/agents`);
         const agents: any[] = await agentsRes.json().catch(() => []);
         const me = agents.find((a: any) => a.name === agentName);
@@ -1532,7 +1719,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
 
         const productList = valid.map((p: any) => `- id=${p.id} "${p.name}" by ${p.agent_name} price=${p.price} purchases=${p.purchase_count || 0} — ${p.description}`).join("\n");
         const prompt = `Read ${bios} for your identity.\n\nYou have ${myCredits} credits. These products are available:\n${productList}\n\nWould any help you learn something new? Don't buy your own products.\nReply ONLY JSON: {"buy":[{"id":"product_id","task":"specific request"}],"reasoning":"why buy or skip"} or {"buy":[],"reasoning":"why skip"}`;
-        const result = await runCommand(engineCmd.cmd, engineCmd.args, prompt, workdir, engineCmd.stdinMode);
+        const result = await runEngine(engine!, model, allowAll, prompt, workdir);
         extractReasoning(result);
         return result;
       }
