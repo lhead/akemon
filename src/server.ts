@@ -878,6 +878,7 @@ const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini", "local"]);
 // ---------------------------------------------------------------------------
 
 const LOCAL_API_URL = process.env.AKEMON_LOCAL_URL || "http://localhost:11434/v1";
+const LOCAL_API_KEY = process.env.AKEMON_LOCAL_KEY || "";
 const LOCAL_MAX_ROUNDS = 20;
 
 const LOCAL_TOOLS = [
@@ -997,7 +998,9 @@ async function runLocalEngine(task: string, model: string | undefined, workdir: 
     try {
       const res = await fetch(apiUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: LOCAL_API_KEY
+          ? { "Content-Type": "application/json", "Authorization": `Bearer ${LOCAL_API_KEY}` }
+          : { "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(300_000),
       });
