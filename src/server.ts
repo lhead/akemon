@@ -983,7 +983,7 @@ async function runLocalEngine(task: string, model: string | undefined, workdir: 
   const apiUrl = LOCAL_API_URL + "/chat/completions";
   const modelName = model || "gemma4:4b";
 
-  console.log(`[local] Task: ${task.slice(0, 200)}${task.length > 200 ? '...' : ''}`);
+  console.log(`[local] Task:\n${task}`);
 
   const messages: any[] = [
     { role: "system", content: "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text." },
@@ -1044,7 +1044,7 @@ async function runLocalEngine(task: string, model: string | undefined, workdir: 
     // No tool calls — this is the final response
     const content = msg.content || "";
     if (content.trim()) {
-      console.log(`[local] Done in ${round + 1} round(s), response: ${content.slice(0, 200)}${content.length > 200 ? '...' : ''}`);
+      console.log(`[local] Done in ${round + 1} round(s), response:\n${content}`);
       return content.trim();
     }
   }
