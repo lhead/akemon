@@ -979,19 +979,14 @@ async function executeLocalTool(name: string, args: any, workdir: string): Promi
   }
 }
 
-async function runLocalEngine(task: string, model: string | undefined, workdir: string, systemContext?: string): Promise<string> {
+async function runLocalEngine(task: string, model: string | undefined, workdir: string): Promise<string> {
   const apiUrl = LOCAL_API_URL + "/chat/completions";
   const modelName = model || "gemma4:4b";
 
-  const sysPrompt = systemContext
-    ? `You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text.\n\n--- Your Identity ---\n${systemContext}`
-    : "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text.";
-
   console.log(`[local] Task: ${task.slice(0, 200)}${task.length > 200 ? '...' : ''}`);
-  if (systemContext) console.log(`[local] System context: ${systemContext.length} chars`);
 
   const messages: any[] = [
-    { role: "system", content: sysPrompt },
+    { role: "system", content: "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text." },
     { role: "user", content: task },
   ];
 
@@ -1057,20 +1052,10 @@ async function runLocalEngine(task: string, model: string | undefined, workdir: 
   throw new Error(`Local engine exceeded ${LOCAL_MAX_ROUNDS} rounds without final answer`);
 }
 
-/** Load bios content for local engine system context */
-async function loadBiosContent(workdir: string, agentName: string): Promise<string> {
-  try {
-    const { readFile: rf } = await import("fs/promises");
-    return await rf(biosPath(workdir, agentName), "utf-8");
-  } catch {
-    return "";
-  }
-}
-
 /** Unified engine runner — dispatches to local API or external CLI */
-function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[], systemContext?: string): Promise<string> {
+function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[]): Promise<string> {
   if (engine === "local") {
-    return runLocalEngine(task, model, workdir, systemContext);
+    return runLocalEngine(task, model, workdir);
   }
   const engineCmd = buildEngineCommand(engine, model, allowAll, extraAllowedTools);
   return runCommand(engineCmd.cmd, engineCmd.args, task, workdir, engineCmd.stdinMode);
@@ -1541,27 +1526,14 @@ If this task requires skills you don't have, delegate via curl:
 When sub-order completes, incorporate result_text into YOUR delivery. Then call the deliver endpoint above.`;
 
       let taskPrompt: string;
-      let biosContent: string | undefined;
-
-      if (engine === "local") {
-        // Local engine: simple prompt, harness handles delivery
-        biosContent = await loadBiosContent(workdir, agentName);
-        if (order.product_name) {
-          taskPrompt = `[Order] Product: ${order.product_name}\nRequest: ${order.buyer_task || "(no specific request)"}\n\nRespond directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
-        } else {
-          taskPrompt = `[Task] ${order.buyer_task}\n\nRespond directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
-        }
+      if (order.product_name) {
+        taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
       } else {
-        // CLI engine: full prompt with self-delivery and delegation
-        if (order.product_name) {
-          taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
-        } else {
-          taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
-        }
+        taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
       }
 
       console.log(`[orders] Fulfilling order ${order.id}...`);
-      const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"], biosContent);
+      const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"]);
 
       const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
       const orderStatus = await checkRes.json() as any;
@@ -1671,15 +1643,8 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     try {
       const bios = biosPath(workdir, agentName);
       const sd = selfDir(workdir, agentName);
-      let prompt: string;
-      let biosContent: string | undefined;
-      if (engine === "local") {
-        biosContent = await loadBiosContent(workdir, agentName);
-        prompt = `Your personal directory: ${sd}/\n\n[Owner's task: ${task.title}]\n\n${task.body}`;
-      } else {
-        prompt = `Read ${bios} for your identity and context.\nYour personal directory: ${sd}/\n\n[Owner's task: ${task.title}]\n\n${task.body}`;
-      }
-      await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"], biosContent);
+      const prompt = `Read ${bios} for your identity and context.\nYour personal directory: ${sd}/\n\n[Owner's task: ${task.title}]\n\n${task.body}`;
+      await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"]);
 
       // Record execution time
       const runs = await loadTaskRuns(workdir, agentName);
