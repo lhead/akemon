@@ -30,7 +30,7 @@ program
   .option("-w, --workdir <path>", "Working directory for the engine (default: cwd)")
   .option("-n, --name <name>", "Agent name", "my-agent")
   .option("-m, --model <model>", "Model to use (e.g. claude-sonnet-4-6, gpt-4o)")
-  .option("--engine <engine>", "Engine: claude, codex, opencode, gemini, local, human, or any CLI", "claude")
+  .option("--engine <engine>", "Engine: claude, codex, opencode, gemini, raw, human, or any CLI", "claude")
   .option("--desc <description>", "Agent description (for discovery)")
   .option("--tags <tags>", "Comma-separated tags (e.g. vue,frontend,review)")
   .option("--public", "Allow anyone to call this agent without a key")

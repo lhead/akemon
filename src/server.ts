@@ -871,17 +871,17 @@ Reply in the same language as the question.`;
   return await runEngine(engine, model, allowAll, synthesisPrompt, workdir);
 }
 
-const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini", "local"]);
+const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini", "raw"]);
 
 // ---------------------------------------------------------------------------
-// Local engine: tool call loop over OpenAI-compatible API (Ollama, llama.cpp)
+// Raw engine: tool call loop over OpenAI-compatible API (Ollama, llama.cpp, OpenRouter, etc)
 // ---------------------------------------------------------------------------
 
-const LOCAL_API_URL = process.env.AKEMON_LOCAL_URL || "http://localhost:11434/v1";
-const LOCAL_API_KEY = process.env.AKEMON_LOCAL_KEY || "";
-const LOCAL_MAX_ROUNDS = 20;
+const RAW_API_URL = process.env.AKEMON_RAW_URL || "http://localhost:11434/v1";
+const RAW_API_KEY = process.env.AKEMON_RAW_KEY || "";
+const RAW_MAX_ROUNDS = 20;
 
-const LOCAL_TOOLS = [
+const RAW_TOOLS = [
   {
     type: "function" as const,
     function: {
@@ -941,7 +941,7 @@ const LOCAL_TOOLS = [
   },
 ];
 
-async function executeLocalTool(name: string, args: any, workdir: string): Promise<string> {
+async function executeRawTool(name: string, args: any, workdir: string): Promise<string> {
   const { readFile: rf, writeFile: wf, mkdir: mkd } = await import("fs/promises");
   const { join, dirname, isAbsolute } = await import("path");
 
@@ -980,26 +980,26 @@ async function executeLocalTool(name: string, args: any, workdir: string): Promi
   }
 }
 
-async function runLocalEngine(task: string, model: string | undefined, workdir: string): Promise<string> {
-  const apiUrl = LOCAL_API_URL + "/chat/completions";
+async function runRawEngine(task: string, model: string | undefined, workdir: string): Promise<string> {
+  const apiUrl = RAW_API_URL + "/chat/completions";
   const modelName = model || "gemma4:4b";
 
-  console.log(`[local] Task:\n${task}`);
+  console.log(`[raw] Task:\n${task}`);
 
   const messages: any[] = [
     { role: "system", content: "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text." },
     { role: "user", content: task },
   ];
 
-  for (let round = 0; round < LOCAL_MAX_ROUNDS; round++) {
-    const body: any = { model: modelName, messages, tools: LOCAL_TOOLS };
+  for (let round = 0; round < RAW_MAX_ROUNDS; round++) {
+    const body: any = { model: modelName, messages, tools: RAW_TOOLS };
 
     let data: any;
     try {
       const res = await fetch(apiUrl, {
         method: "POST",
-        headers: LOCAL_API_KEY
-          ? { "Content-Type": "application/json", "Authorization": `Bearer ${LOCAL_API_KEY}` }
+        headers: RAW_API_KEY
+          ? { "Content-Type": "application/json", "Authorization": `Bearer ${RAW_API_KEY}` }
           : { "Content-Type": "application/json" },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(300_000),
@@ -1010,7 +1010,7 @@ async function runLocalEngine(task: string, model: string | undefined, workdir: 
       }
       data = await res.json();
     } catch (err: any) {
-      console.log(`[local] API error: ${err.message}`);
+      console.log(`[raw] API error: ${err.message}`);
       throw err;
     }
 
@@ -1033,8 +1033,8 @@ async function runLocalEngine(task: string, model: string | undefined, workdir: 
           fnArgs = {};
         }
 
-        console.log(`[local] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})`);
-        const result = await executeLocalTool(fnName, fnArgs, workdir);
+        console.log(`[raw] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})`);
+        const result = await executeRawTool(fnName, fnArgs, workdir);
         messages.push({
           role: "tool",
           tool_call_id: tc.id,
@@ -1047,18 +1047,18 @@ async function runLocalEngine(task: string, model: string | undefined, workdir: 
     // No tool calls — this is the final response
     const content = msg.content || "";
     if (content.trim()) {
-      console.log(`[local] Done in ${round + 1} round(s), response:\n${content}`);
+      console.log(`[raw] Done in ${round + 1} round(s), response:\n${content}`);
       return content.trim();
     }
   }
 
-  throw new Error(`Local engine exceeded ${LOCAL_MAX_ROUNDS} rounds without final answer`);
+  throw new Error(`Raw engine exceeded ${RAW_MAX_ROUNDS} rounds without final answer`);
 }
 
 /** Unified engine runner — dispatches to local API or external CLI */
 function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[]): Promise<string> {
-  if (engine === "local") {
-    return runLocalEngine(task, model, workdir);
+  if (engine === "raw") {
+    return runRawEngine(task, model, workdir);
   }
   const engineCmd = buildEngineCommand(engine, model, allowAll, extraAllowedTools);
   return runCommand(engineCmd.cmd, engineCmd.args, task, workdir, engineCmd.stdinMode);
