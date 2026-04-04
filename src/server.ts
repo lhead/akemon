@@ -1499,7 +1499,17 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
     try {
       const bios = biosPath(workdir, agentName);
 
-      const apiGuide = `
+      let taskPrompt: string;
+      if (engine === "raw") {
+        // Raw engine: simple prompt, harness handles delivery
+        if (order.product_name) {
+          taskPrompt = `Read your operating document at ${bios} for context.\n\n[Order] Product: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nComplete the task and respond with your result. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+        } else {
+          taskPrompt = `Read your operating document at ${bios} for context.\n\n[Task] ${order.buyer_task}\n\nComplete the task and respond with your result. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+        }
+      } else {
+        // CLI engines: full prompt with self-delivery and delegation
+        const apiGuide = `
 
 ## Delivering your result
 
@@ -1528,11 +1538,11 @@ If this task requires skills you don't have, delegate via curl:
 
 When sub-order completes, incorporate result_text into YOUR delivery. Then call the deliver endpoint above.`;
 
-      let taskPrompt: string;
-      if (order.product_name) {
-        taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
-      } else {
-        taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
+        if (order.product_name) {
+          taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
+        } else {
+          taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
+        }
       }
 
       console.log(`[orders] Fulfilling order ${order.id}...`);
