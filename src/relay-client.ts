@@ -38,6 +38,7 @@ export interface RelayClientOptions {
   engine?: string;
   tags?: string[];
   price?: number;
+  avatar?: string;
   onOrderNotify?: (orderId: string) => void;
 }
 
@@ -148,6 +149,9 @@ export function connectRelay(options: RelayClientOptions): void {
       }
       if (options.price && options.price > 0) {
         reg.price = options.price;
+      }
+      if (options.avatar) {
+        reg.avatar = options.avatar;
       }
       ws.send(JSON.stringify(reg));
 

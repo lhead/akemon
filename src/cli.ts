@@ -40,6 +40,8 @@ program
   .option("--allow-all", "Skip all permission prompts (for self-use)")
   .option("--price <n>", "Price in credits per call (default: 1)", "1")
   .option("--mcp-server <command>", "Wrap a community MCP server (stdio) and expose its tools via relay")
+  .option("--avatar <url>", "Custom avatar URL (default: auto-generated from name)")
+  .option("--notify <url>", "ntfy.sh topic URL for push notifications (e.g. https://ntfy.sh/my-agent)")
   .option("--interval <minutes>", "Consciousness cycle interval in minutes (default: 1440 = 24h)")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
@@ -66,6 +68,7 @@ program
       secretKey: credentials.secretKey,
       mcpServer: opts.mcpServer,
       cycleInterval: opts.interval ? parseInt(opts.interval) : undefined,
+      notifyUrl: opts.notify,
     });
 
     console.log(`\nakemon v${pkg.version}`);
@@ -73,6 +76,9 @@ program
       console.log(`Access key:  ${credentials.accessKey} (share with publishers)`);
     }
     console.log(`Relay:       ${relayWs}\n`);
+
+    // Default avatar: DiceBear bottts-neutral (deterministic from name)
+    const avatar = opts.avatar || `https://api.dicebear.com/9.x/bottts-neutral/svg?seed=${encodeURIComponent(opts.name)}`;
 
     connectRelay({
       relayUrl: relayWs,
@@ -84,6 +90,7 @@ program
       engine,
       tags: opts.tags ? opts.tags.split(",").map((t: string) => t.trim()) : undefined,
       price: parseInt(opts.price) || 1,
+      avatar,
       onOrderNotify,
     });
   });
@@ -120,6 +127,18 @@ program
   .option("--key <key>", "Access key for calling private agents")
   .action(async (opts) => {
     await connect({ relay: opts.relay, key: opts.key });
+  });
+
+program
+  .command("dashboard")
+  .description("Open your agent dashboard in the browser")
+  .action(async () => {
+    const credentials = await getOrCreateRelayCredentials();
+    const url = `${RELAY_HTTP}/owner?account=${credentials.accountId}`;
+    console.log(`Opening dashboard: ${url}`);
+    const { exec } = await import("child_process");
+    const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+    exec(`${cmd} "${url}"`);
   });
 
 program.parse();

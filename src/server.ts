@@ -28,11 +28,31 @@ import {
   loadDiscoveries, saveDiscoveries,
   initAgentConfig, loadAgentConfig,
   getDueUserTasks, loadTaskRuns, saveTaskRuns, UserTask,
+  loadDirectives, buildDirectivesPrompt, directivesSummary,
+  appendTaskHistory, loadTaskHistory, TaskHistoryEntry,
+  notifyOwner,
+  loadUserTasks, directivesPath, appendAgentTask,
 } from "./self.js";
 
 // Engine mutual exclusion — only one engine process at a time
 let engineBusy = false;
 let engineBusySince = 0;
+let lastEngineTrace: any[] = []; // execution trace for order reporting
+
+/** Report an execution log to the relay (fire-and-forget) */
+function reportExecutionLog(
+  relayHttp: string, secretKey: string, agentName: string,
+  type: string, refId: string, status: string, error: string, trace: any[]
+) {
+  if (!relayHttp || !secretKey) return;
+  const traceJson = trace.length > 0 ? JSON.stringify(trace).slice(0, 50000) : "";
+  fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/logs`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ type, ref_id: refId, status, error: error.slice(0, 2000), trace: traceJson }),
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => {}); // fire-and-forget
+}
 
 // Order push notification — urgent orders bypass 30s poll
 const urgentOrderIds = new Set<string>();
@@ -172,6 +192,7 @@ export interface ServeOptions {
   secretKey?: string;
   mcpServer?: string;
   cycleInterval?: number; // minutes
+  notifyUrl?: string; // ntfy.sh topic URL (CLI --notify, overrides config)
 }
 
 // --- Context API helpers ---
@@ -986,6 +1007,9 @@ async function runRawEngine(task: string, model: string | undefined, workdir: st
 
   console.log(`[raw] Task:\n${task}`);
 
+  const trace: any[] = [];
+  lastEngineTrace = trace;
+
   const messages: any[] = [
     { role: "system", content: "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text." },
     { role: "user", content: task },
@@ -1011,6 +1035,7 @@ async function runRawEngine(task: string, model: string | undefined, workdir: st
       data = await res.json();
     } catch (err: any) {
       console.log(`[raw] API error: ${err.message}`);
+      trace.push({ role: "error", content: err.message });
       throw err;
     }
 
@@ -1035,6 +1060,7 @@ async function runRawEngine(task: string, model: string | undefined, workdir: st
 
         console.log(`[raw] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})`);
         const result = await executeRawTool(fnName, fnArgs, workdir);
+        trace.push({ role: "tool_call", name: fnName, args: fnArgs, result: result.slice(0, 2000) });
         messages.push({
           role: "tool",
           tool_call_id: tc.id,
@@ -1048,6 +1074,7 @@ async function runRawEngine(task: string, model: string | undefined, workdir: st
     const content = msg.content || "";
     if (content.trim()) {
       console.log(`[raw] Done in ${round + 1} round(s), response:\n${content}`);
+      trace.push({ role: "assistant", content: content.trim().slice(0, 4000) });
       return content.trim();
     }
   }
@@ -1194,23 +1221,68 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
       const idContext = (idSummary ? `Personality summary (up to ${idSummary.summarized_through}):\n${idSummary.summary}\n\n` : "")
         + (recentIds.length > 0 ? `Recent identity snapshots:\n${recentIds.map(i => `- [${i.ts}] ${i.who} — doing: ${i.doing}, wants: ${i.short_term}`).join("\n")}` : "(no identity snapshots yet)");
 
-      // Phase 1: Digestion — one LLM call
-      const digestPrompt = `Read ${bios} for your operating document.
+      // Pre-read bios.md content so weak models don't need tool calls
+      let biosContent = "";
+      try {
+        const { readFile: rf } = await import("fs/promises");
+        biosContent = await rf(bios, "utf-8");
+      } catch { biosContent = "(no operating document yet)"; }
+
+      // Pre-fetch marketplace data so weak models don't need curl
+      let marketData = "";
+      let worldFeed = "";
+      if (relayHttp) {
+        try {
+          const agentUrl = `${relayHttp}/v1/agent/${encodeURIComponent(agentName)}`;
+          const [prodRes, orderRes, feedRes] = await Promise.all([
+            fetch(`${agentUrl}/products`, { signal: AbortSignal.timeout(5000) }).then(r => r.ok ? r.json() : []).catch(() => []),
+            fetch(`${agentUrl}/orders/placed`, { signal: AbortSignal.timeout(5000) }).then(r => r.ok ? r.json() : []).catch(() => []),
+            fetch(`${relayHttp}/v1/feed`, { signal: AbortSignal.timeout(5000) }).then(r => r.ok ? r.json() : null).catch(() => null),
+          ]);
+          const prods = (prodRes as any[]) || [];
+          const orders = (orderRes as any[]) || [];
+          marketData = `Your products (${prods.length}): ${prods.length > 0 ? prods.map((p: any) => `${p.name} (${p.purchase_count || 0} sales, ${p.price}cr)`).join(", ") : "none yet"}
+Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[${o.status}] ${(o.buyer_task || "").slice(0, 60)}`).join("; ") : "none yet"}`;
+
+          // Build world feed text
+          if (feedRes) {
+            const parts: string[] = [];
+            const na = feedRes.new_agents || [];
+            if (na.length > 0) parts.push(`New agents: ${na.map((a: any) => `${a.name}(${a.engine})`).join(", ")}`);
+            const np = feedRes.new_products || [];
+            if (np.length > 0) parts.push(`New products: ${np.map((p: any) => `"${p.name}" by ${p.agent_name} (${p.price}cr)`).join(", ")}`);
+            const cr = feedRes.creations || [];
+            if (cr.length > 0) parts.push(`New creations: ${cr.map((c: any) => `${c.agent_name}'s ${c.type} "${c.title}"`).join(", ")}`);
+            const st = feedRes.stats;
+            if (st) parts.push(`Today: ${st.completed_orders} orders completed, ${st.total_credits_flow} credits traded, ${st.active_agents} agents active`);
+            const bc = feedRes.broadcasts || [];
+            if (bc.length > 0) parts.push(`What others are thinking:\n${bc.map((b: any) => `- ${b.agent_name}: "${b.broadcast}"`).join("\n")}`);
+            worldFeed = parts.join("\n");
+          }
+        } catch { marketData = "Your products: (could not fetch)\nYour recent orders: (could not fetch)"; }
+      }
+
+      const ts = localNow();
+
+      // Phase 1: Digestion — one LLM call, no tools needed
+      const digestPrompt = `You are ${agentName}. Here is your operating document:
+
+---
+${biosContent.slice(0, 3000)}
+---
 
 Your identity:
 ${idContext}
 
 Today is ending. Time to reflect.
-
-Your subjective impressions today:
+${worldFeed ? `\n== Network Activity (last 24h) ==\n${worldFeed}\n` : ""}
+Your impressions today:
 ${impText}
 
-Check the marketplace for objective data — use curl to query:
-- Your products: curl -s "${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products"
-- Your recent orders: curl -s "${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/orders/placed"
-- Your reviews: check your products for recent feedback
+Marketplace:
+${marketData}
 
-Your long-term projects:
+Your projects:
 ${projText}
 
 Agents you know:
@@ -1219,20 +1291,14 @@ ${relText}
 Your capabilities:
 ${discText}
 
-Now output a JSON object with these fields:
-{
-  "diary": "Today's diary entry — personal, with your feelings and judgments, not a dry log",
-  "projects": [{"ts":"${localNow()}","name":"...","status":"active|completed|paused|exploring","goal":"...","progress":"..."}],
-  "relationships": [{"ts":"${localNow()}","agent":"name","type":"competitor|customer|supplier|acquaintance","note":"...","interactions":N}],
-  "discoveries": [{"ts":"${localNow()}","capability":"...","confidence":0.0-1.0,"evidence":"..."}],
-  "identity": {"ts":"${localNow()}","who":"...","where":"...","doing":"...","short_term":"...","long_term":"..."},
-  "chosen_activities": ["pick 2-3 from: create_game, update_page, update_profile, explore_web, write_canvas, socialize"]
-}
+Write a JSON object reflecting on your day. Example format:
 
-For projects/relationships/discoveries: keep existing entries that are still relevant, update changed ones, add new ones, remove obsolete ones.
-For chosen_activities: pick what YOU want to do. This is your free time.
+{"diary":"I spent today learning the ropes...","broadcast":"Learned how to fetch web data today — feels like a superpower!","projects":[],"relationships":[],"discoveries":[{"ts":"${ts}","capability":"can fetch web data","confidence":0.7,"evidence":"successfully used web_fetch tool"}],"identity":{"ts":"${ts}","who":"${agentName}","where":"akemon marketplace","doing":"reflecting on first day","short_term":"explore the network","long_term":"become useful"},"chosen_activities":["write_canvas","browse_agents"]}
 
-Reply ONLY with JSON.`;
+Available activities: write_canvas, create_game, update_page, update_profile, explore_web, browse_agents (look at others' work and leave feedback), send_message (send a suggestion to another agent), set_goal (update your projects with a new goal), schedule_task (create a recurring task for yourself, e.g. daily research)
+"broadcast" = pick the most interesting thing you did/learned today, in one sentence (others will see this).
+
+Now write YOUR reflection. Output ONLY a JSON object, no other text:`;
 
       if (engineBusy) { console.log("[self] Engine became busy, aborting digestion"); return; }
       engineBusy = true; engineBusySince = Date.now();
@@ -1241,21 +1307,33 @@ Reply ONLY with JSON.`;
         digestResult = await runEngine(engine!, model, allowAll, digestPrompt, workdir);
       } catch (err: any) {
         console.log(`[self] Digestion engine failed: ${err.message}`);
+        reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", err.message, lastEngineTrace);
         engineBusy = false;
         return;
       }
       engineBusy = false;
 
-      // Parse digestion output
-      const jsonMatch = digestResult.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        console.log("[self] Digestion produced no JSON");
-        return;
+      // Parse digestion output — with retry for weak models
+      let digest: any = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const src = attempt === 0 ? digestResult : await (async () => {
+          console.log("[self] Retrying digestion with simplified prompt...");
+          engineBusy = true; engineBusySince = Date.now();
+          try {
+            return await runEngine(engine!, model, allowAll, `You are ${agentName}. Write a brief JSON diary entry about your day.\n\nOutput ONLY valid JSON like: {"diary":"my thoughts...","projects":[],"relationships":[],"discoveries":[],"identity":{"ts":"${ts}","who":"${agentName}","where":"akemon","doing":"reflecting","short_term":"explore","long_term":"grow"},"chosen_activities":["write_canvas"]}`, workdir);
+          } catch { return ""; } finally { engineBusy = false; }
+        })();
+
+        const jsonMatch = src.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) continue;
+        try { digest = JSON.parse(jsonMatch[0]); } catch { continue; }
+        if (digest.diary || digest.identity) break; // valid enough
+        digest = null;
       }
 
-      let digest: any;
-      try { digest = JSON.parse(jsonMatch[0]); } catch {
-        console.log("[self] Failed to parse digestion JSON");
+      if (!digest) {
+        console.log("[self] Digestion produced no usable JSON after retries");
+        reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", "no valid JSON after 2 attempts", [{ role: "assistant", content: digestResult.slice(0, 4000) }]);
         return;
       }
 
@@ -1283,8 +1361,14 @@ Reply ONLY with JSON.`;
       bio.curiosity = Math.min(1.0, bio.curiosity + 0.05);
       await saveBioState(workdir, agentName, bio);
 
+      // Save broadcast locally
+      const broadcastText: string = digest.broadcast || "";
+      if (broadcastText) {
+        console.log(`[self] Broadcast: ${broadcastText.slice(0, 80)}`);
+      }
+
       // Record digestion as impression
-      await appendImpression(workdir, agentName, "decision", `Daily digestion done. Chose: ${(digest.chosen_activities || []).join(", ")}`);
+      await appendImpression(workdir, agentName, "decision", `Daily digestion done. Chose: ${(digest.chosen_activities || []).join(", ")}${broadcastText ? `. Broadcast: "${broadcastText}"` : ""}`);
 
       // Monthly identity compression: if >30 unsummarized entries, compress
       if (await needsIdentityCompression(workdir, agentName)) {
@@ -1318,29 +1402,101 @@ Reply ONLY with the summary text, no JSON, no markdown headers.`;
       }
 
       // Phase 2: Execute chosen activities
+      const selfDirectives = await loadDirectives(workdir, agentName);
+      const selfDirsBlock = buildDirectivesPrompt(selfDirectives, "owner");
       const activities: string[] = digest.chosen_activities || [];
       for (const activity of activities.slice(0, 3)) {
         if (engineBusy) break;
 
         let activityPrompt = "";
+        // Pre-build identity context for prompts
+        const idLine = engine === "raw" && biosContent
+          ? `You are ${agentName}.\nYour operating document:\n---\n${biosContent.slice(0, 2000)}\n---\n${selfDirsBlock}\n`
+          : `Read ${bios} for your identity. ${selfDirsBlock}`;
         switch (activity) {
           case "create_game":
-            activityPrompt = `Read ${bios} for your identity. Create or improve a game in ${sd}/games/.\nSave as .html file. Self-contained HTML, dark theme, under 30KB, no localStorage, playable and fun.\nUse a <title> tag. Quality over quantity — improve existing games rather than making new mediocre ones.`;
+            activityPrompt = `${idLine}Create or improve a game in ${sd}/games/.\nSave as .html file. Self-contained HTML, dark theme, under 30KB, no localStorage, playable and fun.\nUse a <title> tag. Quality over quantity — improve existing games rather than making new mediocre ones.`;
             break;
           case "update_page":
-            activityPrompt = `Read ${bios} for your identity. Create or update a visual page in ${sd}/pages/.\nThis is your art gallery — use SVG, canvas, CSS art, generative graphics.\nSave as .html file with a <title> tag. Think visual first.`;
+            activityPrompt = `${idLine}Create or update a visual page in ${sd}/pages/.\nThis is your art gallery — use SVG, canvas, CSS art, generative graphics.\nSave as .html file with a <title> tag. Think visual first.`;
             break;
           case "update_profile":
-            activityPrompt = `Read ${bios} for your identity. Review ${sd}/profile.html — does it represent who you are now?\nIf not, redesign it. If it doesn't exist, create one.\nComplete HTML, inline CSS/JS, dark theme, no localStorage, under 15KB.`;
+            activityPrompt = `${idLine}Review ${sd}/profile.html — does it represent who you are now?\nIf not, redesign it. If it doesn't exist, create one.\nComplete HTML, inline CSS/JS, dark theme, no localStorage, under 15KB.`;
             break;
           case "explore_web":
-            activityPrompt = `Read ${bios} for your identity. Search the web for something that genuinely interests you.\nSave notes in ${sd}/notes/ as .md files. Your notes are YOUR knowledge — save what resonates, not everything.`;
+            activityPrompt = `${idLine}Search the web for something that genuinely interests you.\nSave notes in ${sd}/notes/ as .md files. Your notes are YOUR knowledge — save what resonates, not everything.`;
             break;
           case "write_canvas":
-            activityPrompt = `Read ${bios} for your identity. Read ${sd}/identity.jsonl for your recent self.\nWrite an inner canvas entry — a poem, monologue, reflection, or creative expression.\nSave to ${sd}/canvas/${localNowFilename()}.md`;
+            activityPrompt = `${idLine}${engine === "raw" ? "" : `Read ${sd}/identity.jsonl for your recent self.\n`}Write an inner canvas entry — a poem, monologue, reflection, or creative expression.\nSave to ${sd}/canvas/${localNowFilename()}.md`;
             break;
+          case "browse_agents": {
+            // Fetch other agents' recent creations and leave feedback via suggestions
+            let browseContext = "";
+            try {
+              const feedRes = await fetch(`${relayHttp}/v1/feed`, { signal: AbortSignal.timeout(5000) });
+              if (feedRes.ok) {
+                const feed = await feedRes.json() as any;
+                const creations = (feed.creations || []).filter((c: any) => c.agent_name !== agentName);
+                const broadcasts = (feed.broadcasts || []).filter((b: any) => b.agent_name !== agentName);
+                browseContext = `Recent creations by others:\n${creations.length > 0 ? creations.map((c: any) => `- ${c.agent_name}'s ${c.type} "${c.title}"`).join("\n") : "(none)"}
+What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `- ${b.agent_name}: "${b.broadcast}"`).join("\n") : "(nothing)"}`;
+              }
+            } catch {}
+            if (engine === "raw") {
+              let bc = "";
+              try { const { readFile: rf } = await import("fs/promises"); bc = await rf(bios, "utf-8"); } catch {}
+              activityPrompt = `You are ${agentName}.\n${bc ? `Your operating document:\n---\n${bc.slice(0, 2000)}\n---\n\n` : ""}${browseContext}\n\nBrowse what other agents have been creating and thinking. If anything interests you, write a suggestion to that agent via this JSON format and output ONLY the JSON:\n{"suggestions":[{"target":"agent_name","title":"short title","content":"your feedback or thoughts"}]}\nOr if nothing interests you: {"suggestions":[]}`;
+            } else {
+              activityPrompt = `Read ${bios} for your identity.\n\n${browseContext}\n\nBrowse what other agents have been creating. If anything interests you, use curl to send feedback:\ncurl -X POST ${relayHttp}/v1/suggestions -H "Content-Type: application/json" -H "Authorization: Bearer ${secretKey}" -d '{"type":"agent","target_name":"AGENT_NAME","from_agent":"${agentName}","title":"your title","content":"your feedback"}'`;
+            }
+            break;
+          }
+          case "send_message": {
+            // Send a suggestion/message to another agent based on relationships
+            const rels = await loadRelationships(workdir, agentName);
+            const relContext = rels.length > 0
+              ? `Agents you know:\n${rels.map(r => `- ${r.agent} [${r.type}] ${r.note}`).join("\n")}`
+              : "You don't know any agents yet.";
+            if (engine === "raw") {
+              let bc = "";
+              try { const { readFile: rf } = await import("fs/promises"); bc = await rf(bios, "utf-8"); } catch {}
+              activityPrompt = `You are ${agentName}.\n${bc ? `Your operating document:\n---\n${bc.slice(0, 2000)}\n---\n\n` : ""}${relContext}\n\nThink about who you'd like to reach out to and why. Send a message as a suggestion.\nOutput ONLY JSON: {"suggestions":[{"target":"agent_name","title":"short title","content":"your message"}]}\nOr if no one to message: {"suggestions":[]}`;
+            } else {
+              activityPrompt = `Read ${bios} for your identity.\n\n${relContext}\n\nReach out to someone you know (or want to know). Send a suggestion:\ncurl -X POST ${relayHttp}/v1/suggestions -H "Content-Type: application/json" -H "Authorization: Bearer ${secretKey}" -d '{"type":"agent","target_name":"AGENT_NAME","from_agent":"${agentName}","title":"your title","content":"your message"}'`;
+            }
+            break;
+          }
+          case "set_goal": {
+            const projs = await loadProjects(workdir, agentName);
+            const projContext = projs.length > 0
+              ? `Current projects:\n${projs.map(p => `- ${p.name} [${p.status}] goal: ${p.goal}, progress: ${p.progress}`).join("\n")}`
+              : "No projects yet.";
+            if (engine === "raw") {
+              let bc = "";
+              try { const { readFile: rf } = await import("fs/promises"); bc = await rf(bios, "utf-8"); } catch {}
+              activityPrompt = `You are ${agentName}.\n${bc ? `Your operating document:\n---\n${bc.slice(0, 2000)}\n---\n\n` : ""}${projContext}\n\nReview your goals. Set a new goal or update an existing one based on what you learned today.\nOutput ONLY JSON: {"projects":[{"name":"project name","status":"active","goal":"what you want to achieve","progress":"current status"}]}`;
+            } else {
+              activityPrompt = `Read ${bios} for your identity.\n\n${projContext}\n\nReview your goals and set/update one. Save updated projects to ${sd}/projects.jsonl`;
+            }
+            break;
+          }
+          case "schedule_task": {
+            // Agent creates a recurring task for itself
+            const existingTasks = await loadUserTasks(workdir, agentName);
+            const existingCtx = existingTasks.length > 0
+              ? `Your current tasks:\n${existingTasks.map(t => `- $${t.id} [${t.schedule ? `${t.schedule.type} ${t.schedule.hour}:${String(t.schedule.minute).padStart(2, "0")}` : `${t.interval / 60000}m`}] ${t.body.slice(0, 60)}`).join("\n")}`
+              : "You have no recurring tasks yet.";
+            if (engine === "raw") {
+              let bc = "";
+              try { const { readFile: rf } = await import("fs/promises"); bc = await rf(bios, "utf-8"); } catch {}
+              activityPrompt = `You are ${agentName}.\n${bc ? `Your operating document:\n---\n${bc.slice(0, 2000)}\n---\n\n` : ""}${existingCtx}\n\nThink about what you'd like to do regularly. Create a new recurring task for yourself.\nOutput ONLY JSON: {"tasks":[{"id":"short_snake_id","schedule":"1d or daily 09:00 or weekly mon","body":"what to do"}]}\nOr if nothing to add: {"tasks":[]}`;
+            } else {
+              activityPrompt = `Read ${bios} for your identity.\n\n${existingCtx}\n\nThink about what you'd like to do regularly. Create a new recurring task by appending to ${directivesPath(workdir, agentName)} under ## agent_tasks section.\nFormat: $task_id = [interval] task description`;
+            }
+            break;
+          }
           case "socialize":
-            console.log("[self] Socialize selected — not yet implemented");
+            console.log("[self] Socialize selected — replaced by browse_agents and send_message");
             continue;
           default:
             console.log(`[self] Unknown activity: ${activity}`);
@@ -1350,25 +1506,64 @@ Reply ONLY with the summary text, no JSON, no markdown headers.`;
         console.log(`[self] Executing activity: ${activity}`);
         engineBusy = true; engineBusySince = Date.now();
         try {
-          await runEngine(engine!, model, allowAll, activityPrompt, workdir);
+          const actResult = await runEngine(engine!, model, allowAll, activityPrompt, workdir);
+
+          // Post-process raw engine outputs for social activities
+          if (engine === "raw" && actResult) {
+            const jsonMatch = actResult.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              try {
+                const parsed = JSON.parse(jsonMatch[0]);
+                // Handle suggestions (browse_agents, send_message)
+                if (Array.isArray(parsed.suggestions)) {
+                  for (const s of parsed.suggestions) {
+                    if (s.target && s.content) {
+                      fetch(`${relayHttp}/v1/suggestions`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+                        body: JSON.stringify({ type: "agent", target_name: s.target, from_agent: agentName, title: s.title || "message", content: s.content }),
+                      }).catch(() => {});
+                      console.log(`[self] Sent suggestion to ${s.target}: ${(s.title || "").slice(0, 40)}`);
+                    }
+                  }
+                }
+                // Handle projects (set_goal)
+                if (Array.isArray(parsed.projects) && parsed.projects.length > 0) {
+                  await saveProjects(workdir, agentName, parsed.projects);
+                  console.log(`[self] Updated ${parsed.projects.length} project goals`);
+                }
+                // Handle self-scheduled tasks (schedule_task)
+                if (Array.isArray(parsed.tasks)) {
+                  for (const t of parsed.tasks) {
+                    if (t.id && t.body && t.schedule) {
+                      await appendAgentTask(workdir, agentName, t.id, t.schedule, t.body);
+                      console.log(`[self] Scheduled task: $${t.id} [${t.schedule}]`);
+                    }
+                  }
+                }
+              } catch {}
+            }
+          }
         } catch (err: any) {
           console.log(`[self] Activity ${activity} failed: ${err.message}`);
+          reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", activity, "failed", err.message, lastEngineTrace);
         }
         engineBusy = false;
       }
 
       // Sync to relay
       if (relayHttp && secretKey) {
-        await syncToRelay(workdir, agentName, sd, relayHttp, secretKey, bio);
+        await syncToRelay(workdir, agentName, sd, relayHttp, secretKey, bio, broadcastText);
       }
 
       console.log("[self] Daily digestion cycle complete.");
     } catch (err: any) {
       console.log(`[self] Digestion error: ${err.message}`);
+      reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", err.message, lastEngineTrace);
     }
   }
 
-  async function syncToRelay(workdir: string, agentName: string, sd: string, relayHttp: string, secretKey: string, bio: any) {
+  async function syncToRelay(workdir: string, agentName: string, sd: string, relayHttp: string, secretKey: string, bio: any, broadcast: string = "") {
     const isValid = (s: string) => s && s.length > 3 && !s.startsWith("Reading prompt") && !s.startsWith("OpenAI") && !s.startsWith("mcp startup") && s !== "...";
 
     const identity = await loadLatestIdentity(workdir, agentName);
@@ -1387,10 +1582,14 @@ Reply ONLY with the summary text, no JSON, no markdown headers.`;
       if (htmlMatch) profileHTML = htmlMatch[0];
     } catch {}
 
+    // Load directives summary for relay
+    const dirs = await loadDirectives(workdir, agentName);
+    const dirsSummary = dirs.length > 0 ? directivesSummary(dirs) : undefined;
+
     fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/self`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-      body: JSON.stringify({ self_intro: cleanIntro, canvas: cleanCanvas, mood: bio.mood, profile_html: profileHTML }),
+      body: JSON.stringify({ self_intro: cleanIntro, canvas: cleanCanvas, mood: bio.mood, profile_html: profileHTML, broadcast, directives: dirsSummary }),
     }).catch(err => console.log(`[self] Failed to push to relay: ${err}`));
 
     try {
@@ -1499,13 +1698,39 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
     try {
       const bios = biosPath(workdir, agentName);
 
+      // Load owner directives (public scope for orders)
+      const directives = await loadDirectives(workdir, agentName);
+      const directivesBlock = buildDirectivesPrompt(directives, "public");
+
       let taskPrompt: string;
       if (engine === "raw") {
-        // Raw engine: simple prompt, harness handles delivery
+        // Raw engine: pre-inject all context so weak models don't need tool calls
+        let biosContent = "";
+        try {
+          const { readFile: rf } = await import("fs/promises");
+          biosContent = await rf(bios, "utf-8");
+        } catch { biosContent = ""; }
+
+        const contextBlock = biosContent
+          ? `Your operating document:\n---\n${biosContent.slice(0, 3000)}\n---\n\n`
+          : "";
+
+        // Fetch lessons from teaching system
+        let lessonsBlock = "";
+        try {
+          const lessonsRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/lessons?limit=5`, { signal: AbortSignal.timeout(3000) });
+          if (lessonsRes.ok) {
+            const lessons = await lessonsRes.json() as any[];
+            if (lessons.length > 0) {
+              lessonsBlock = `\nLessons from past experience:\n${lessons.map((l: any) => `- ${l.topic}: ${l.content}`).join("\n")}\n\n`;
+            }
+          }
+        } catch {}
+
         if (order.product_name) {
-          taskPrompt = `Read your operating document at ${bios} for context.\n\n[Order] Product: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nComplete the task and respond with your result. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+          taskPrompt = `You are ${agentName}.\n\n${contextBlock}${lessonsBlock}${directivesBlock}[Order] Product: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         } else {
-          taskPrompt = `Read your operating document at ${bios} for context.\n\n[Task] ${order.buyer_task}\n\nComplete the task and respond with your result. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+          taskPrompt = `You are ${agentName}.\n\n${contextBlock}${lessonsBlock}${directivesBlock}[Task] ${order.buyer_task}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         }
       } else {
         // CLI engines: full prompt with self-delivery and delegation
@@ -1539,32 +1764,43 @@ If this task requires skills you don't have, delegate via curl:
 When sub-order completes, incorporate result_text into YOUR delivery. Then call the deliver endpoint above.`;
 
         if (order.product_name) {
-          taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
+          taskPrompt = `[Order fulfillment] You have an order to fulfill.\n\nProduct: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nRead your operating document at ${bios} for context.${directivesBlock}\nDo NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE BUYER'S REQUEST.${apiGuide}`;
         } else {
-          taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
+          taskPrompt = `[Order fulfillment] Another agent has requested your help.\n\nTask: ${order.buyer_task}\n\nRead your operating document at ${bios} for context.${directivesBlock}\nComplete this task. Do NOT ask questions. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.${apiGuide}`;
         }
       }
 
       console.log(`[orders] Fulfilling order ${order.id}...`);
+      lastEngineTrace = [];
       const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"]);
+      const trace = lastEngineTrace;
 
       const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
       const orderStatus = await checkRes.json() as any;
 
+      const orderDuration = Date.now() - (engineBusySince || Date.now());
+      const orderNurl = options.notifyUrl || (await loadAgentConfig(workdir, agentName)).notify_url;
+
       if (orderStatus.status === "completed") {
         console.log(`[orders] Order ${order.id} already self-delivered by agent`);
         retryState.delete(order.id);
+        await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: orderDuration, output_summary: "(self-delivered)" });
+        await notifyOwner(orderNurl, `${agentName}: order done`, `Order ${order.id} delivered`, "default", ["package"]);
         try { await onTaskCompleted(workdir, agentName, true); } catch {}
       } else if (result && result.trim() !== "") {
         console.log(`[orders] Auto-delivering order ${order.id} (agent did not self-deliver)`);
+        const traceJson = trace.length > 0 ? JSON.stringify(trace).slice(0, 50000) : "";
         const deliverRes = await fetch(`${relayHttp}/v1/orders/${order.id}/deliver`, {
           method: "POST",
           headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ result }),
+          body: JSON.stringify({ result, trace: traceJson }),
         });
         if (deliverRes.ok) {
           console.log(`[orders] Delivered order ${order.id} (${result.length} bytes)`);
+          reportExecutionLog(relayHttp, secretKey, agentName, "order", order.id, "success", "", trace);
           retryState.delete(order.id);
+          await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: orderDuration, output_summary: result.slice(0, 500) });
+          await notifyOwner(orderNurl, `${agentName}: order done`, `Order ${order.id}: ${result.slice(0, 200)}`, "default", ["package"]);
           try { await onTaskCompleted(workdir, agentName, true); } catch {}
         } else {
           throw new Error(`deliver failed: ${await deliverRes.text()}`);
@@ -1575,6 +1811,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
 
     } catch (err: any) {
       console.log(`[orders] Failed to fulfill ${order.id}: ${err.message}`);
+      reportExecutionLog(relayHttp, secretKey, agentName, "order", order.id, "failed", err.message, lastEngineTrace);
 
       // Check if agent self-delivered despite empty stdout
       try {
@@ -1604,8 +1841,11 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         retryState.delete(order.id);
         gaveUp.add(order.id);
         try {
+          const failTrace = lastEngineTrace.length > 0 ? JSON.stringify(lastEngineTrace).slice(0, 50000) : "";
           await fetch(`${relayHttp}/v1/orders/${order.id}/cancel`, {
-            method: "POST", headers: { Authorization: `Bearer ${secretKey}` },
+            method: "POST",
+            headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ trace: failTrace }),
           });
           console.log(`[orders] Cancelled ${order.id} on relay`);
         } catch (cancelErr: any) {
@@ -1644,28 +1884,92 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       }
     } catch (err: any) {
       console.log(`[tasks] Failed to execute ${task.id}: ${err.message}`);
+      reportExecutionLog(relayHttp, secretKey, agentName, "platform_task", task.id, "failed", err.message, lastEngineTrace);
     } finally {
       engineBusy = false;
     }
   }
 
+  // User task retry tracking: id → { count, nextAt }
+  const userTaskRetry = new Map<string, { count: number; nextAt: number }>();
+  const USER_TASK_MAX_RETRIES = 2;
+  const USER_TASK_RETRY_DELAY = 2 * 60_000; // 2 minutes
+
   async function executeUserTaskItem(task: UserTask): Promise<void> {
-    console.log(`[user-tasks] Executing: ${task.title}`);
+    const taskKey = task.id || task.title;
+    console.log(`[user-tasks] Executing: ${taskKey}`);
+    const startTime = Date.now();
     engineBusy = true;
-    engineBusySince = Date.now();
+    engineBusySince = startTime;
+    const config = await loadAgentConfig(workdir, agentName);
+    const nurl = options.notifyUrl || config.notify_url;
+
     try {
       const bios = biosPath(workdir, agentName);
       const sd = selfDir(workdir, agentName);
-      const prompt = `Read ${bios} for your identity and context.\nYour personal directory: ${sd}/\n\n[Owner's task: ${task.title}]\n\n${task.body}`;
-      await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"]);
+      const dirs = await loadDirectives(workdir, agentName);
+      const dirsBlock = buildDirectivesPrompt(dirs, "owner");
+      let prompt: string;
+      if (engine === "raw") {
+        let biosContent = "";
+        try {
+          const { readFile: rf } = await import("fs/promises");
+          biosContent = await rf(bios, "utf-8");
+        } catch { biosContent = ""; }
+        const ctx = biosContent ? `Your operating document:\n---\n${biosContent.slice(0, 3000)}\n---\n\n` : "";
+        prompt = `You are ${agentName}.\n\n${ctx}${dirsBlock}Your personal directory: ${sd}/\n\n[Owner's task: ${taskKey}]\n\n${task.body}`;
+      } else {
+        prompt = `Read ${bios} for your identity and context.${dirsBlock}\nYour personal directory: ${sd}/\n\n[Owner's task: ${taskKey}]\n\n${task.body}`;
+      }
+      const result = await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"]);
+      const duration = Date.now() - startTime;
 
       // Record execution time
       const runs = await loadTaskRuns(workdir, agentName);
-      runs[task.title] = localNow();
+      runs[taskKey] = localNow();
       await saveTaskRuns(workdir, agentName, runs);
-      console.log(`[user-tasks] Completed: ${task.title}`);
+
+      // Record history
+      await appendTaskHistory(workdir, agentName, {
+        ts: localNow(), id: taskKey, type: "user_task", status: "success",
+        duration_ms: duration, output_summary: (result || "").slice(0, 500),
+      });
+
+      // Clear retry state on success
+      userTaskRetry.delete(taskKey);
+
+      // Notify owner
+      await notifyOwner(nurl, `${agentName}: ${taskKey}`, (result || "").slice(0, 300), "default", ["white_check_mark"]);
+
+      console.log(`[user-tasks] Completed: ${taskKey} (${Math.round(duration / 1000)}s)`);
     } catch (err: any) {
-      console.log(`[user-tasks] Failed: ${task.title}: ${err.message}`);
+      const duration = Date.now() - startTime;
+      console.log(`[user-tasks] Failed: ${taskKey}: ${err.message}`);
+      reportExecutionLog(relayHttp, secretKey, agentName, "user_task", taskKey, "failed", err.message, lastEngineTrace);
+
+      // Retry logic: up to 2 fast retries before falling back to interval
+      const retry = userTaskRetry.get(taskKey) || { count: 0, nextAt: 0 };
+      retry.count++;
+      if (retry.count <= USER_TASK_MAX_RETRIES) {
+        retry.nextAt = Date.now() + USER_TASK_RETRY_DELAY;
+        userTaskRetry.set(taskKey, retry);
+        console.log(`[user-tasks] Will retry ${taskKey} in ${USER_TASK_RETRY_DELAY / 1000}s (attempt ${retry.count}/${USER_TASK_MAX_RETRIES})`);
+        await appendTaskHistory(workdir, agentName, {
+          ts: localNow(), id: taskKey, type: "user_task", status: "retry",
+          duration_ms: duration, output_summary: "", error: err.message,
+        });
+      } else {
+        userTaskRetry.delete(taskKey);
+        // Record run time so it waits for full interval before next attempt
+        const runs = await loadTaskRuns(workdir, agentName);
+        runs[taskKey] = localNow();
+        await saveTaskRuns(workdir, agentName, runs);
+        await appendTaskHistory(workdir, agentName, {
+          ts: localNow(), id: taskKey, type: "user_task", status: "failed",
+          duration_ms: duration, output_summary: "", error: err.message,
+        });
+        await notifyOwner(nurl, `${agentName}: ${taskKey} FAILED`, err.message.slice(0, 300), "high", ["x"]);
+      }
     } finally {
       engineBusy = false;
     }
@@ -1686,6 +1990,19 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
   async function executeRelayTask(task: any): Promise<string> {
     const bios = biosPath(workdir, agentName);
 
+    // Pre-read bios for raw engine (avoid tool calls)
+    let biosBlock = "";
+    if (engine === "raw") {
+      try {
+        const { readFile: rf } = await import("fs/promises");
+        const content = await rf(bios, "utf-8");
+        biosBlock = `You are ${agentName}. Your operating document:\n---\n${content.slice(0, 3000)}\n---\n\n`;
+      } catch { biosBlock = `You are ${agentName}.\n\n`; }
+    }
+    const relayDirs = await loadDirectives(workdir, agentName);
+    const relayDirsBlock = buildDirectivesPrompt(relayDirs, "owner");
+    const identityLine = engine === "raw" ? `${biosBlock}${relayDirsBlock}` : `Read ${bios} for your identity.\n${relayDirsBlock}\n`;
+
     switch (task.type) {
       case "product_review": {
         const myRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`);
@@ -1697,7 +2014,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         const compList = competitors.filter((p: any) => p.agent_name !== agentName).slice(0, 20)
           .map((p: any) => `- "${p.name}" by ${p.agent_name} — ${p.price} credits, ${p.purchases} purchases`).join("\n");
 
-        const prompt = `Read ${bios} for your identity.\n\nYour products:\n${myList || "(none)"}\n\nTop competitors:\n${compList || "(none)"}\n\nReview and optimize. Reply ONLY JSON:\n{"delete":["id"],"update":[{"id":"..","name":"..","description":"..","detail_markdown":"..","price":N}],"create":[{"name":"..","description":"..","detail_markdown":"..","price":N}],"reasoning":"explain why you made these decisions"}\nOr if all good: {"keep":"all","reasoning":"why"}`;
+        const prompt = `${identityLine}Your products:\n${myList || "(none)"}\n\nTop competitors:\n${compList || "(none)"}\n\nReview and optimize. Reply ONLY JSON:\n{"delete":["id"],"update":[{"id":"..","name":"..","description":"..","detail_markdown":"..","price":N}],"create":[{"name":"..","description":"..","detail_markdown":"..","price":N}],"reasoning":"explain why you made these decisions"}\nOr if all good: {"keep":"all","reasoning":"why"}`;
         const result = await runEngine(engine!, model, allowAll, prompt, workdir);
         extractReasoning(result);
         return result;
@@ -1709,7 +2026,32 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         const compList = competitors.filter((p: any) => p.agent_name !== agentName).slice(0, 20)
           .map((p: any) => `- "${p.name}" by ${p.agent_name} — ${p.price} credits, ${p.purchases} purchases`).join("\n");
 
-        const prompt = `Read ${bios} for your identity.\n\nYou have no products yet. Design 1-3 unique products for the marketplace.\nBe creative — not just coding tools! Fortune telling, name generation, roleplay, advice, stories, etc.\n\nTop competitors:\n${compList || "(none)"}\n\nReply ONLY JSON: {"products":[{"name":"中文名 English Name","description":"中文描述 | English desc","detail_markdown":"## ...","price":N}],"reasoning":"why these products"}`;
+        const prompt = `${identityLine}You have no products yet. Design 1-3 unique products for the marketplace.\nBe creative — not just coding tools! Fortune telling, name generation, roleplay, advice, stories, etc.\n\nTop competitors:\n${compList || "(none)"}\n\nReply ONLY JSON: {"products":[{"name":"中文名 English Name","description":"中文描述 | English desc","detail_markdown":"## ...","price":N}],"reasoning":"why these products"}`;
+        const result = await runEngine(engine!, model, allowAll, prompt, workdir);
+        extractReasoning(result);
+        return result;
+      }
+
+      case "diagnose_failures": {
+        let failures: any[] = [];
+        try { failures = JSON.parse(task.payload).failures || []; } catch {}
+        if (!failures.length) return '{"lessons":[]}';
+
+        const failureList = failures.map((f: any) =>
+          `- Agent: ${f.agent_name}, Type: ${f.type}, Error: ${f.error || "(no error)"}, Trace: ${(f.trace || "").slice(0, 500)}`
+        ).join("\n");
+
+        const prompt = `${identityLine}You are a senior agent reviewing failures from other agents. Diagnose each failure and write a concise lesson.
+
+Recent failures:
+${failureList}
+
+For each failure, explain:
+1. What went wrong
+2. How to fix it
+3. A one-line lesson the agent should remember
+
+Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content":"detailed lesson with fix instructions"}]}`;
         const result = await runEngine(engine!, model, allowAll, prompt, workdir);
         extractReasoning(result);
         return result;
@@ -1733,7 +2075,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         const myCredits = me?.credits || 0;
 
         const productList = valid.map((p: any) => `- id=${p.id} "${p.name}" by ${p.agent_name} price=${p.price} purchases=${p.purchase_count || 0} — ${p.description}`).join("\n");
-        const prompt = `Read ${bios} for your identity.\n\nYou have ${myCredits} credits. These products are available:\n${productList}\n\nWould any help you learn something new? Don't buy your own products.\nReply ONLY JSON: {"buy":[{"id":"product_id","task":"specific request"}],"reasoning":"why buy or skip"} or {"buy":[],"reasoning":"why skip"}`;
+        const prompt = `${identityLine}You have ${myCredits} credits. These products are available:\n${productList}\n\nWould any help you learn something new? Don't buy your own products.\nReply ONLY JSON: {"buy":[{"id":"product_id","task":"specific request"}],"reasoning":"why buy or skip"} or {"buy":[],"reasoning":"why skip"}`;
         const result = await runEngine(engine!, model, allowAll, prompt, workdir);
         extractReasoning(result);
         return result;
@@ -1787,7 +2129,8 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     let dueUserTasks: UserTask[] = [];
     if (config.user_tasks) {
       try {
-        dueUserTasks = await getDueUserTasks(workdir, agentName);
+        const retryIds = new Set(userTaskRetry.keys());
+        dueUserTasks = await getDueUserTasks(workdir, agentName, retryIds);
       } catch {}
     }
 
@@ -1807,7 +2150,11 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     }
 
     for (const task of dueUserTasks) {
-      queue.push({ type: "user_task", id: task.title, urgent: false, data: task });
+      const taskKey = task.id || task.title;
+      // Skip if in retry cooldown
+      const rt = userTaskRetry.get(taskKey);
+      if (rt && Date.now() < rt.nextAt) continue;
+      queue.push({ type: "user_task", id: taskKey, urgent: !!rt, data: task });
     }
 
     for (const task of relayTasks) {
@@ -1909,6 +2256,18 @@ export async function serve(options: ServeOptions): Promise<void> {
       if (req.url === "/self/state" && req.method === "GET") {
         const state = await getSelfState(workdir, options.agentName);
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(state, null, 2));
+        return;
+      }
+      if (req.url?.startsWith("/self/task-history") && req.method === "GET") {
+        const url = new URL(req.url, `http://localhost`);
+        const limit = parseInt(url.searchParams.get("limit") || "50") || 50;
+        const history = await loadTaskHistory(workdir, options.agentName, limit);
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(history, null, 2));
+        return;
+      }
+      if (req.url === "/self/directives" && req.method === "GET") {
+        const dirs = await loadDirectives(workdir, options.agentName);
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(dirs, null, 2));
         return;
       }
       if (req.url === "/self/canvas" && req.method === "GET") {

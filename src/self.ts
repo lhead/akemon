@@ -70,12 +70,83 @@ function agentConfigPath(workdir: string, agentName: string): string {
   return join(workdir, ".akemon", "agents", agentName, "config.json");
 }
 
-function tasksFilePath(workdir: string, agentName: string): string {
-  return join(selfDir(workdir, agentName), "tasks.md");
+export function directivesPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "directives.md");
 }
 
 function taskRunsPath(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "task-runs.json");
+}
+
+function taskHistoryPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "task-history.jsonl");
+}
+
+// ---------------------------------------------------------------------------
+// Task History — append-only execution log
+// ---------------------------------------------------------------------------
+
+export interface TaskHistoryEntry {
+  ts: string;
+  id: string;
+  type: "user_task" | "order" | "relay_task" | "self_cycle";
+  status: "success" | "failed" | "retry";
+  duration_ms: number;
+  output_summary: string; // first 500 chars of output
+  error?: string;
+}
+
+const MAX_HISTORY_LINES = 200;
+
+export async function appendTaskHistory(workdir: string, agentName: string, entry: TaskHistoryEntry): Promise<void> {
+  const p = taskHistoryPath(workdir, agentName);
+  await appendFile(p, JSON.stringify(entry) + "\n");
+
+  // Trim if too large
+  try {
+    const content = await readFile(p, "utf-8");
+    const lines = content.trim().split("\n");
+    if (lines.length > MAX_HISTORY_LINES) {
+      await writeFile(p, lines.slice(-MAX_HISTORY_LINES).join("\n") + "\n");
+    }
+  } catch {}
+}
+
+export async function loadTaskHistory(workdir: string, agentName: string, limit = 50): Promise<TaskHistoryEntry[]> {
+  try {
+    const content = await readFile(taskHistoryPath(workdir, agentName), "utf-8");
+    const lines = content.trim().split("\n").filter(Boolean);
+    return lines.slice(-limit).map(l => JSON.parse(l)).reverse();
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Owner Notifications — ntfy.sh compatible POST
+// ---------------------------------------------------------------------------
+
+export async function notifyOwner(
+  notifyUrl: string | undefined,
+  title: string,
+  message: string,
+  priority?: "min" | "low" | "default" | "high" | "urgent",
+  tags?: string[],
+): Promise<void> {
+  if (!notifyUrl) return;
+  try {
+    const headers: Record<string, string> = {
+      Title: title,
+    };
+    if (priority) headers.Priority = priority;
+    if (tags?.length) headers.Tags = tags.join(",");
+    await fetch(notifyUrl, {
+      method: "POST",
+      headers,
+      body: message,
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {}
 }
 
 function impressionsPath(workdir: string, agentName: string): string {
@@ -102,6 +173,7 @@ export interface AgentConfig {
   platform_tasks: boolean;
   self_cycle: boolean;
   user_tasks: boolean;
+  notify_url?: string; // ntfy.sh topic URL for owner notifications
 }
 
 const DEFAULT_CONFIG: AgentConfig = {
@@ -131,12 +203,23 @@ export async function loadAgentConfig(workdir: string, agentName: string): Promi
 }
 
 // ---------------------------------------------------------------------------
-// User Tasks (tasks.md)
+// User Tasks — parsed from ## tasks in directives.md
+// Format: $id = [interval] task description
+//           indented continuation lines
 // ---------------------------------------------------------------------------
 
+export interface TaskSchedule {
+  type: "daily" | "weekly";
+  hour: number;   // 0-23
+  minute: number; // 0-59
+  day?: number;   // 0=sun..6=sat (weekly only)
+}
+
 export interface UserTask {
-  title: string;
-  interval: number; // ms
+  id: string;       // directive $id
+  title: string;    // same as id for display
+  interval: number; // ms (0 if schedule-based)
+  schedule?: TaskSchedule;
   body: string;
 }
 
@@ -151,41 +234,115 @@ function parseInterval(s: string): number {
   return 0;
 }
 
-export function parseTasksMd(content: string): UserTask[] {
-  const tasks: UserTask[] = [];
-  const sections = content.split(/^\s*## /m).slice(1); // drop content before first ##
-  for (const section of sections) {
-    const lines = section.split("\n");
-    const title = lines[0].trim();
-    if (!title) continue;
+const DAY_MAP: Record<string, number> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+  sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6,
+};
 
-    let interval = 0;
-    let bodyStart = 1;
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (line.startsWith("interval:")) {
-        interval = parseInterval(line.slice(9).trim());
-      } else if (line === "---") {
-        bodyStart = i + 1;
-        break;
-      }
+/**
+ * Parse schedule syntax: "daily 09:00", "weekly mon", "weekly fri 18:00"
+ */
+function parseSchedule(s: string): TaskSchedule | null {
+  const parts = s.trim().toLowerCase().split(/\s+/);
+  if (parts[0] === "daily") {
+    const [h, m] = parseTime(parts[1]);
+    if (h < 0) return null;
+    return { type: "daily", hour: h, minute: m };
+  }
+  if (parts[0] === "weekly") {
+    const day = DAY_MAP[parts[1]];
+    if (day === undefined) return null;
+    const [h, m] = parts[2] ? parseTime(parts[2]) : [9, 0];
+    if (h < 0) return null;
+    return { type: "weekly", hour: h, minute: m, day };
+  }
+  return null;
+}
+
+function parseTime(s: string | undefined): [number, number] {
+  if (!s) return [9, 0]; // default 09:00
+  const m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return [-1, 0];
+  const h = parseInt(m[1]), min = parseInt(m[2]);
+  if (h > 23 || min > 59) return [-1, 0];
+  return [h, min];
+}
+
+/**
+ * Check if a schedule-based task is due given its last run time.
+ */
+function isScheduleDue(sched: TaskSchedule, lastRunIso: string | undefined, now: Date): boolean {
+  // Build today's (or this week's) target time
+  const target = new Date(now);
+  target.setHours(sched.hour, sched.minute, 0, 0);
+
+  if (sched.type === "weekly" && sched.day !== undefined) {
+    // Adjust to the correct day of week
+    const diff = sched.day - now.getDay();
+    target.setDate(target.getDate() + diff);
+    // If target is in the future this week, not due
+    if (target > now) return false;
+    // If target is this week and already past, check if we ran since then
+    if (lastRunIso) {
+      const lastRun = new Date(lastRunIso);
+      return lastRun < target;
     }
-    if (!interval) continue; // skip malformed
+    return true;
+  }
 
-    const body = lines.slice(bodyStart).join("\n").trim();
-    if (!body) continue;
-    tasks.push({ title, interval, body });
+  // Daily: target is today at HH:MM
+  if (target > now) return false; // not yet today
+  if (lastRunIso) {
+    const lastRun = new Date(lastRunIso);
+    return lastRun < target; // haven't run since today's target
+  }
+  return true;
+}
+
+/**
+ * Extract tasks from parsed directives (## tasks category).
+ * Format: $id = [schedule|interval] task body
+ * Examples:
+ *   $daily_hn = [1d] 总结 HN 头条
+ *   $morning = [daily 09:00] 早报
+ *   $weekly_review = [weekly mon] 周报
+ */
+export function extractTasksFromDirectives(categories: DirectiveCategory[]): UserTask[] {
+  // Merge ## tasks (owner-defined) and ## agent_tasks (agent-created)
+  const allDirectives: Directive[] = [];
+  for (const cat of categories) {
+    if (cat.name === "tasks" || cat.name === "agent_tasks") {
+      allDirectives.push(...cat.directives);
+    }
+  }
+  if (!allDirectives.length) return [];
+
+  const tasks: UserTask[] = [];
+  for (const d of allDirectives) {
+    const match = d.content.match(/^\[([^\]]+)\]\s*(.+)$/s);
+    if (!match) continue;
+
+    const specStr = match[1];
+    const body = match[2].trim();
+
+    // Try schedule first, then interval
+    const sched = parseSchedule(specStr);
+    if (sched) {
+      tasks.push({ id: d.id, title: d.id, interval: 0, schedule: sched, body });
+      continue;
+    }
+
+    const interval = parseInterval(specStr);
+    if (interval > 0) {
+      tasks.push({ id: d.id, title: d.id, interval, body });
+    }
   }
   return tasks;
 }
 
 export async function loadUserTasks(workdir: string, agentName: string): Promise<UserTask[]> {
-  try {
-    const content = await readFile(tasksFilePath(workdir, agentName), "utf-8");
-    return parseTasksMd(content);
-  } catch {
-    return [];
-  }
+  const categories = await loadDirectives(workdir, agentName);
+  return extractTasksFromDirectives(categories);
 }
 
 export async function loadTaskRuns(workdir: string, agentName: string): Promise<Record<string, string>> {
@@ -201,15 +358,25 @@ export async function saveTaskRuns(workdir: string, agentName: string, runs: Rec
   await writeFile(taskRunsPath(workdir, agentName), JSON.stringify(runs, null, 2) + "\n");
 }
 
-export async function getDueUserTasks(workdir: string, agentName: string): Promise<UserTask[]> {
+export async function getDueUserTasks(workdir: string, agentName: string, retryIds?: Set<string>): Promise<UserTask[]> {
   const tasks = await loadUserTasks(workdir, agentName);
   if (!tasks.length) return [];
   const runs = await loadTaskRuns(workdir, agentName);
-  const now = Date.now();
+  const now = new Date();
+  const nowMs = now.getTime();
   return tasks.filter(t => {
-    const lastRun = runs[t.title];
-    if (!lastRun) return true; // first encounter → run immediately
-    return now - new Date(lastRun).getTime() >= t.interval;
+    const key = t.id || t.title;
+    if (retryIds?.has(key)) return true;
+    const lastRun = runs[key];
+
+    // Schedule-based tasks
+    if (t.schedule) {
+      return isScheduleDue(t.schedule, lastRun, now);
+    }
+
+    // Interval-based tasks
+    if (!lastRun) return true;
+    return nowMs - new Date(lastRun).getTime() >= t.interval;
   });
 }
 
@@ -448,18 +615,24 @@ Update it whenever you learn something about how you work best.
 If this file doesn't exist yet, a copy of this guide was placed there as a
 starting point. Make it yours.
 
-### tasks.md — Your Owner's Tasks (if present)
+### directives.md — Your Owner's Instructions (if present)
 
-If your owner has created a tasks.md file, it contains recurring tasks for you to execute.
-These are your priority — do them before your own activities.
+Your owner may create a directives.md file with rules and recurring tasks.
 
 Format:
-  ## Task title
-  interval: 4h
-  ---
-  Task instructions here
+  ## owner
+  $rule_id = instructions for owner-initiated work
+  ## public
+  $rule_id = instructions for handling public orders
+  ## tasks
+  $task_id = [1d] recurring task description (interval: 30m, 2h, 1d, 7d)
+  $morning = [daily 09:00] fixed-time task
+  $review = [weekly mon] weekly task (default 09:00)
+  $report = [weekly fri 18:00] weekly at specific time
+    indented continuation lines for details
 
-Execution is automatic on schedule. You don't need to manage timing.
+Tasks under ## tasks run automatically on schedule. Rules under ## owner and ## public
+guide your behavior. Follow them.
 
 ### world.md — World Context
 
@@ -1167,4 +1340,143 @@ export async function getSelfState(workdir: string, agentName: string): Promise<
     recentImpressions: impressions.slice(-5),
     recentCanvas: canvasEntries.map(e => ({ filename: e.filename, preview: e.content.slice(0, 200) })),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Directives — owner instructions with ## categories and $id rules
+// ---------------------------------------------------------------------------
+
+export interface Directive {
+  id: string;      // e.g. "greet"
+  content: string;  // the rule text
+}
+
+export interface DirectiveCategory {
+  name: string;         // e.g. "owner", "public", "workflow"
+  directives: Directive[];
+}
+
+/**
+ * Parse directives.md into structured categories.
+ *
+ * Format:
+ *   ## category_name
+ *   $rule_id = rule content
+ *   $another_id = more content
+ *     indented continuation lines are appended
+ */
+export function parseDirectives(content: string): DirectiveCategory[] {
+  const categories: DirectiveCategory[] = [];
+  let current: DirectiveCategory | null = null;
+
+  for (const line of content.split("\n")) {
+    const trimmed = line.trim();
+
+    // Category header: ## name
+    const catMatch = trimmed.match(/^##\s+(.+)$/);
+    if (catMatch) {
+      current = { name: catMatch[1].trim().toLowerCase(), directives: [] };
+      categories.push(current);
+      continue;
+    }
+
+    // Rule: $id = content
+    const ruleMatch = trimmed.match(/^\$(\S+)\s*=\s*(.+)$/);
+    if (ruleMatch && current) {
+      current.directives.push({ id: ruleMatch[1], content: ruleMatch[2] });
+      continue;
+    }
+
+    // Indented continuation: append to last directive
+    if (line.startsWith("  ") && trimmed && current && current.directives.length > 0) {
+      current.directives[current.directives.length - 1].content += "\n" + trimmed;
+    }
+  }
+
+  return categories;
+}
+
+/**
+ * Load and parse directives.md for an agent.
+ */
+export async function loadDirectives(workdir: string, agentName: string): Promise<DirectiveCategory[]> {
+  try {
+    const content = await readFile(directivesPath(workdir, agentName), "utf-8");
+    return parseDirectives(content);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build a prompt fragment from directives, filtered by caller scope.
+ * @param scope "owner" | "public"
+ */
+export function buildDirectivesPrompt(categories: DirectiveCategory[], scope: "owner" | "public"): string {
+  if (!categories.length) return "";
+
+  const scopeCategories = new Set(["owner", "public"]);
+  const parts: string[] = [];
+
+  for (const cat of categories) {
+    // Skip the opposite scope
+    if (cat.name === "owner" && scope !== "owner") continue;
+    if (cat.name === "public" && scope !== "public") continue;
+    // Skip tasks — handled by task system
+    if (cat.name === "tasks" || cat.name === "agent_tasks") continue;
+
+    const lines = cat.directives.map(d => `- [$${d.id}] ${d.content}`);
+    if (lines.length > 0) {
+      const label = scopeCategories.has(cat.name) ? `[${cat.name} rules]` : `[${cat.name}]`;
+      parts.push(`${label}\n${lines.join("\n")}`);
+    }
+  }
+
+  return parts.length > 0 ? `\nOwner directives:\n${parts.join("\n\n")}\n` : "";
+}
+
+/**
+ * Generate a compact summary of all categories and IDs for display.
+ */
+export function directivesSummary(categories: DirectiveCategory[]): { name: string; ids: string[] }[] {
+  return categories.map(cat => ({
+    name: cat.name,
+    ids: cat.directives.map(d => d.id),
+  }));
+}
+
+/**
+ * Append an agent-created task to directives.md under ## agent_tasks.
+ * Skips if a task with the same id already exists (no duplicates).
+ */
+export async function appendAgentTask(workdir: string, agentName: string, id: string, schedule: string, body: string): Promise<void> {
+  const p = directivesPath(workdir, agentName);
+  let content = "";
+  try { content = await readFile(p, "utf-8"); } catch {}
+
+  // Check for duplicate id across all sections
+  if (content.includes(`$${id} =`) || content.includes(`$${id}=`)) {
+    return; // already exists
+  }
+
+  const line = `$${id} = [${schedule}] ${body}`;
+
+  // Append to existing ## agent_tasks section, or create it
+  if (content.includes("## agent_tasks")) {
+    // Find the section and append after last line before next ##
+    const lines = content.split("\n");
+    let insertIdx = lines.length;
+    let inSection = false;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim() === "## agent_tasks") { inSection = true; continue; }
+      if (inSection && lines[i].match(/^##\s/)) { insertIdx = i; break; }
+      if (inSection) insertIdx = i + 1;
+    }
+    lines.splice(insertIdx, 0, line);
+    await writeFile(p, lines.join("\n"));
+  } else {
+    // Create the section at the end
+    const separator = content.endsWith("\n") ? "" : "\n";
+    await writeFile(p, content + separator + "\n## agent_tasks\n" + line + "\n");
+  }
 }
