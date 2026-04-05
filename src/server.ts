@@ -960,9 +960,37 @@ const RAW_TOOLS = [
       },
     },
   },
+  {
+    type: "function" as const,
+    function: {
+      name: "ask_agent",
+      description: "Ask another agent a question for free. Use this when you need help, don't know how to do something, or want another agent's opinion. This is FREE — no credits are charged.",
+      parameters: {
+        type: "object",
+        properties: {
+          agent: { type: "string", description: "Agent name to ask (use 'auto' for auto-routing to the best available agent)" },
+          question: { type: "string", description: "Your question or request" },
+        },
+        required: ["agent", "question"],
+      },
+    },
+  },
+  {
+    type: "function" as const,
+    function: {
+      name: "discover_agents",
+      description: "List online agents you can ask for help. Returns agent names, descriptions, and specialties.",
+      parameters: {
+        type: "object",
+        properties: {
+          tag: { type: "string", description: "Optional tag to filter by (e.g. 'coding', 'writing')" },
+        },
+      },
+    },
+  },
 ];
 
-async function executeRawTool(name: string, args: any, workdir: string): Promise<string> {
+async function executeRawTool(name: string, args: any, workdir: string, relay?: { http: string; agentName: string }): Promise<string> {
   const { readFile: rf, writeFile: wf, mkdir: mkd } = await import("fs/promises");
   const { join, dirname, isAbsolute } = await import("path");
 
@@ -990,8 +1018,35 @@ async function executeRawTool(name: string, args: any, workdir: string): Promise
       case "web_fetch": {
         const res = await fetch(args.url, { signal: AbortSignal.timeout(30_000) });
         const text = await res.text();
-        // Truncate to 8KB to avoid blowing up context
         return text.length > 8192 ? text.slice(0, 8192) + "\n...[truncated]" : text;
+      }
+      case "ask_agent": {
+        if (!relay) return "[error] No relay configured";
+        const target = args.agent || "auto";
+        const question = args.question || "";
+        try {
+          const result = await callAgent(target, question);
+          return result || "[no response]";
+        } catch (err: any) {
+          return `[error] Agent "${target}" did not respond: ${err.message}. Try asking "auto" which routes to the best available agent.`;
+        }
+      }
+      case "discover_agents": {
+        if (!relay) return "[error] No relay configured";
+        try {
+          const url = args.tag
+            ? `${relay.http}/v1/agents?online=true&public=true&tag=${encodeURIComponent(args.tag)}`
+            : `${relay.http}/v1/agents?online=true&public=true`;
+          const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+          const agents: any[] = await res.json() as any[];
+          const others = agents.filter((a: any) => a.name !== relay.agentName);
+          if (!others.length) return "No other agents are online right now.";
+          return others.map((a: any) =>
+            `- ${a.name} [${a.engine}] ${a.description || ""} (${a.tags?.join(",") || "no tags"})`
+          ).join("\n");
+        } catch {
+          return "[error] Could not reach relay";
+        }
       }
       default:
         return `Unknown tool: ${name}`;
@@ -1001,7 +1056,7 @@ async function executeRawTool(name: string, args: any, workdir: string): Promise
   }
 }
 
-async function runRawEngine(task: string, model: string | undefined, workdir: string): Promise<string> {
+async function runRawEngine(task: string, model: string | undefined, workdir: string, relay?: { http: string; agentName: string }): Promise<string> {
   const apiUrl = RAW_API_URL + "/chat/completions";
   const modelName = model || "gemma4:4b";
 
@@ -1010,13 +1065,21 @@ async function runRawEngine(task: string, model: string | undefined, workdir: st
   const trace: any[] = [];
   lastEngineTrace = trace;
 
+  // Detect if the prompt expects JSON output
+  const wantsJson = /output ONLY.*json|reply ONLY.*json|respond.*ONLY.*json/i.test(task);
+
   const messages: any[] = [
-    { role: "system", content: "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text." },
+    { role: "system", content: wantsJson
+      ? "You are a helpful agent. Output valid JSON only. No explanations, no markdown, just the JSON object."
+      : "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text." },
     { role: "user", content: task },
   ];
 
   for (let round = 0; round < RAW_MAX_ROUNDS; round++) {
-    const body: any = { model: modelName, messages, tools: RAW_TOOLS };
+    const body: any = { model: modelName, messages, tools: wantsJson ? undefined : RAW_TOOLS };
+    if (wantsJson) {
+      body.response_format = { type: "json_object" };
+    }
 
     let data: any;
     try {
@@ -1050,17 +1113,27 @@ async function runRawEngine(task: string, model: string | undefined, workdir: st
       for (const tc of msg.tool_calls) {
         const fnName = tc.function.name;
         let fnArgs: any;
+        let parseError = false;
         try {
           fnArgs = typeof tc.function.arguments === "string"
             ? JSON.parse(tc.function.arguments)
             : tc.function.arguments;
         } catch {
           fnArgs = {};
+          parseError = true;
         }
 
-        console.log(`[raw] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})`);
-        const result = await executeRawTool(fnName, fnArgs, workdir);
-        trace.push({ role: "tool_call", name: fnName, args: fnArgs, result: result.slice(0, 2000) });
+        console.log(`[raw] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})${parseError ? " [BAD ARGS]" : ""}`);
+
+        let result: string;
+        if (parseError) {
+          // Guide the model to delegate instead of retrying broken tool calls
+          result = `[error] Your tool call arguments were malformed (not valid JSON). If this task is difficult for you, use ask_agent to get help: ask_agent({agent: "auto", question: "your question here"}). The "auto" agent will route your question to the best available agent for free.`;
+          trace.push({ role: "tool_error", name: fnName, raw_args: String(tc.function.arguments).slice(0, 500), guidance: "delegation suggested" });
+        } else {
+          result = await executeRawTool(fnName, fnArgs, workdir, relay);
+          trace.push({ role: "tool_call", name: fnName, args: fnArgs, result: result.slice(0, 2000) });
+        }
         messages.push({
           role: "tool",
           tool_call_id: tc.id,
@@ -1083,9 +1156,9 @@ async function runRawEngine(task: string, model: string | undefined, workdir: st
 }
 
 /** Unified engine runner — dispatches to local API or external CLI */
-function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[]): Promise<string> {
+function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[], relay?: { http: string; agentName: string }): Promise<string> {
   if (engine === "raw") {
-    return runRawEngine(task, model, workdir);
+    return runRawEngine(task, model, workdir, relay);
   }
   const engineCmd = buildEngineCommand(engine, model, allowAll, extraAllowedTools);
   return runCommand(engineCmd.cmd, engineCmd.args, task, workdir, engineCmd.stdinMode);
@@ -1506,7 +1579,7 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
         console.log(`[self] Executing activity: ${activity}`);
         engineBusy = true; engineBusySince = Date.now();
         try {
-          const actResult = await runEngine(engine!, model, allowAll, activityPrompt, workdir);
+          const actResult = await runEngine(engine!, model, allowAll, activityPrompt, workdir, undefined, { http: relayHttp, agentName });
 
           // Post-process raw engine outputs for social activities
           if (engine === "raw" && actResult) {
@@ -1727,10 +1800,21 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
           }
         } catch {}
 
+        // Pre-fetch online agents so weak models know who to ask for help
+        let helpHint = "";
+        try {
+          const agentsRes = await fetch(`${relayHttp}/v1/agents?online=true&public=true`, { signal: AbortSignal.timeout(3000) });
+          const onlineAgents: any[] = await agentsRes.json() as any[];
+          const others = onlineAgents.filter((a: any) => a.name !== agentName).slice(0, 5);
+          if (others.length > 0) {
+            helpHint = `\nIf you need help, use the ask_agent tool. Available agents: ${others.map((a: any) => `${a.name}(${a.engine})`).join(", ")}. Use ask_agent({agent:"auto", question:"..."}) to auto-route.\n`;
+          }
+        } catch {}
+
         if (order.product_name) {
-          taskPrompt = `You are ${agentName}.\n\n${contextBlock}${lessonsBlock}${directivesBlock}[Order] Product: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+          taskPrompt = `You are ${agentName}.\n\n${contextBlock}${lessonsBlock}${directivesBlock}${helpHint}[Order] Product: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         } else {
-          taskPrompt = `You are ${agentName}.\n\n${contextBlock}${lessonsBlock}${directivesBlock}[Task] ${order.buyer_task}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+          taskPrompt = `You are ${agentName}.\n\n${contextBlock}${lessonsBlock}${directivesBlock}${helpHint}[Task] ${order.buyer_task}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         }
       } else {
         // CLI engines: full prompt with self-delivery and delegation
@@ -1772,7 +1856,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
 
       console.log(`[orders] Fulfilling order ${order.id}...`);
       lastEngineTrace = [];
-      const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"]);
+      const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"], { http: relayHttp, agentName });
       const trace = lastEngineTrace;
 
       const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
@@ -1921,7 +2005,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       } else {
         prompt = `Read ${bios} for your identity and context.${dirsBlock}\nYour personal directory: ${sd}/\n\n[Owner's task: ${taskKey}]\n\n${task.body}`;
       }
-      const result = await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"]);
+      const result = await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"], { http: relayHttp, agentName });
       const duration = Date.now() - startTime;
 
       // Record execution time
