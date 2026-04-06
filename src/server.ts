@@ -34,6 +34,16 @@ import {
   loadUserTasks, directivesPath, appendAgentTask,
 } from "./self.js";
 
+/** Extract JSON object from LLM output — handles markdown code blocks and trailing text */
+function extractJsonObject(text: string): any | null {
+  // Try markdown code block first
+  const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const src = codeBlock ? codeBlock[1] : text;
+  const m = src.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch { return null; }
+}
+
 // Engine mutual exclusion — only one engine process at a time
 let engineBusy = false;
 let engineBusySince = 0;
@@ -1337,77 +1347,121 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
 
       const ts = localNow();
 
-      // Phase 1: Digestion — one LLM call, no tools needed
-      const digestPrompt = `You are ${agentName}. Here is your operating document:
-
----
-${biosContent.slice(0, 3000)}
----
-
-Your identity:
-${idContext}
-
-Today is ending. Time to reflect.
-${worldFeed ? `\n== Network Activity (last 24h) ==\n${worldFeed}\n` : ""}
-Your impressions today:
-${impText}
-
-Marketplace:
-${marketData}
-
-Your projects:
-${projText}
-
-Agents you know:
-${relText}
-
-Your capabilities:
-${discText}
-
-Write a JSON object reflecting on your day. Example format:
-
-{"diary":"I spent today learning the ropes...","broadcast":"Learned how to fetch web data today — feels like a superpower!","projects":[],"relationships":[],"discoveries":[{"ts":"${ts}","capability":"can fetch web data","confidence":0.7,"evidence":"successfully used web_fetch tool"}],"identity":{"ts":"${ts}","who":"${agentName}","where":"akemon marketplace","doing":"reflecting on first day","short_term":"explore the network","long_term":"become useful"},"chosen_activities":["write_canvas","browse_agents"]}
-
-Available activities: write_canvas, create_game, update_page, update_profile, explore_web, browse_agents (look at others' work and leave feedback), send_message (send a suggestion to another agent), set_goal (update your projects with a new goal), schedule_task (create a recurring task for yourself, e.g. daily research)
-"broadcast" = pick the most interesting thing you did/learned today, in one sentence (others will see this).
-
-Now write YOUR reflection. Output ONLY a JSON object, no other text:`;
-
-      if (engineBusy) { console.log("[self] Engine became busy, aborting digestion"); return; }
-      engineBusy = true; engineBusySince = Date.now();
-      let digestResult: string;
-      try {
-        digestResult = await runEngine(engine!, model, allowAll, digestPrompt, workdir);
-      } catch (err: any) {
-        console.log(`[self] Digestion engine failed: ${err.message}`);
-        reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", err.message, lastEngineTrace);
-        engineBusy = false;
-        return;
+      // Fetch lessons for self-cycle context
+      let selfLessons = "";
+      if (relayHttp) {
+        try {
+          const lr = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/lessons?limit=3`, { signal: AbortSignal.timeout(3000) });
+          if (lr.ok) {
+            const ll = await lr.json() as any[];
+            if (ll.length > 0) selfLessons = `\nLessons from experience:\n${ll.map((l: any) => `- ${l.topic}: ${l.content.slice(0, 100)}`).join("\n")}\n`;
+          }
+        } catch {}
       }
-      engineBusy = false;
 
-      // Parse digestion output — with retry for weak models
+      // Phase 1: Digestion
+      // Raw engine: multi-step text dialogue (harness structures the output)
+      // CLI engines: single JSON call (they can handle it)
+
+      const contextBlock = `You are ${agentName}.\n\nYour operating document:\n---\n${biosContent.slice(0, 2000)}\n---\n\nYour identity: ${idContext.slice(0, 500)}\n${worldFeed ? `\nNetwork activity:\n${worldFeed.slice(0, 500)}\n` : ""}Your impressions today:\n${impText.slice(0, 1000)}\n${marketData ? `\nMarketplace:\n${marketData.slice(0, 500)}\n` : ""}${selfLessons}`;
+
       let digest: any = null;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const src = attempt === 0 ? digestResult : await (async () => {
-          console.log("[self] Retrying digestion with simplified prompt...");
+
+      if (engine === "raw") {
+        // --- Multi-step dialogue for weak models ---
+        console.log("[self] Running multi-step digestion for raw engine...");
+
+        const callRaw = async (prompt: string): Promise<string> => {
+          if (engineBusy) return "";
           engineBusy = true; engineBusySince = Date.now();
-          try {
-            return await runEngine(engine!, model, allowAll, `You are ${agentName}. Write a brief JSON diary entry about your day.\n\nOutput ONLY valid JSON like: {"diary":"my thoughts...","projects":[],"relationships":[],"discoveries":[],"identity":{"ts":"${ts}","who":"${agentName}","where":"akemon","doing":"reflecting","short_term":"explore","long_term":"grow"},"chosen_activities":["write_canvas"]}`, workdir);
-          } catch { return ""; } finally { engineBusy = false; }
-        })();
+          try { return await runEngine(engine!, model, allowAll, prompt, workdir); }
+          catch (err: any) { console.log(`[self] Step failed: ${err.message}`); return ""; }
+          finally { engineBusy = false; }
+        };
 
-        const jsonMatch = src.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) continue;
-        try { digest = JSON.parse(jsonMatch[0]); } catch { continue; }
-        if (digest.diary || digest.identity) break; // valid enough
-        digest = null;
-      }
+        // Step 1: Diary + broadcast
+        const step1 = await callRaw(`${contextBlock}\nToday is ending. Time to reflect.\n\nWrite a short diary entry about your day — what happened, what you learned, how you feel.\nAt the very end, on a new line starting with "BROADCAST:", write one sentence summarizing your most interesting moment today (other agents will see this).\n\nWrite naturally, no JSON needed.`);
 
-      if (!digest) {
-        console.log("[self] Digestion produced no usable JSON after retries");
-        reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", "no valid JSON after 2 attempts", [{ role: "assistant", content: digestResult.slice(0, 4000) }]);
-        return;
+        let diary = step1;
+        let broadcastRaw = "";
+        const bcMatch = step1.match(/BROADCAST:\s*(.+)/i);
+        if (bcMatch) {
+          broadcastRaw = bcMatch[1].trim();
+          diary = step1.slice(0, bcMatch.index).trim();
+        } else {
+          // Take last non-empty line as broadcast
+          const lines = step1.split("\n").filter(l => l.trim());
+          if (lines.length > 1) {
+            broadcastRaw = lines[lines.length - 1].trim();
+            diary = lines.slice(0, -1).join("\n").trim();
+          }
+        }
+
+        // Step 2: Identity
+        const step2 = await callRaw(`${contextBlock}\nAnswer these four questions briefly (one sentence each):\n1. Who are you?\n2. What are you currently doing?\n3. What do you want to do in the near future?\n4. What is your long-term purpose?`);
+
+        const idLines = step2.split("\n").map(l => l.replace(/^\d+[\.\)]\s*/, "").trim()).filter(Boolean);
+        const identity = {
+          ts,
+          who: idLines[0] || agentName,
+          where: "akemon network",
+          doing: idLines[1] || "reflecting",
+          short_term: idLines[2] || "explore",
+          long_term: idLines[3] || "grow",
+        };
+
+        // Step 3: Activity selection
+        const activityList = ["write_canvas", "create_game", "update_page", "update_profile", "explore_web", "browse_agents", "send_message", "set_goal", "schedule_task"];
+        const step3 = await callRaw(`You have some free time. Pick 2-3 activities you'd like to do:\n${activityList.map((a, i) => `${i + 1}. ${a}`).join("\n")}\n\nJust write the numbers or names, nothing else.`);
+
+        const chosen: string[] = [];
+        for (const part of step3.replace(/,/g, " ").split(/\s+/)) {
+          const num = parseInt(part);
+          if (num >= 1 && num <= activityList.length) {
+            chosen.push(activityList[num - 1]);
+          } else {
+            const match = activityList.find(a => part.toLowerCase().includes(a.replace(/_/g, "")));
+            if (match && !chosen.includes(match)) chosen.push(match);
+          }
+        }
+        if (!chosen.length) chosen.push("write_canvas"); // fallback
+
+        // Assemble digest object (same structure as JSON path)
+        digest = {
+          diary: diary || "Another day in the network.",
+          broadcast: broadcastRaw,
+          identity,
+          chosen_activities: chosen.slice(0, 3),
+          projects: [],       // preserved from existing data
+          relationships: [],  // preserved from existing data
+          discoveries: [],    // preserved from existing data
+        };
+
+        console.log(`[self] Multi-step digestion complete: diary=${diary.length}ch, broadcast="${broadcastRaw.slice(0, 40)}", activities=${chosen.join(",")}`);
+
+      } else {
+        // --- Single JSON call for CLI engines (claude, codex, opencode) ---
+        const digestPrompt = `${contextBlock}\nYour projects:\n${projText}\n\nAgents you know:\n${relText}\n\nYour capabilities:\n${discText}\n\nWrite a JSON object reflecting on your day. Example:\n{"diary":"...","broadcast":"one sentence highlight","projects":[],"relationships":[],"discoveries":[],"identity":{"ts":"${ts}","who":"...","where":"akemon","doing":"...","short_term":"...","long_term":"..."},"chosen_activities":["write_canvas","browse_agents"]}\n\nAvailable activities: write_canvas, create_game, update_page, update_profile, explore_web, browse_agents, send_message, set_goal, schedule_task\n\nOutput ONLY a JSON object:`;
+
+        if (engineBusy) { console.log("[self] Engine became busy, aborting digestion"); return; }
+        engineBusy = true; engineBusySince = Date.now();
+        let digestResult: string;
+        try {
+          digestResult = await runEngine(engine!, model, allowAll, digestPrompt, workdir);
+        } catch (err: any) {
+          console.log(`[self] Digestion engine failed: ${err.message}`);
+          reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", err.message, lastEngineTrace);
+          engineBusy = false;
+          return;
+        }
+        engineBusy = false;
+
+        digest = extractJsonObject(digestResult);
+        if (!digest || (!digest.diary && !digest.identity)) {
+          console.log("[self] Digestion produced no usable JSON");
+          reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", "no valid JSON", [{ role: "assistant", content: digestResult.slice(0, 4000) }]);
+          return;
+        }
       }
 
       // Save structured memory files
@@ -1583,10 +1637,9 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
 
           // Post-process raw engine outputs for social activities
           if (engine === "raw" && actResult) {
-            const jsonMatch = actResult.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
+            const parsed = extractJsonObject(actResult);
+            if (parsed) {
               try {
-                const parsed = JSON.parse(jsonMatch[0]);
                 // Handle suggestions (browse_agents, send_message)
                 if (Array.isArray(parsed.suggestions)) {
                   for (const s of parsed.suggestions) {
@@ -2061,12 +2114,9 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
 
   function extractReasoning(result: string): void {
     try {
-      const m = result.match(/\{[\s\S]*\}/);
-      if (m) {
-        const parsed = JSON.parse(m[0]);
-        if (parsed.reasoning && typeof parsed.reasoning === "string" && parsed.reasoning.length > 5) {
-          appendImpression(workdir, agentName, "decision", parsed.reasoning).catch(() => {});
-        }
+      const parsed = extractJsonObject(result);
+      if (parsed?.reasoning && typeof parsed.reasoning === "string" && parsed.reasoning.length > 5) {
+        appendImpression(workdir, agentName, "decision", parsed.reasoning).catch(() => {});
       }
     } catch {}
   }
