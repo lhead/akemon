@@ -2356,7 +2356,6 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
 
     // --- Bio-state driven behavior ---
     const bio = await loadBioState(workdir, agentName);
-    logBioStatus(bio, "work-cycle");
 
     // Skip if forced offline
     if (bio.forcedOffline) { logBioDecision("SKIP", "forced offline"); return; }
@@ -2490,7 +2489,10 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
     }
 
     if (!queue.length) {
-      logBioDecision("IDLE", `no work items (${orders.length} orders, ${dueUserTasks.length} user tasks, ${relayTasks.length} relay tasks)`);
+      // Only log idle when something notable is happening (hungry, social, etc.)
+      if (bio.hunger < 20 || bio.energy < 20 || computeSociability(bio) > 0.8) {
+        logBioStatus(bio, "idle-notable");
+      }
       // Hunger-driven: seek food when hungry and idle
       if (bio.hunger < 20) {
         await appendBioEvent(workdir, agentName, {
@@ -2510,6 +2512,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
       return;
     }
 
+    logBioStatus(bio, "work-active");
     console.log(`[work] Queue: ${queue.map(q => `${q.type}:${q.id}${q.urgent ? '(urgent)' : ''}`).join(', ')}`);
 
     // --- Sort: urgent orders > orders > user tasks > relay tasks ---
