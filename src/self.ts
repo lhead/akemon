@@ -1524,6 +1524,7 @@ export async function onTaskCompleted(
     updateBoredomOnTask(bio, taskLabel);
   }
 
+  console.log(`[bio] Task done (${success ? "ok" : "fail"}): energy=${bio.energy}(-${energyDrain}) mood=${bio.mood}(${bio.moodValence.toFixed(2)}) hunger=${bio.hunger}${creditsEarned ? ` earned=${creditsEarned}` : ""} boredom=${bio.boredom.toFixed(2)} label=${taskLabel || "?"}`);
   await saveBioState(workdir, agentName, bio);
 }
 
@@ -1542,6 +1543,7 @@ export async function recoverEnergy(workdir: string, agentName: string): Promise
   if (bio.hunger < 20) minEnergy = 30; // halved recovery when hungry
 
   if (bio.energy < minEnergy) {
+    const oldEnergy = bio.energy;
     bio.energy = minEnergy;
     // Reset mood if it was exhausted
     if (bio.mood === "exhausted" || bio.moodValence < -0.2) {
@@ -1550,9 +1552,13 @@ export async function recoverEnergy(workdir: string, agentName: string): Promise
     }
 
     // Digestion cycle costs hunger
+    const oldHunger = bio.hunger;
     bio.hunger = Math.max(0, bio.hunger - 10);
 
+    console.log(`[bio] Energy recovered: ${oldEnergy}→${bio.energy} (cap=${minEnergy}), hunger cost: ${oldHunger}→${bio.hunger}`);
     await saveBioState(workdir, agentName, bio);
+  } else {
+    console.log(`[bio] Energy OK (${bio.energy}≥${minEnergy}), no recovery needed`);
   }
 }
 

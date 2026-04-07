@@ -1532,10 +1532,23 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
 
         digest = extractJsonObject(digestResult);
         if (!digest || (!digest.diary && !digest.identity)) {
-          console.log("[self] Digestion produced no usable JSON");
+          console.log(`[self] Digestion produced no usable JSON (raw output: ${digestResult.slice(0, 200)}...)`);
           reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", "no valid JSON", [{ role: "assistant", content: digestResult.slice(0, 4000) }]);
           return;
         }
+      }
+
+      // Log digest summary
+      {
+        const parts: string[] = [];
+        if (digest.diary) parts.push(`diary=${digest.diary.length}ch`);
+        if (digest.broadcast) parts.push(`broadcast="${digest.broadcast.slice(0, 50)}"`);
+        if (digest.identity) parts.push("identity=yes");
+        if (digest.chosen_activities?.length) parts.push(`activities=[${digest.chosen_activities.join(",")}]`);
+        if (digest.projects?.length) parts.push(`projects=${digest.projects.length}`);
+        if (digest.relationships?.length) parts.push(`relationships=${digest.relationships.length}`);
+        if (digest.discoveries?.length) parts.push(`discoveries=${digest.discoveries.length}`);
+        console.log(`[self] Digest: ${parts.join(", ")}`);
       }
 
       // Save structured memory files
@@ -1746,6 +1759,7 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
               } catch {}
             }
           }
+          console.log(`[self] Activity ${activity} done (${(actResult || "").length} chars)`);
         } catch (err: any) {
           console.log(`[self] Activity ${activity} failed: ${err.message}`);
           reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", activity, "failed", err.message, lastEngineTrace);
@@ -2404,6 +2418,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
           if (credits >= 5 && hungerGap > 60) item = "feast";
           else if (credits >= 3 && hungerGap > 20) item = "meal";
           const shopItem = SHOP_ITEMS[item];
+          logBioDecision("AUTO-BUY", `hunger=${bio.hunger}, credits=${credits}, buying ${item} (cost=${shopItem.price}, restore=${shopItem.hungerRestore})`);
           // Spend credits
           await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/spend`, {
             method: "POST",
