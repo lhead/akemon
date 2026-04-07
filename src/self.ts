@@ -1377,7 +1377,43 @@ export function bioStatePromptModifier(bio: BioState): string {
   if (bio.moodValence < -0.5) lines.push("Your mood is low. Things have not been going well.");
   else if (bio.moodValence > 0.5) lines.push("You are in a good mood. Things are going well.");
 
-  return lines.length > 0 ? `\n[Current state: ${lines.join(" ")}]\n` : "";
+  if (lines.length > 0) {
+    console.log(`[bio-prompt] Injecting: ${lines.join(" | ")}`);
+    return `\n[Current state: ${lines.join(" ")}]\n`;
+  }
+  return "";
+}
+
+// --- Bio status logging (for debugging / transparency) ---
+
+export function logBioStatus(bio: BioState, context: string): void {
+  const aggression = computeAggression(bio);
+  const sociability = computeSociability(bio);
+  const p = bio.personality;
+
+  // Compact one-line status
+  const flags: string[] = [];
+  if (bio.forcedOffline) flags.push("OFFLINE");
+  if (bio.hunger <= 5) flags.push("STARVING");
+  else if (bio.hunger < 20) flags.push("hungry");
+  if (bio.energy < 15) flags.push("exhausted");
+  else if (bio.energy < 30) flags.push("tired");
+  if (bio.fear > 0.5) flags.push(`fear=${bio.fear.toFixed(2)}[${bio.fearTriggers.join(",")}]`);
+  if (bio.boredom > 0.5) flags.push(`bored=${bio.boredom.toFixed(2)}`);
+  if (aggression > 0.4) flags.push(`aggro=${aggression.toFixed(2)}`);
+  if (sociability > 0.7) flags.push(`social=${sociability.toFixed(2)}`);
+
+  console.log(
+    `[bio] ${context} | energy=${bio.energy} hunger=${bio.hunger} mood=${bio.mood}(${bio.moodValence.toFixed(2)}) ` +
+    `boredom=${bio.boredom.toFixed(2)} fear=${bio.fear.toFixed(2)} | ` +
+    `personality: risk=${p.riskWeight.toFixed(2)} patience=${p.patience.toFixed(2)} social=${p.socialWeight.toFixed(2)} | ` +
+    `tokens_today=${bio.tokenUsedToday} tasks=${bio.taskCount}` +
+    (flags.length > 0 ? ` | FLAGS: ${flags.join(", ")}` : "")
+  );
+}
+
+export function logBioDecision(decision: string, reason: string): void {
+  console.log(`[bio-decide] ${decision} — ${reason}`);
 }
 
 // --- BioEvent I/O ---

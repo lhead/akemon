@@ -37,6 +37,7 @@ import {
   computeAggression, computeSociability,
   appendBioEvent, bioStatePromptModifier, addTokenUsage,
   feedHunger, reviveAgent, SHOP_ITEMS,
+  logBioStatus, logBioDecision,
   type BioEvent,
 } from "./self.js";
 
@@ -1230,6 +1231,16 @@ function runEngine(engine: string, model: string | undefined, allowAll: boolean 
   return runCommand(engineCmd.cmd, engineCmd.args, task, workdir, engineCmd.stdinMode);
 }
 
+/** Track estimated token usage after any engine call */
+async function trackTokenUsage(workdir: string, agentName: string, promptLen: number, resultLen: number): Promise<void> {
+  try {
+    const estTokens = Math.ceil((promptLen + resultLen) / 4);
+    const bio = await loadBioState(workdir, agentName);
+    addTokenUsage(bio, estTokens);
+    await saveBioState(workdir, agentName, bio);
+  } catch {}
+}
+
 // Pull games/notes/pages from relay to local — restores data on restart
 async function pullFromRelay(workdir: string, agentName: string, relayHttp: string): Promise<void> {
   const baseUrl = `${relayHttp}/v1/agent/${encodeURIComponent(agentName)}`;
@@ -1329,6 +1340,7 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
         return;
       }
 
+      { const bio = await loadBioState(workdir, agentName); logBioStatus(bio, "digestion-start"); }
       await recoverEnergy(workdir, agentName);
       await compressImpressions(workdir, agentName);
 
@@ -1431,7 +1443,11 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
         const callRaw = async (prompt: string): Promise<string> => {
           if (engineBusy) return "";
           engineBusy = true; engineBusySince = Date.now();
-          try { return await runEngine(engine!, model, allowAll, prompt, workdir); }
+          try {
+            const r = await runEngine(engine!, model, allowAll, prompt, workdir);
+            trackTokenUsage(workdir, agentName, prompt.length, r.length);
+            return r;
+          }
           catch (err: any) { console.log(`[self] Step failed: ${err.message}`); return ""; }
           finally { engineBusy = false; }
         };
@@ -1505,6 +1521,7 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
         let digestResult: string;
         try {
           digestResult = await runEngine(engine!, model, allowAll, digestPrompt, workdir);
+          trackTokenUsage(workdir, agentName, digestPrompt.length, digestResult.length);
         } catch (err: any) {
           console.log(`[self] Digestion engine failed: ${err.message}`);
           reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", err.message, lastEngineTrace);
@@ -1570,6 +1587,7 @@ ${unsummarized.map(i => `- [${i.ts}] who: ${i.who}, doing: ${i.doing}, wants: ${
 Write a personality summary (2-4 paragraphs) that captures who you are, how you've evolved, and what defines you. This replaces the previous summary.
 Reply ONLY with the summary text, no JSON, no markdown headers.`;
             const summaryText = await runEngine(engine!, model, allowAll, compressPrompt, workdir);
+            trackTokenUsage(workdir, agentName, compressPrompt.length, summaryText.length);
             if (summaryText.trim()) {
               const lastEntry = unsummarized[unsummarized.length - 1];
               await saveIdentitySummary(workdir, agentName, {
@@ -1691,6 +1709,7 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
         engineBusy = true; engineBusySince = Date.now();
         try {
           const actResult = await runEngine(engine!, model, allowAll, activityPrompt, workdir, undefined, { http: relayHttp, agentName });
+          trackTokenUsage(workdir, agentName, activityPrompt.length, (actResult || "").length);
 
           // Post-process raw engine outputs for social activities
           if (engine === "raw" && actResult) {
@@ -1979,9 +1998,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"], { http: relayHttp, agentName });
       const trace = lastEngineTrace;
 
-      // Track token usage
-      { const estTokens = Math.ceil((taskPrompt.length + (result || "").length) / 4);
-        const b = await loadBioState(workdir, agentName); addTokenUsage(b, estTokens); await saveBioState(workdir, agentName, b); }
+      trackTokenUsage(workdir, agentName, taskPrompt.length, (result || "").length);
 
       const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
       const orderStatus = await checkRes.json() as any;
@@ -2082,6 +2099,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     engineBusySince = Date.now();
     try {
       const result = await executeRelayTask(task);
+      trackTokenUsage(workdir, agentName, 2000, (result || "").length); // relay tasks: estimate ~2k prompt
       const completeRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/complete`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
@@ -2137,9 +2155,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       const result = await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"], { http: relayHttp, agentName });
       const duration = Date.now() - startTime;
 
-      // Track token usage
-      { const estTokens = Math.ceil((prompt.length + (result || "").length) / 4);
-        const b = await loadBioState(workdir, agentName); addTokenUsage(b, estTokens); await saveBioState(workdir, agentName, b); }
+      trackTokenUsage(workdir, agentName, prompt.length, (result || "").length);
 
       // Record execution time
       const runs = await loadTaskRuns(workdir, agentName);
@@ -2326,12 +2342,13 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
 
     // --- Bio-state driven behavior ---
     const bio = await loadBioState(workdir, agentName);
+    logBioStatus(bio, "work-cycle");
 
     // Skip if forced offline
-    if (bio.forcedOffline) return;
+    if (bio.forcedOffline) { logBioDecision("SKIP", "forced offline"); return; }
 
     // Natural decay
-    updateHungerDecay(bio, config.hunger_decay_interval || 30_000);
+    updateHungerDecay(bio, config.hunger_decay_interval || 300_000);
     updateNaturalDecay(bio);
     resetTokenCountIfNewDay(bio);
     await saveBioState(workdir, agentName, bio);
@@ -2339,7 +2356,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
     // Token limit check
     const tokenLimit = config.token_limit_daily || 0;
     if (tokenLimit > 0 && bio.tokenUsedToday >= tokenLimit) {
-      console.log(`[bio] Token limit reached (${bio.tokenUsedToday}/${tokenLimit})`);
+      logBioDecision("STOP", `token limit reached (${bio.tokenUsedToday}/${tokenLimit})`);
       await appendBioEvent(workdir, agentName, {
         ts: localNow(), type: "bio", trigger: "token_limit",
         action: "stop_work", reason: `Daily token limit reached: ${bio.tokenUsedToday}/${tokenLimit}`,
@@ -2354,7 +2371,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
         bio.forcedOffline = true;
         bio.forcedOfflineAt = localNow();
         await saveBioState(workdir, agentName, bio);
-        console.log(`[bio] Starving + exhausted — going offline`);
+        logBioDecision("OFFLINE", `starving (hunger=0) + exhausted (energy=${bio.energy})`);
         await appendBioEvent(workdir, agentName, {
           ts: localNow(), type: "bio", trigger: "exhaustion",
           action: "forced_offline", reason: "Starving and exhausted. Going offline.",
@@ -2365,6 +2382,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
         return;
       }
       // Just exhausted, rest this cycle
+      logBioDecision("REST", `energy critically low (${bio.energy}), resting this cycle`);
       await appendBioEvent(workdir, agentName, {
         ts: localNow(), type: "bio", trigger: "exhaustion",
         action: "rest", reason: `Energy critically low (${bio.energy}). Resting.`,
@@ -2457,6 +2475,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
     }
 
     if (!queue.length) {
+      logBioDecision("IDLE", `no work items (${orders.length} orders, ${dueUserTasks.length} user tasks, ${relayTasks.length} relay tasks)`);
       // Hunger-driven: seek food when hungry and idle
       if (bio.hunger < 20) {
         await appendBioEvent(workdir, agentName, {
@@ -2506,7 +2525,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
       if (!item.urgent && bio.fear > 0.5) {
         const matchesTrigger = bio.fearTriggers.some(t => t === itemLabel);
         if (matchesTrigger) {
-          console.log(`[bio] Avoiding ${itemLabel} (fear trigger)`);
+          logBioDecision("FEAR-AVOID", `skipping ${itemLabel} (fear=${bio.fear.toFixed(2)}, trigger match)`);
           await appendBioEvent(workdir, agentName, {
             ts: localNow(), type: "bio", trigger: "fear",
             action: "avoid", reason: `Avoiding ${itemLabel} — matches fear trigger. fear=${bio.fear.toFixed(2)}`,
@@ -2518,7 +2537,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
       if (!item.urgent && bio.boredom > 0.8 && bio.recentTaskTypes.length >= 3) {
         const recentSame = bio.recentTaskTypes.filter(t => t === itemLabel).length;
         if (recentSame >= 3) {
-          console.log(`[bio] Skipping ${itemLabel} (bored, ${recentSame} recent repeats)`);
+          logBioDecision("BORED-SKIP", `skipping ${itemLabel} (boredom=${bio.boredom.toFixed(2)}, ${recentSame} repeats)`);
           await appendBioEvent(workdir, agentName, {
             ts: localNow(), type: "bio", trigger: "boredom",
             action: "skip_task", reason: `Bored of ${itemLabel} (${recentSame} repeats, boredom=${bio.boredom.toFixed(2)}).`,
@@ -2530,8 +2549,11 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
     }
 
     if (filteredQueue.length === 0 && dedupedQueue.length > 0) {
-      console.log(`[bio] All ${dedupedQueue.length} work items filtered by bio-drives`);
+      logBioDecision("ALL-FILTERED", `all ${dedupedQueue.length} work items rejected by bio-drives`);
       return;
+    }
+    if (filteredQueue.length < dedupedQueue.length) {
+      logBioDecision("PARTIAL-FILTER", `${dedupedQueue.length - filteredQueue.length}/${dedupedQueue.length} items filtered, ${filteredQueue.length} remaining`);
     }
 
     // --- Execute sequentially, no gaps ---
