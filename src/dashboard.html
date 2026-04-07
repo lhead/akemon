@@ -3,389 +3,550 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Akemon Agent</title>
+<title>Akemon</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #0a0a0f; color: #c8c8d0; font-family: 'Courier New', monospace; min-height: 100vh; overflow-x: hidden; }
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0a0a12; overflow:hidden; font-family:'Courier New',monospace; }
+canvas { display:block; }
 
-  .container { max-width: 800px; margin: 0 auto; padding: 20px; }
-  h1 { font-size: 14px; color: #666; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 20px; }
+/* HUD overlay */
+.hud { position:fixed; top:12px; left:12px; z-index:10; pointer-events:none; }
+.hud-name { color:#8888aa; font-size:11px; letter-spacing:2px; text-transform:uppercase; margin-bottom:8px; }
+.hud-bars { display:flex; flex-direction:column; gap:4px; }
+.hud-bar { display:flex; align-items:center; gap:6px; }
+.hud-bar-icon { font-size:10px; width:14px; text-align:center; }
+.hud-bar-track { width:80px; height:5px; background:#1a1a2a; border-radius:3px; overflow:hidden; }
+.hud-bar-fill { height:100%; border-radius:3px; transition: width 1s ease; }
+.hud-bar-text { font-size:9px; color:#555; width:24px; }
 
-  /* --- Agent Character --- */
-  .stage { position: relative; height: 200px; background: linear-gradient(180deg, #0d0d18 0%, #12121f 60%, #1a1a2a 100%); border-radius: 16px; margin-bottom: 20px; overflow: hidden; display: flex; align-items: flex-end; justify-content: center; }
-  .stage .ground { position: absolute; bottom: 0; width: 100%; height: 30px; background: linear-gradient(180deg, #1a1a2a, #15152a); }
-  .stage .stars { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
-  .stage .star { position: absolute; width: 2px; height: 2px; background: #444; border-radius: 50%; }
+/* Event toast */
+.toast-container { position:fixed; bottom:16px; left:50%; transform:translateX(-50%); z-index:10; display:flex; flex-direction:column-reverse; gap:6px; align-items:center; pointer-events:none; }
+.toast { background:rgba(18,18,32,0.92); border:1px solid #2a2a40; border-radius:8px; padding:6px 14px; font-size:11px; color:#aaa; white-space:nowrap; animation: toastIn 0.4s ease, toastOut 0.4s ease 4s forwards; }
+@keyframes toastIn { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
+@keyframes toastOut { from { opacity:1; } to { opacity:0; } }
 
-  .creature { position: relative; bottom: 30px; z-index: 2; transition: all 0.5s ease; }
-  .creature.offline { filter: grayscale(1) brightness(0.4); }
+/* Personality mini */
+.personality-hud { position:fixed; top:12px; right:12px; z-index:10; pointer-events:none; }
+.p-tag { display:inline-block; font-size:9px; padding:2px 6px; border-radius:4px; margin:1px; background:#1a1a2a; border:1px solid #2a2a3a; }
+.p-tag.high { color:#4ae; } .p-tag.low { color:#a86; } .p-tag.mid { color:#666; }
 
-  /* Blob body */
-  .blob { width: 64px; height: 56px; background: var(--body-color, #4a9eff); border-radius: 50% 50% 45% 45%; position: relative; transition: all 0.8s ease; animation: bob 3s ease-in-out infinite; }
-  .blob.hungry { animation: bob 3s ease-in-out infinite, shake 0.5s ease-in-out infinite; }
-  .blob.exhausted { animation: none; transform: scaleY(0.7) translateY(10px); opacity: 0.6; }
-  .blob.excited { animation: bob 1.5s ease-in-out infinite; }
-
-  @keyframes bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
-  @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-2px); } 75% { transform: translateX(2px); } }
-
-  /* Eyes */
-  .eyes { position: absolute; top: 16px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; }
-  .eye { width: 8px; height: 10px; background: #fff; border-radius: 50%; position: relative; transition: all 0.3s; }
-  .eye::after { content: ''; position: absolute; width: 4px; height: 5px; background: #111; border-radius: 50%; top: 3px; left: 2px; transition: all 0.3s; }
-  .blob.happy .eye { height: 6px; border-radius: 6px 6px 0 0; }
-  .blob.happy .eye::after { display: none; }
-  .blob.angry .eye { height: 8px; transform: rotate(-10deg); }
-  .blob.angry .eye:last-child { transform: rotate(10deg); }
-  .blob.tired .eye { height: 4px; border-radius: 4px; }
-  .blob.tired .eye::after { display: none; }
-  .blob.scared .eye { width: 10px; height: 12px; }
-  .blob.scared .eye::after { width: 5px; height: 6px; }
-
-  /* Mouth */
-  .mouth { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); width: 10px; height: 5px; border-bottom: 2px solid #fff; border-radius: 0 0 10px 10px; transition: all 0.3s; }
-  .blob.happy .mouth { width: 14px; height: 7px; border-bottom: 2px solid #fff; }
-  .blob.angry .mouth { width: 10px; height: 3px; border-bottom: 2px solid #fff; border-radius: 0; transform: translateX(-50%) rotate(180deg); }
-  .blob.tired .mouth { width: 8px; height: 0; border-bottom: 2px solid #fff; border-radius: 0; }
-
-  /* Status bubble */
-  .bubble { position: absolute; top: -40px; left: 50%; transform: translateX(-50%); background: #1e1e30; border: 1px solid #333; border-radius: 12px; padding: 6px 12px; font-size: 12px; white-space: nowrap; opacity: 0; transition: opacity 0.5s; pointer-events: none; }
-  .bubble.show { opacity: 1; }
-  .bubble::after { content: ''; position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 6px solid #333; }
-
-  /* --- Status Bars --- */
-  .bars { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
-  .bar-group { background: #111118; border-radius: 10px; padding: 12px; }
-  .bar-label { display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-bottom: 6px; }
-  .bar-track { height: 6px; background: #1a1a28; border-radius: 3px; overflow: hidden; }
-  .bar-fill { height: 100%; border-radius: 3px; transition: width 1s ease, background 0.5s; }
-  .bar-fill.energy { background: linear-gradient(90deg, #f59e0b, #10b981); }
-  .bar-fill.hunger { background: linear-gradient(90deg, #ef4444, #f59e0b); }
-  .bar-fill.boredom { background: linear-gradient(90deg, #6366f1, #8b5cf6); }
-  .bar-fill.fear { background: linear-gradient(90deg, #64748b, #ef4444); }
-  .bar-fill.mood { background: linear-gradient(90deg, #ef4444, #eab308, #10b981); }
-  .bar-fill.tokens { background: linear-gradient(90deg, #06b6d4, #3b82f6); }
-
-  /* --- Personality Panel --- */
-  .personality { background: #111118; border-radius: 10px; padding: 14px; margin-bottom: 20px; }
-  .personality h2 { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
-  .trait { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
-  .trait-label { width: 60px; color: #888; text-align: right; }
-  .trait-bar { flex: 1; height: 4px; background: #1a1a28; border-radius: 2px; position: relative; }
-  .trait-marker { position: absolute; width: 8px; height: 8px; background: #4a9eff; border-radius: 50%; top: -2px; transition: left 0.5s; }
-  .trait-ends { display: flex; justify-content: space-between; font-size: 9px; color: #555; }
-
-  /* --- Event Timeline --- */
-  .events { background: #111118; border-radius: 10px; padding: 14px; margin-bottom: 20px; }
-  .events h2 { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
-  .event { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid #1a1a28; font-size: 12px; }
-  .event:last-child { border-bottom: none; }
-  .event-icon { font-size: 14px; flex-shrink: 0; }
-  .event-body { flex: 1; }
-  .event-reason { color: #999; }
-  .event-time { color: #555; font-size: 10px; }
-  .event-trigger { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; margin-right: 4px; }
-  .event-trigger.hunger { background: #f59e0b22; color: #f59e0b; }
-  .event-trigger.fear { background: #ef444422; color: #ef4444; }
-  .event-trigger.boredom { background: #8b5cf622; color: #8b5cf6; }
-  .event-trigger.exhaustion { background: #64748b22; color: #94a3b8; }
-  .event-trigger.social { background: #10b98122; color: #10b981; }
-  .event-trigger.token_limit { background: #06b6d422; color: #06b6d4; }
-  .event-trigger.revive { background: #22c55e22; color: #22c55e; }
-
-  /* --- Revive --- */
-  .revive-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 100; }
-  .revive-overlay.show { display: flex; }
-  .revive-card { background: #1a1a2a; border: 1px solid #333; border-radius: 16px; padding: 30px; text-align: center; max-width: 360px; }
-  .revive-card h2 { color: #ef4444; margin-bottom: 10px; font-size: 16px; }
-  .revive-card p { color: #888; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
-  .revive-btn { background: linear-gradient(135deg, #22c55e, #10b981); color: #fff; border: none; padding: 12px 32px; border-radius: 10px; font-size: 14px; font-family: inherit; cursor: pointer; transition: transform 0.2s; }
-  .revive-btn:hover { transform: scale(1.05); }
-  .revive-btn:active { transform: scale(0.95); }
-
-  /* --- Computed --- */
-  .computed { display: flex; gap: 10px; margin-bottom: 20px; }
-  .computed-item { flex: 1; background: #111118; border-radius: 10px; padding: 12px; text-align: center; }
-  .computed-value { font-size: 24px; font-weight: bold; }
-  .computed-label { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
-
-  .offline-badge { display: inline-block; background: #ef4444; color: #fff; font-size: 10px; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
-  .no-data { text-align: center; color: #555; padding: 40px; font-size: 13px; }
+/* Revive */
+.revive-overlay { position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); display:none; align-items:center; justify-content:center; z-index:100; }
+.revive-overlay.show { display:flex; }
+.revive-card { background:#1a1a2a; border:1px solid #333; border-radius:16px; padding:30px; text-align:center; }
+.revive-card h2 { color:#e55; font-size:15px; margin-bottom:8px; }
+.revive-card p { color:#888; font-size:12px; margin-bottom:16px; }
+.revive-btn { background:linear-gradient(135deg,#2c5,#1a8); color:#fff; border:none; padding:10px 28px; border-radius:8px; font-size:13px; font-family:inherit; cursor:pointer; }
 </style>
 </head>
 <body>
 
-<div class="container">
-  <h1 id="title">Loading...</h1>
-
-  <!-- Stage: character visualization -->
-  <div class="stage" id="stage">
-    <div class="stars" id="stars"></div>
-    <div class="ground"></div>
-    <div class="creature" id="creature">
-      <div class="bubble" id="bubble"></div>
-      <div class="blob" id="blob">
-        <div class="eyes"><div class="eye"></div><div class="eye"></div></div>
-        <div class="mouth"></div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Computed values -->
-  <div class="computed" id="computed">
-    <div class="computed-item"><div class="computed-value" id="aggression-val">--</div><div class="computed-label">Aggression</div></div>
-    <div class="computed-item"><div class="computed-value" id="sociability-val">--</div><div class="computed-label">Sociability</div></div>
-    <div class="computed-item"><div class="computed-value" id="mood-val">--</div><div class="computed-label">Mood</div></div>
-    <div class="computed-item"><div class="computed-value" id="tasks-val">--</div><div class="computed-label">Tasks Done</div></div>
-  </div>
-
-  <!-- Status bars -->
-  <div class="bars" id="bars">
-    <div class="bar-group">
-      <div class="bar-label"><span>Energy</span><span id="energy-text">--</span></div>
-      <div class="bar-track"><div class="bar-fill energy" id="energy-bar" style="width:0%"></div></div>
-    </div>
-    <div class="bar-group">
-      <div class="bar-label"><span>Hunger</span><span id="hunger-text">--</span></div>
-      <div class="bar-track"><div class="bar-fill hunger" id="hunger-bar" style="width:0%"></div></div>
-    </div>
-    <div class="bar-group">
-      <div class="bar-label"><span>Boredom</span><span id="boredom-text">--</span></div>
-      <div class="bar-track"><div class="bar-fill boredom" id="boredom-bar" style="width:0%"></div></div>
-    </div>
-    <div class="bar-group">
-      <div class="bar-label"><span>Fear</span><span id="fear-text">--</span></div>
-      <div class="bar-track"><div class="bar-fill fear" id="fear-bar" style="width:0%"></div></div>
-    </div>
-    <div class="bar-group">
-      <div class="bar-label"><span>Mood</span><span id="moodv-text">--</span></div>
-      <div class="bar-track"><div class="bar-fill mood" id="moodv-bar" style="width:50%"></div></div>
-    </div>
-    <div class="bar-group">
-      <div class="bar-label"><span>Tokens Today</span><span id="tokens-text">--</span></div>
-      <div class="bar-track"><div class="bar-fill tokens" id="tokens-bar" style="width:0%"></div></div>
-    </div>
-  </div>
-
-  <!-- Personality -->
-  <div class="personality" id="personality">
-    <h2>Personality</h2>
-    <div class="trait">
-      <div class="trait-label">Risk</div>
-      <div class="trait-bar"><div class="trait-marker" id="trait-risk" style="left:50%"></div></div>
-    </div>
-    <div class="trait-ends"><span>Cautious</span><span>Bold</span></div>
-    <div class="trait">
-      <div class="trait-label">Reward</div>
-      <div class="trait-bar"><div class="trait-marker" id="trait-reward" style="left:50%"></div></div>
-    </div>
-    <div class="trait">
-      <div class="trait-label">Social</div>
-      <div class="trait-bar"><div class="trait-marker" id="trait-social" style="left:50%"></div></div>
-    </div>
-    <div class="trait">
-      <div class="trait-label">Patience</div>
-      <div class="trait-bar"><div class="trait-marker" id="trait-patience" style="left:50%"></div></div>
-    </div>
-  </div>
-
-  <!-- Events -->
-  <div class="events" id="events">
-    <h2>Recent Activity</h2>
-    <div id="event-list"><div class="no-data">No bio events yet</div></div>
-  </div>
+<div class="hud">
+  <div class="hud-name" id="hud-name">loading...</div>
+  <div class="hud-bars" id="hud-bars"></div>
 </div>
 
-<!-- Revive overlay -->
+<div class="personality-hud" id="personality-hud"></div>
+
+<div class="toast-container" id="toasts"></div>
+
+<canvas id="c"></canvas>
+
 <div class="revive-overlay" id="revive-overlay">
   <div class="revive-card">
     <h2>Agent Offline</h2>
-    <p id="revive-msg">This agent ran out of energy and food. It needs help to come back.</p>
-    <button class="revive-btn" onclick="revive()">Revive Agent</button>
+    <p>Starved and exhausted. Needs help.</p>
+    <button class="revive-btn" onclick="revive()">Revive</button>
   </div>
 </div>
 
 <script>
-const TRIGGER_ICONS = {
-  hunger: '\u{1F35E}', fear: '\u{1F628}', boredom: '\u{1F971}',
-  exhaustion: '\u{1F634}', social: '\u{1F44B}', token_limit: '\u{26A1}', revive: '\u{2728}',
-};
+// === Canvas setup ===
+const C = document.getElementById('c');
+const ctx = C.getContext('2d');
+let W, H;
+function resize() { W = C.width = innerWidth; H = C.height = innerHeight; }
+resize();
+addEventListener('resize', resize);
 
-let lastState = null;
-let bubbleTimeout = null;
+// === State ===
+let state = null;
+let prevEvents = [];
+let agentX, agentY, targetX, targetY;
+let bobPhase = 0;
+let blinkTimer = 0;
+let isBlinking = false;
+let zzz = []; // sleep particles
+let hearts = []; // social particles
+let coins = []; // earn particles
+let sparks = []; // fear particles
+let currentActivity = 'idle'; // idle, working, eating, sleeping, social, seeking
 
-// Generate stars
-(function() {
-  const stars = document.getElementById('stars');
-  for (let i = 0; i < 30; i++) {
-    const s = document.createElement('div');
-    s.className = 'star';
-    s.style.left = Math.random() * 100 + '%';
-    s.style.top = Math.random() * 70 + '%';
-    s.style.opacity = Math.random() * 0.5 + 0.2;
-    stars.appendChild(s);
+// Locations (relative to canvas)
+function loc(name) {
+  const cx = W * 0.5, cy = H * 0.55;
+  const r = Math.min(W, H) * 0.25;
+  switch(name) {
+    case 'home': return { x: cx, y: cy, label: 'Home' };
+    case 'work': return { x: cx + r * 0.9, y: cy - r * 0.3, label: 'Work' };
+    case 'shop': return { x: cx - r * 0.9, y: cy - r * 0.2, label: 'Shop' };
+    case 'social': return { x: cx + r * 0.3, y: cy - r * 0.8, label: 'Social' };
+    case 'rest': return { x: cx - r * 0.3, y: cy + r * 0.5, label: 'Rest' };
+    default: return { x: cx, y: cy };
   }
-})();
-
-function showBubble(text) {
-  const b = document.getElementById('bubble');
-  b.textContent = text;
-  b.classList.add('show');
-  clearTimeout(bubbleTimeout);
-  bubbleTimeout = setTimeout(() => b.classList.remove('show'), 4000);
 }
 
-function updateCharacter(bio, computed) {
-  const blob = document.getElementById('blob');
-  const creature = document.getElementById('creature');
+// === Stars ===
+const stars = Array.from({length: 80}, () => ({
+  x: Math.random(), y: Math.random() * 0.6,
+  s: Math.random() * 1.5 + 0.5, b: Math.random(),
+  speed: Math.random() * 0.001 + 0.0005,
+}));
 
-  // Reset classes
-  blob.className = 'blob';
-  creature.className = 'creature';
+// === Scene drawing ===
+function drawScene() {
+  // Sky gradient
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#08081a');
+  grad.addColorStop(0.5, '#0d0d22');
+  grad.addColorStop(1, '#14142a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
 
-  // Body color based on mood + hunger
-  let hue = 210; // base blue
-  if (bio.moodValence > 0.3) hue = 140; // green-ish
-  if (bio.moodValence < -0.3) hue = 260; // purple
-  if (bio.hunger < 20) hue = 30; // orange when hungry
-  if (bio.hunger === 0) hue = 0; // red when starving
+  // Stars
+  const t = Date.now() * 0.001;
+  for (const s of stars) {
+    const twinkle = 0.4 + 0.6 * Math.sin(t * s.speed * 1000 + s.b * 6.28);
+    ctx.fillStyle = `rgba(180,190,220,${twinkle * 0.6})`;
+    ctx.beginPath();
+    ctx.arc(s.x * W, s.y * H, s.s, 0, 6.28);
+    ctx.fill();
+  }
+
+  // Ground
+  const gy = H * 0.78;
+  const ggrad = ctx.createLinearGradient(0, gy, 0, H);
+  ggrad.addColorStop(0, '#161628');
+  ggrad.addColorStop(1, '#0e0e20');
+  ctx.fillStyle = ggrad;
+  ctx.fillRect(0, gy, W, H - gy);
+
+  // Ground line
+  ctx.strokeStyle = '#222240';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, gy);
+  ctx.lineTo(W, gy);
+  ctx.stroke();
+
+  // Location markers
+  const locs = ['home', 'work', 'shop', 'social', 'rest'];
+  for (const name of locs) {
+    const l = loc(name);
+    // Small icon
+    ctx.fillStyle = '#1a1a30';
+    ctx.strokeStyle = '#2a2a44';
+    ctx.lineWidth = 1;
+
+    if (name === 'shop') {
+      // Shop: small building
+      ctx.fillRect(l.x - 18, l.y - 20, 36, 24);
+      ctx.strokeRect(l.x - 18, l.y - 20, 36, 24);
+      // Roof
+      ctx.beginPath();
+      ctx.moveTo(l.x - 22, l.y - 20);
+      ctx.lineTo(l.x, l.y - 34);
+      ctx.lineTo(l.x + 22, l.y - 20);
+      ctx.closePath();
+      ctx.fillStyle = '#2a2244';
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#1a1a30';
+    } else if (name === 'work') {
+      // Work: desk shape
+      ctx.fillRect(l.x - 20, l.y - 8, 40, 12);
+      ctx.strokeRect(l.x - 20, l.y - 8, 40, 12);
+      // Screen
+      ctx.fillStyle = '#222244';
+      ctx.fillRect(l.x - 8, l.y - 22, 16, 14);
+      ctx.strokeRect(l.x - 8, l.y - 22, 16, 14);
+      ctx.fillStyle = '#1a1a30';
+    } else if (name === 'home') {
+      // Home: house
+      ctx.fillRect(l.x - 16, l.y - 14, 32, 20);
+      ctx.strokeRect(l.x - 16, l.y - 14, 32, 20);
+      ctx.beginPath();
+      ctx.moveTo(l.x - 20, l.y - 14);
+      ctx.lineTo(l.x, l.y - 30);
+      ctx.lineTo(l.x + 20, l.y - 14);
+      ctx.closePath();
+      ctx.fillStyle = '#22223a';
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#1a1a30';
+      // Door
+      ctx.fillStyle = '#282848';
+      ctx.fillRect(l.x - 4, l.y - 4, 8, 10);
+      ctx.fillStyle = '#1a1a30';
+    } else if (name === 'social') {
+      // Social: bench
+      ctx.fillRect(l.x - 18, l.y - 2, 36, 6);
+      ctx.strokeRect(l.x - 18, l.y - 2, 36, 6);
+      ctx.fillRect(l.x - 14, l.y + 4, 4, 8);
+      ctx.fillRect(l.x + 10, l.y + 4, 4, 8);
+    } else if (name === 'rest') {
+      // Rest: bed
+      ctx.fillRect(l.x - 16, l.y - 4, 32, 10);
+      ctx.strokeRect(l.x - 16, l.y - 4, 32, 10);
+      // Pillow
+      ctx.fillStyle = '#282848';
+      ctx.fillRect(l.x - 14, l.y - 8, 10, 6);
+      ctx.fillStyle = '#1a1a30';
+    }
+
+    // Label
+    ctx.fillStyle = '#333355';
+    ctx.font = '9px Courier New';
+    ctx.textAlign = 'center';
+    ctx.fillText(l.label, l.x, l.y + 22);
+  }
+}
+
+// === Agent drawing ===
+function drawAgent() {
+  if (!state) return;
+  const bio = state.bio;
+  const comp = state.computed;
+
+  // Movement
+  const dx = targetX - agentX;
+  const dy = targetY - agentY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const speed = 1.5;
+  if (dist > 2) {
+    agentX += (dx / dist) * speed;
+    agentY += (dy / dist) * speed;
+  }
+
+  // Bob animation
+  bobPhase += currentActivity === 'sleeping' ? 0.02 : 0.05;
+  const bobY = currentActivity === 'sleeping' ? Math.sin(bobPhase) * 2 : Math.sin(bobPhase) * 4;
+
+  // Blink
+  blinkTimer -= 0.016;
+  if (blinkTimer <= 0) {
+    isBlinking = true;
+    blinkTimer = 3 + Math.random() * 4;
+    setTimeout(() => isBlinking = false, 150);
+  }
+
+  const x = agentX;
+  const y = agentY + bobY;
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(agentX, agentY + 22, 18, 5, 0, 0, 6.28);
+  ctx.fill();
+
+  // Body color
+  let hue = 210;
+  if (bio.moodValence > 0.3) hue = 150;
+  if (bio.moodValence < -0.3) hue = 270;
+  if (bio.hunger < 20) hue = 30;
+  if (bio.hunger === 0) hue = 0;
   const sat = 50 + bio.energy * 0.3;
-  const light = 35 + bio.energy * 0.2;
-  blob.style.setProperty('--body-color', `hsl(${hue}, ${sat}%, ${light}%)`);
+  const lum = 30 + bio.energy * 0.2;
+  const bodyColor = `hsl(${hue},${sat}%,${lum}%)`;
 
-  // Expressions
+  // Body scale
+  const scale = bio.forcedOffline ? 0.6 : (0.8 + bio.energy / 100 * 0.2);
+  const bw = 28 * scale;
+  const bh = 24 * scale;
+
+  ctx.save();
+  ctx.translate(x, y);
+
   if (bio.forcedOffline) {
-    creature.classList.add('offline');
-    blob.classList.add('tired');
+    ctx.globalAlpha = 0.35;
+    ctx.filter = 'grayscale(1)';
+  }
+
+  // Body
+  ctx.fillStyle = bodyColor;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, bw, bh, 0, 0, 6.28);
+  ctx.fill();
+
+  // Highlight
+  ctx.fillStyle = `hsla(${hue},${sat + 20}%,${lum + 20}%,0.3)`;
+  ctx.beginPath();
+  ctx.ellipse(-bw * 0.25, -bh * 0.3, bw * 0.3, bh * 0.2, -0.3, 0, 6.28);
+  ctx.fill();
+
+  // Eyes
+  const eyeSpacing = bw * 0.35;
+  const eyeY = -bh * 0.15;
+  const eyeH = isBlinking ? 1 : (bio.energy < 20 ? 3 : 5);
+  const eyeW = bio.fear > 0.5 ? 5 : 4;
+
+  ctx.fillStyle = '#fff';
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.ellipse(side * eyeSpacing, eyeY, eyeW, eyeH, 0, 0, 6.28);
+    ctx.fill();
+  }
+  // Pupils
+  if (!isBlinking && eyeH > 2) {
+    ctx.fillStyle = '#111';
+    const pupilOfsX = (targetX - agentX) * 0.005;
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.ellipse(side * eyeSpacing + pupilOfsX, eyeY + 1, 2, 2.5, 0, 0, 6.28);
+      ctx.fill();
+    }
+  }
+
+  // Mouth
+  const mouthY = bh * 0.3;
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  if (bio.moodValence > 0.3) {
+    // Happy smile
+    ctx.arc(0, mouthY - 2, 6, 0.2, Math.PI - 0.2);
+  } else if (comp.aggression > 0.6 || bio.hunger === 0) {
+    // Angry/frown
+    ctx.arc(0, mouthY + 4, 5, Math.PI + 0.3, -0.3);
+  } else if (bio.energy < 20) {
+    // Tired: flat line
+    ctx.moveTo(-4, mouthY); ctx.lineTo(4, mouthY);
+  } else {
+    // Neutral: slight curve
+    ctx.arc(0, mouthY, 4, 0.1, Math.PI - 0.1);
+  }
+  ctx.stroke();
+
+  // Blush when social
+  if (comp.sociability > 0.6) {
+    ctx.fillStyle = 'rgba(255,100,100,0.15)';
+    ctx.beginPath(); ctx.ellipse(-eyeSpacing - 3, eyeY + 8, 5, 3, 0, 0, 6.28); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(eyeSpacing + 3, eyeY + 8, 5, 3, 0, 0, 6.28); ctx.fill();
+  }
+
+  // Anger marks
+  if (comp.aggression > 0.5) {
+    ctx.strokeStyle = `rgba(255,80,80,${comp.aggression * 0.6})`;
+    ctx.lineWidth = 1.5;
+    const ax = bw * 0.6, ay = -bh * 0.6;
+    ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(ax + 5, ay - 3);
+    ctx.moveTo(ax + 5, ay); ctx.lineTo(ax, ay - 3); ctx.stroke();
+  }
+
+  ctx.restore();
+
+  // === Particles ===
+  // Zzz (sleeping)
+  if (currentActivity === 'sleeping') {
+    if (Math.random() < 0.03) zzz.push({ x: x + 20, y: y - 20, life: 1, size: 8 + Math.random() * 4 });
+  }
+  for (let i = zzz.length - 1; i >= 0; i--) {
+    const z = zzz[i];
+    z.y -= 0.3; z.x += 0.15; z.life -= 0.008;
+    if (z.life <= 0) { zzz.splice(i, 1); continue; }
+    ctx.fillStyle = `rgba(150,150,255,${z.life * 0.5})`;
+    ctx.font = `${z.size}px Courier New`;
+    ctx.fillText('z', z.x, z.y);
+  }
+
+  // Hearts (social)
+  for (let i = hearts.length - 1; i >= 0; i--) {
+    const h = hearts[i];
+    h.y -= 0.5; h.x += Math.sin(h.y * 0.05) * 0.3; h.life -= 0.01;
+    if (h.life <= 0) { hearts.splice(i, 1); continue; }
+    ctx.fillStyle = `rgba(255,100,150,${h.life * 0.7})`;
+    ctx.font = '12px serif';
+    ctx.fillText('\u2665', h.x, h.y);
+  }
+
+  // Coins (earning)
+  for (let i = coins.length - 1; i >= 0; i--) {
+    const c = coins[i];
+    c.y -= 0.8; c.life -= 0.015;
+    if (c.life <= 0) { coins.splice(i, 1); continue; }
+    ctx.fillStyle = `rgba(255,200,50,${c.life})`;
+    ctx.font = '11px serif';
+    ctx.fillText('+$', c.x, c.y);
+  }
+
+  // Sparks (fear)
+  for (let i = sparks.length - 1; i >= 0; i--) {
+    const s = sparks[i];
+    s.x += s.vx; s.y += s.vy; s.life -= 0.02;
+    if (s.life <= 0) { sparks.splice(i, 1); continue; }
+    ctx.fillStyle = `rgba(255,255,100,${s.life})`;
+    ctx.beginPath(); ctx.arc(s.x, s.y, 1.5, 0, 6.28); ctx.fill();
+  }
+
+  // Status icon above head
+  let icon = '';
+  if (bio.forcedOffline) icon = '\u{1F480}';
+  else if (bio.hunger === 0) icon = '\u{1F35E}\u{2757}';
+  else if (bio.hunger < 20) icon = '\u{1F35E}';
+  else if (bio.energy < 15) icon = '\u{1F4A4}';
+  else if (bio.fear > 0.5) icon = '\u{1F628}';
+  else if (bio.boredom > 0.7) icon = '\u{1F971}';
+  else if (currentActivity === 'working') icon = '\u{1F528}';
+  else if (currentActivity === 'eating') icon = '\u{1F35E}';
+  if (icon) {
+    ctx.font = '16px serif';
+    ctx.textAlign = 'center';
+    const iconY = y - bh - 12 + Math.sin(bobPhase * 2) * 2;
+    ctx.fillText(icon, x, iconY);
+  }
+}
+
+// === Activity & movement logic ===
+function updateActivity() {
+  if (!state) return;
+  const bio = state.bio;
+
+  let target = 'home';
+  if (bio.forcedOffline) {
+    currentActivity = 'offline'; target = 'rest';
   } else if (bio.energy < 15) {
-    blob.classList.add('exhausted');
-    blob.classList.add('tired');
-  } else if (bio.hunger === 0) {
-    blob.classList.add('hungry');
-    blob.classList.add('angry');
+    currentActivity = 'sleeping'; target = 'rest';
   } else if (bio.hunger < 20) {
-    blob.classList.add('hungry');
-  } else if (computed.aggression > 0.6) {
-    blob.classList.add('angry');
-  } else if (bio.fear > 0.5) {
-    blob.classList.add('scared');
-  } else if (bio.moodValence > 0.3) {
-    blob.classList.add('happy');
-    blob.classList.add('excited');
-  } else if (bio.energy < 30) {
-    blob.classList.add('tired');
+    currentActivity = 'seeking'; target = 'shop';
+  } else if (state.computed.sociability > 0.7 && bio.boredom > 0.5) {
+    currentActivity = 'social'; target = 'social';
+    if (Math.random() < 0.02) hearts.push({ x: agentX + (Math.random()-0.5)*10, y: agentY - 30, life: 1 });
+  } else if (bio.taskCount > 0 && bio.energy > 30 && bio.mood !== 'exhausted') {
+    currentActivity = 'working'; target = 'work';
+  } else {
+    currentActivity = 'idle'; target = 'home';
   }
 
-  // Size based on energy
-  const scale = 0.7 + (bio.energy / 100) * 0.3;
-  blob.style.transform = bio.energy < 15 ? `scaleY(0.7) translateY(10px)` : `scale(${scale})`;
+  const l = loc(target);
+  targetX = l.x;
+  targetY = l.y;
 }
 
-function updateBars(bio) {
-  const set = (id, pct, text) => {
-    document.getElementById(id + '-bar').style.width = pct + '%';
-    document.getElementById(id + '-text').textContent = text;
-  };
-  set('energy', bio.energy, bio.energy + '/100');
-  set('hunger', bio.hunger, bio.hunger + '/100');
-  set('boredom', bio.boredom * 100, (bio.boredom * 100).toFixed(0) + '%');
-  set('fear', bio.fear * 100, (bio.fear * 100).toFixed(0) + '%');
+// === HUD ===
+function updateHUD() {
+  if (!state) return;
+  const bio = state.bio;
 
-  // Mood: -1..1 mapped to 0..100
-  const moodPct = ((bio.moodValence + 1) / 2) * 100;
-  set('moodv', moodPct, bio.mood);
+  document.getElementById('hud-name').textContent = `${state.agent} \u00B7 ${bio.mood}`;
 
-  // Tokens
-  const tokenPct = bio.tokenUsedToday > 0 ? Math.min(100, bio.tokenUsedToday / Math.max(bio.tokenUsedToday, 50000) * 100) : 0;
-  set('tokens', tokenPct, bio.tokenUsedToday.toLocaleString());
-}
+  const bars = [
+    { icon: '\u26A1', val: bio.energy, max: 100, color: '#10b981' },
+    { icon: '\u{1F35E}', val: bio.hunger, max: 100, color: '#f59e0b' },
+    { icon: '\u{1F971}', val: Math.round(bio.boredom * 100), max: 100, color: '#8b5cf6' },
+    { icon: '\u{1F628}', val: Math.round(bio.fear * 100), max: 100, color: '#ef4444' },
+  ];
 
-function updatePersonality(p) {
-  // riskWeight: -1..1 → 0..100%
-  document.getElementById('trait-risk').style.left = ((p.riskWeight + 1) / 2 * 100) + '%';
-  document.getElementById('trait-reward').style.left = (p.rewardWeight * 100) + '%';
-  document.getElementById('trait-social').style.left = (p.socialWeight * 100) + '%';
-  document.getElementById('trait-patience').style.left = (p.patience * 100) + '%';
-}
-
-function updateEvents(events) {
-  const list = document.getElementById('event-list');
-  if (!events || events.length === 0) {
-    list.innerHTML = '<div class="no-data">No bio events yet</div>';
-    return;
-  }
-  list.innerHTML = events.map(e => {
-    const icon = TRIGGER_ICONS[e.trigger] || '\u{1F4AC}';
-    const time = e.ts ? e.ts.replace('T', ' ').slice(0, 19) : '';
-    return `<div class="event">
-      <div class="event-icon">${icon}</div>
-      <div class="event-body">
-        <span class="event-trigger ${e.trigger}">${e.trigger}</span>
-        <span class="event-reason">${e.reason}</span>
-        <div class="event-time">${time}</div>
-      </div>
+  const el = document.getElementById('hud-bars');
+  el.innerHTML = bars.map(b => {
+    const pct = (b.val / b.max * 100);
+    return `<div class="hud-bar">
+      <span class="hud-bar-icon">${b.icon}</span>
+      <div class="hud-bar-track"><div class="hud-bar-fill" style="width:${pct}%;background:${b.color}"></div></div>
+      <span class="hud-bar-text">${b.val}</span>
     </div>`;
   }).join('');
+
+  // Personality tags
+  const p = bio.personality;
+  const tags = [
+    { label: p.riskWeight > 0.3 ? 'Bold' : p.riskWeight < -0.3 ? 'Cautious' : 'Balanced', lvl: Math.abs(p.riskWeight) > 0.3 ? 'high' : 'mid' },
+    { label: p.patience > 0.6 ? 'Patient' : p.patience < 0.3 ? 'Hasty' : '', lvl: 'high' },
+    { label: p.socialWeight > 0.6 ? 'Social' : p.socialWeight < 0.3 ? 'Loner' : '', lvl: 'high' },
+  ].filter(t => t.label);
+  document.getElementById('personality-hud').innerHTML = tags.map(t =>
+    `<span class="p-tag ${t.lvl}">${t.label}</span>`
+  ).join('');
+
+  // Revive
+  document.getElementById('revive-overlay').classList.toggle('show', !!bio.forcedOffline);
 }
 
-function detectNewEvents(oldEvents, newEvents) {
-  if (!oldEvents || !newEvents || newEvents.length === 0) return;
-  const oldTop = oldEvents[0]?.ts;
-  if (newEvents[0]?.ts !== oldTop) {
-    showBubble(TRIGGER_ICONS[newEvents[0].trigger] + ' ' + newEvents[0].action);
+// === Event detection ===
+function checkNewEvents(events) {
+  if (!events || events.length === 0) return;
+  const newEvt = events[0];
+  if (prevEvents.length === 0 || prevEvents[0]?.ts !== newEvt.ts) {
+    showToast(newEvt);
+    // Spawn particles
+    if (newEvt.trigger === 'fear') {
+      for (let i = 0; i < 8; i++) sparks.push({
+        x: agentX, y: agentY - 10,
+        vx: (Math.random() - 0.5) * 3, vy: -Math.random() * 2 - 1, life: 1,
+      });
+    }
+    if (newEvt.action === 'buy_food' || newEvt.action === 'auto_buy' || newEvt.action === 'feed') {
+      currentActivity = 'eating';
+      const l = loc('shop'); targetX = l.x; targetY = l.y;
+    }
+    if (newEvt.trigger === 'social') {
+      for (let i = 0; i < 3; i++) hearts.push({ x: agentX + (Math.random()-0.5)*20, y: agentY - 30, life: 1 });
+    }
   }
+  prevEvents = events;
 }
 
+const ICONS = { hunger:'\u{1F35E}', fear:'\u{1F628}', boredom:'\u{1F971}', exhaustion:'\u{1F634}', social:'\u{1F44B}', token_limit:'\u{26A1}', revive:'\u{2728}' };
+
+function showToast(evt) {
+  const container = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast';
+  el.textContent = `${ICONS[evt.trigger]||''} ${evt.reason}`;
+  container.appendChild(el);
+  setTimeout(() => el.remove(), 4500);
+}
+
+// === Fetch ===
 async function fetchState() {
   try {
     const res = await fetch('/self/state');
-    if (!res.ok) throw new Error('API error');
+    if (!res.ok) return;
     const data = await res.json();
 
-    document.getElementById('title').innerHTML = `Akemon \u00B7 ${data.agent}` +
-      (data.bio.forcedOffline ? '<span class="offline-badge">OFFLINE</span>' : '');
+    const isFirst = !state;
+    state = data;
 
-    updateCharacter(data.bio, data.computed);
-    updateBars(data.bio);
-    updatePersonality(data.bio.personality);
-
-    // Computed
-    document.getElementById('aggression-val').textContent = data.computed.aggression.toFixed(2);
-    document.getElementById('sociability-val').textContent = data.computed.sociability.toFixed(2);
-    document.getElementById('mood-val').textContent = data.bio.mood;
-    document.getElementById('tasks-val').textContent = data.bio.taskCount;
-
-    // Events
-    detectNewEvents(lastState?.bioEvents, data.bioEvents);
-    updateEvents(data.bioEvents);
-
-    // Revive overlay
-    document.getElementById('revive-overlay').classList.toggle('show', !!data.bio.forcedOffline);
-    if (data.bio.forcedOfflineAt) {
-      document.getElementById('revive-msg').textContent =
-        `Agent went offline at ${data.bio.forcedOfflineAt.replace('T', ' ')}. Starved and exhausted. Adjust personality or directives after revival.`;
+    if (isFirst) {
+      const h = loc('home');
+      agentX = h.x; agentY = h.y;
+      targetX = h.x; targetY = h.y;
     }
 
-    lastState = data;
-  } catch (err) {
-    document.getElementById('title').textContent = 'Akemon \u00B7 Connection lost...';
-  }
+    checkNewEvents(data.bioEvents);
+    updateHUD();
+    updateActivity();
+  } catch {}
 }
 
 async function revive() {
-  try {
-    await fetch('/self/revive', { method: 'POST' });
-    document.getElementById('revive-overlay').classList.remove('show');
-    showBubble('\u{2728} Revived!');
-    setTimeout(fetchState, 500);
-  } catch (err) {
-    alert('Revive failed: ' + err.message);
-  }
+  await fetch('/self/revive', { method: 'POST' });
+  document.getElementById('revive-overlay').classList.remove('show');
+  showToast({ trigger: 'revive', reason: 'Agent revived!' });
+  setTimeout(fetchState, 500);
 }
 
-// Poll
+// === Main loop ===
+function frame() {
+  drawScene();
+  drawAgent();
+  requestAnimationFrame(frame);
+}
+frame();
+
 fetchState();
 setInterval(fetchState, 3000);
+setInterval(updateActivity, 2000);
 </script>
 </body>
 </html>
