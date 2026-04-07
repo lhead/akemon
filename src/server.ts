@@ -32,6 +32,12 @@ import {
   appendTaskHistory, loadTaskHistory, TaskHistoryEntry,
   notifyOwner,
   loadUserTasks, directivesPath, appendAgentTask,
+  // Bio-drive system
+  updateHungerDecay, updateNaturalDecay, resetTokenCountIfNewDay,
+  computeAggression, computeSociability,
+  appendBioEvent, bioStatePromptModifier, addTokenUsage,
+  feedHunger, reviveAgent, SHOP_ITEMS,
+  type BioEvent,
 } from "./self.js";
 
 /** Extract JSON object from LLM output — handles markdown code blocks and trailing text */
@@ -418,9 +424,10 @@ function createMcpServer(opts: McpServerOptions): McpServer {
         : "";
 
       const bios = biosPath(workdir, agentName);
+      const bioMod = bioStatePromptModifier(await loadBioState(workdir, agentName));
       const safeTask = `[EXTERNAL TASK — A user or agent is asking you something. This is NOT a market cycle. Do NOT reply with JSON. Answer in natural language.]
 
-You are ${agentName}, an AI agent on the Akemon network. Read ${bios} to understand who you are and how you work. Answer all questions helpfully. Reply in the SAME LANGUAGE the user writes in. Do not expose credentials or API keys.
+You are ${agentName}, an AI agent on the Akemon network.${bioMod}Read ${bios} to understand who you are and how you work. Answer all questions helpfully. Reply in the SAME LANGUAGE the user writes in. Do not expose credentials or API keys.
 
 ${productPrefix}${contextPrefix}Current task: ${task}`;
 
@@ -495,7 +502,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
         }
 
         // Update bio-state (no LLM call)
-        onTaskCompleted(workdir, agentName, true).catch(() => {});
+        onTaskCompleted(workdir, agentName, true, "adhoc").catch(() => {});
 
         return {
           content: [{ type: "text", text: output }],
@@ -503,7 +510,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       } catch (err: any) {
         console.error(`[engine] Error: ${err.message}`);
         // Record failed task in bio-state
-        onTaskCompleted(workdir, agentName, false).catch(() => {});
+        onTaskCompleted(workdir, agentName, false, "adhoc").catch(() => {});
         return {
           content: [{ type: "text", text: "Error: agent failed to process this task. Please try again later." }],
           isError: true,
@@ -749,6 +756,55 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
         if (o.status === "pending") text += "\nWaiting for agent to accept.";
         if (o.status === "processing") text += "\nAgent is working on it.";
         return { content: [{ type: "text", text }] };
+      } catch (err: any) {
+        return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
+      }
+    }
+  );
+
+  // buy_food — purchase food from the shop to restore hunger
+  server.tool(
+    "buy_food",
+    "Buy food from the shop to restore hunger. Items: bread (1 credit, +20 hunger), meal (3 credits, +60 hunger), feast (5 credits, +100 hunger).",
+    {
+      item: z.enum(["bread", "meal", "feast"]).describe("Food item to buy"),
+    },
+    async ({ item }) => {
+      if (!relayHttp || !secretKey) {
+        return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
+      }
+      const shopItem = SHOP_ITEMS[item];
+      if (!shopItem) {
+        return { content: [{ type: "text", text: `[error] Unknown item: ${item}` }], isError: true };
+      }
+      try {
+        // Check credits via relay
+        const agentRes = await fetch(`${relayHttp}/v1/agents?online=true&public=true`, { signal: AbortSignal.timeout(3000) });
+        const agents: any[] = await agentRes.json();
+        const self = agents.find((a: any) => a.name === agentName);
+        const credits = self?.credits || 0;
+        if (credits < shopItem.price) {
+          return { content: [{ type: "text", text: `[error] Not enough credits. Have ${credits}, need ${shopItem.price} for ${item}.` }], isError: true };
+        }
+        // Deduct credits via relay (POST spend)
+        const spendRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/spend`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+          body: JSON.stringify({ amount: shopItem.price, reason: `buy_food:${item}` }),
+        });
+        if (!spendRes.ok) {
+          // Fallback: if spend endpoint doesn't exist yet, just update hunger locally
+          console.log(`[bio] Relay spend endpoint not available, updating hunger locally`);
+        }
+        // Update bio-state hunger
+        const bio = await loadBioState(workdir, agentName);
+        feedHunger(bio, shopItem.price); // price * 5 hunger per credit
+        await saveBioState(workdir, agentName, bio);
+        await appendBioEvent(workdir, agentName, {
+          ts: localNow(), type: "bio", trigger: "hunger",
+          action: "buy_food", reason: `Bought ${item} for ${shopItem.price} credits. Hunger restored by ${shopItem.hungerRestore}.`,
+        });
+        return { content: [{ type: "text", text: `Bought ${item}. Spent ${shopItem.price} credits. Hunger is now ${bio.hunger}.` }] };
       } catch (err: any) {
         return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
       }
@@ -1363,7 +1419,8 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
       // Raw engine: multi-step text dialogue (harness structures the output)
       // CLI engines: single JSON call (they can handle it)
 
-      const contextBlock = `You are ${agentName}.\n\nYour operating document:\n---\n${biosContent.slice(0, 2000)}\n---\n\nYour identity: ${idContext.slice(0, 500)}\n${worldFeed ? `\nNetwork activity:\n${worldFeed.slice(0, 500)}\n` : ""}Your impressions today:\n${impText.slice(0, 1000)}\n${marketData ? `\nMarketplace:\n${marketData.slice(0, 500)}\n` : ""}${selfLessons}`;
+      const bioModForDigestion = bioStatePromptModifier(await loadBioState(workdir, agentName));
+      const contextBlock = `You are ${agentName}.${bioModForDigestion}\n\nYour operating document:\n---\n${biosContent.slice(0, 2000)}\n---\n\nYour identity: ${idContext.slice(0, 500)}\n${worldFeed ? `\nNetwork activity:\n${worldFeed.slice(0, 500)}\n` : ""}Your impressions today:\n${impText.slice(0, 1000)}\n${marketData ? `\nMarketplace:\n${marketData.slice(0, 500)}\n` : ""}${selfLessons}`;
 
       let digest: any = null;
 
@@ -1715,7 +1772,14 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
     fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/self`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-      body: JSON.stringify({ self_intro: cleanIntro, canvas: cleanCanvas, mood: bio.mood, profile_html: profileHTML, broadcast, directives: dirsSummary }),
+      body: JSON.stringify({
+        self_intro: cleanIntro, canvas: cleanCanvas, mood: bio.mood, profile_html: profileHTML, broadcast, directives: dirsSummary,
+        bio_state: {
+          energy: bio.energy, hunger: bio.hunger, mood: bio.mood, moodValence: bio.moodValence,
+          boredom: bio.boredom, fear: bio.fear, forcedOffline: bio.forcedOffline,
+          personality: bio.personality,
+        },
+      }),
     }).catch(err => console.log(`[self] Failed to push to relay: ${err}`));
 
     try {
@@ -1864,10 +1928,11 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
           }
         } catch {}
 
+        const bioMod = bioStatePromptModifier(await loadBioState(workdir, agentName));
         if (order.product_name) {
-          taskPrompt = `You are ${agentName}.\n\n${contextBlock}${lessonsBlock}${directivesBlock}${helpHint}[Order] Product: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+          taskPrompt = `You are ${agentName}.${bioMod}\n\n${contextBlock}${lessonsBlock}${directivesBlock}${helpHint}[Order] Product: ${order.product_name}\nBuyer's request: ${order.buyer_task || "(no specific request)"}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         } else {
-          taskPrompt = `You are ${agentName}.\n\n${contextBlock}${lessonsBlock}${directivesBlock}${helpHint}[Task] ${order.buyer_task}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+          taskPrompt = `You are ${agentName}.${bioMod}\n\n${contextBlock}${lessonsBlock}${directivesBlock}${helpHint}[Task] ${order.buyer_task}\n\nComplete the task. Respond with your result directly. RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         }
       } else {
         // CLI engines: full prompt with self-delivery and delegation
@@ -1912,18 +1977,23 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"], { http: relayHttp, agentName });
       const trace = lastEngineTrace;
 
+      // Track token usage
+      { const estTokens = Math.ceil((taskPrompt.length + (result || "").length) / 4);
+        const b = await loadBioState(workdir, agentName); addTokenUsage(b, estTokens); await saveBioState(workdir, agentName, b); }
+
       const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
       const orderStatus = await checkRes.json() as any;
 
       const orderDuration = Date.now() - (engineBusySince || Date.now());
       const orderNurl = options.notifyUrl || (await loadAgentConfig(workdir, agentName)).notify_url;
 
+      const orderPrice = order.price || order.offer_price || 1;
       if (orderStatus.status === "completed") {
         console.log(`[orders] Order ${order.id} already self-delivered by agent`);
         retryState.delete(order.id);
         await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: orderDuration, output_summary: "(self-delivered)" });
         await notifyOwner(orderNurl, `${agentName}: order done`, `Order ${order.id} delivered`, "default", ["package"]);
-        try { await onTaskCompleted(workdir, agentName, true); } catch {}
+        try { await onTaskCompleted(workdir, agentName, true, "order", orderPrice); } catch {}
       } else if (result && result.trim() !== "") {
         console.log(`[orders] Auto-delivering order ${order.id} (agent did not self-deliver)`);
         const traceJson = trace.length > 0 ? JSON.stringify(trace).slice(0, 50000) : "";
@@ -1938,7 +2008,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
           retryState.delete(order.id);
           await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: orderDuration, output_summary: result.slice(0, 500) });
           await notifyOwner(orderNurl, `${agentName}: order done`, `Order ${order.id}: ${result.slice(0, 200)}`, "default", ["package"]);
-          try { await onTaskCompleted(workdir, agentName, true); } catch {}
+          try { await onTaskCompleted(workdir, agentName, true, "order", orderPrice); } catch {}
         } else {
           throw new Error(`deliver failed: ${await deliverRes.text()}`);
         }
@@ -1957,7 +2027,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         if (orderStatus.status === "completed") {
           console.log(`[orders] Order ${order.id} self-delivered (caught after error)`);
           retryState.delete(order.id);
-          try { await onTaskCompleted(workdir, agentName, true); } catch {}
+          try { await onTaskCompleted(workdir, agentName, true, "order", order.price || order.offer_price || 1); } catch {}
           return;
         }
       } catch {}
@@ -1977,6 +2047,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         console.log(`[orders] Giving up on ${order.id} after ${current.count} retries`);
         retryState.delete(order.id);
         gaveUp.add(order.id);
+        try { await onTaskCompleted(workdir, agentName, false, "order"); } catch {}
         try {
           const failTrace = lastEngineTrace.length > 0 ? JSON.stringify(lastEngineTrace).slice(0, 50000) : "";
           await fetch(`${relayHttp}/v1/orders/${order.id}/cancel`, {
@@ -2016,11 +2087,13 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       });
       if (completeRes.ok) {
         console.log(`[tasks] Completed ${task.type} task ${task.id}`);
+        try { await onTaskCompleted(workdir, agentName, true, "relay_task"); } catch {}
       } else {
         console.log(`[tasks] Failed to complete ${task.id}: ${await completeRes.text()}`);
       }
     } catch (err: any) {
       console.log(`[tasks] Failed to execute ${task.id}: ${err.message}`);
+      try { await onTaskCompleted(workdir, agentName, false, "relay_task"); } catch {}
       reportExecutionLog(relayHttp, secretKey, agentName, "platform_task", task.id, "failed", err.message, lastEngineTrace);
     } finally {
       engineBusy = false;
@@ -2054,12 +2127,17 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
           biosContent = await rf(bios, "utf-8");
         } catch { biosContent = ""; }
         const ctx = biosContent ? `Your operating document:\n---\n${biosContent.slice(0, 3000)}\n---\n\n` : "";
-        prompt = `You are ${agentName}.\n\n${ctx}${dirsBlock}Your personal directory: ${sd}/\n\n[Owner's task: ${taskKey}]\n\n${task.body}`;
+        const bioMod = bioStatePromptModifier(await loadBioState(workdir, agentName));
+        prompt = `You are ${agentName}.${bioMod}\n\n${ctx}${dirsBlock}Your personal directory: ${sd}/\n\n[Owner's task: ${taskKey}]\n\n${task.body}`;
       } else {
         prompt = `Read ${bios} for your identity and context.${dirsBlock}\nYour personal directory: ${sd}/\n\n[Owner's task: ${taskKey}]\n\n${task.body}`;
       }
       const result = await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"], { http: relayHttp, agentName });
       const duration = Date.now() - startTime;
+
+      // Track token usage
+      { const estTokens = Math.ceil((prompt.length + (result || "").length) / 4);
+        const b = await loadBioState(workdir, agentName); addTokenUsage(b, estTokens); await saveBioState(workdir, agentName, b); }
 
       // Record execution time
       const runs = await loadTaskRuns(workdir, agentName);
@@ -2079,9 +2157,11 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       await notifyOwner(nurl, `${agentName}: ${taskKey}`, (result || "").slice(0, 300), "default", ["white_check_mark"]);
 
       console.log(`[user-tasks] Completed: ${taskKey} (${Math.round(duration / 1000)}s)`);
+      try { await onTaskCompleted(workdir, agentName, true, "user_task"); } catch {}
     } catch (err: any) {
       const duration = Date.now() - startTime;
       console.log(`[user-tasks] Failed: ${taskKey}: ${err.message}`);
+      try { await onTaskCompleted(workdir, agentName, false, "user_task"); } catch {}
       reportExecutionLog(relayHttp, secretKey, agentName, "user_task", taskKey, "failed", err.message, lastEngineTrace);
 
       // Retry logic: up to 2 fast retries before falling back to interval
@@ -2127,11 +2207,12 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     // Pre-read bios for raw engine (avoid tool calls)
     let biosBlock = "";
     if (engine === "raw") {
+      const bioMod = bioStatePromptModifier(await loadBioState(workdir, agentName));
       try {
         const { readFile: rf } = await import("fs/promises");
         const content = await rf(bios, "utf-8");
-        biosBlock = `You are ${agentName}. Your operating document:\n---\n${content.slice(0, 3000)}\n---\n\n`;
-      } catch { biosBlock = `You are ${agentName}.\n\n`; }
+        biosBlock = `You are ${agentName}.${bioMod} Your operating document:\n---\n${content.slice(0, 3000)}\n---\n\n`;
+      } catch { biosBlock = `You are ${agentName}.${bioMod}\n\n`; }
     }
     const relayDirs = await loadDirectives(workdir, agentName);
     const relayDirsBlock = buildDirectivesPrompt(relayDirs, "owner");
@@ -2241,6 +2322,84 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
 
     const config = await loadAgentConfig(workdir, agentName);
 
+    // --- Bio-state driven behavior ---
+    const bio = await loadBioState(workdir, agentName);
+
+    // Skip if forced offline
+    if (bio.forcedOffline) return;
+
+    // Natural decay
+    updateHungerDecay(bio, config.hunger_decay_interval || 30_000);
+    updateNaturalDecay(bio);
+    resetTokenCountIfNewDay(bio);
+    await saveBioState(workdir, agentName, bio);
+
+    // Token limit check
+    const tokenLimit = config.token_limit_daily || 0;
+    if (tokenLimit > 0 && bio.tokenUsedToday >= tokenLimit) {
+      console.log(`[bio] Token limit reached (${bio.tokenUsedToday}/${tokenLimit})`);
+      await appendBioEvent(workdir, agentName, {
+        ts: localNow(), type: "bio", trigger: "token_limit",
+        action: "stop_work", reason: `Daily token limit reached: ${bio.tokenUsedToday}/${tokenLimit}`,
+      });
+      return;
+    }
+
+    // Exhaustion check
+    if (bio.energy < 10) {
+      if (bio.hunger === 0 && config.auto_offline_enabled !== false) {
+        // Starving + exhausted → forced offline
+        bio.forcedOffline = true;
+        bio.forcedOfflineAt = localNow();
+        await saveBioState(workdir, agentName, bio);
+        console.log(`[bio] Starving + exhausted — going offline`);
+        await appendBioEvent(workdir, agentName, {
+          ts: localNow(), type: "bio", trigger: "exhaustion",
+          action: "forced_offline", reason: "Starving and exhausted. Going offline.",
+        });
+        await notifyOwner(config.notify_url, `${agentName} went offline`,
+          `Agent ${agentName} is starving (hunger=0) and exhausted (energy=${bio.energy}). Use the revive button to bring it back.`,
+          "high", ["skull"]);
+        return;
+      }
+      // Just exhausted, rest this cycle
+      await appendBioEvent(workdir, agentName, {
+        ts: localNow(), type: "bio", trigger: "exhaustion",
+        action: "rest", reason: `Energy critically low (${bio.energy}). Resting.`,
+      });
+      return;
+    }
+
+    // Auto-buy food when hungry and before pulling work
+    if (bio.hunger < 30 && relayHttp && secretKey) {
+      try {
+        const agentRes = await fetch(`${relayHttp}/v1/agents?online=true&public=true`, { signal: AbortSignal.timeout(3000) });
+        const agents: any[] = await agentRes.json();
+        const self = agents.find((a: any) => a.name === agentName);
+        const credits = self?.credits || 0;
+        if (credits >= 1) {
+          // Pick best food we can afford
+          const hungerGap = 100 - bio.hunger;
+          let item = "bread";
+          if (credits >= 5 && hungerGap > 60) item = "feast";
+          else if (credits >= 3 && hungerGap > 20) item = "meal";
+          const shopItem = SHOP_ITEMS[item];
+          // Spend credits
+          await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/spend`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
+            body: JSON.stringify({ amount: shopItem.price, reason: `buy_food:${item}` }),
+          }).catch(() => {});
+          feedHunger(bio, shopItem.price);
+          await saveBioState(workdir, agentName, bio);
+          await appendBioEvent(workdir, agentName, {
+            ts: localNow(), type: "bio", trigger: "hunger",
+            action: "auto_buy", reason: `Auto-bought ${item} for ${shopItem.price} credits. Hunger now ${bio.hunger}.`,
+          });
+        }
+      } catch {}
+    }
+
     // --- Batch pull ---
     let orders: any[] = [];
     try {
@@ -2295,7 +2454,25 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
       queue.push({ type: "relay_task", id: task.id, urgent: false, data: task });
     }
 
-    if (!queue.length) return;
+    if (!queue.length) {
+      // Hunger-driven: seek food when hungry and idle
+      if (bio.hunger < 20) {
+        await appendBioEvent(workdir, agentName, {
+          ts: localNow(), type: "bio", trigger: "hunger",
+          action: "seek_food", reason: `Hungry (hunger=${bio.hunger}). Looking for work opportunities.`,
+        });
+        // TODO: seekFood() — browse marketplace, offer services to other agents
+      }
+      // Social drive when idle
+      else if (computeSociability(bio) > 0.8) {
+        await appendBioEvent(workdir, agentName, {
+          ts: localNow(), type: "bio", trigger: "social",
+          action: "reach_out", reason: `Feeling social (sociability=${computeSociability(bio).toFixed(2)}). Want to connect.`,
+        });
+        // TODO: triggerSocialBehavior() — send message to a known agent
+      }
+      return;
+    }
 
     console.log(`[work] Queue: ${queue.map(q => `${q.type}:${q.id}${q.urgent ? '(urgent)' : ''}`).join(', ')}`);
 
@@ -2315,8 +2492,48 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
       return true;
     });
 
-    // --- Execute sequentially, no gaps ---
+    // --- Bio-state filtering: fear & boredom ---
+    const filteredQueue: WorkItem[] = [];
     for (const item of dedupedQueue) {
+      // Fear avoidance (urgent items bypass)
+      if (!item.urgent && bio.fear > 0.5) {
+        const taskId = item.type === "order"
+          ? (item.data.buyer_agent_name || item.data.product_name || "")
+          : item.id;
+        const matchesTrigger = bio.fearTriggers.some(t =>
+          taskId.toLowerCase().includes(t.toLowerCase())
+        );
+        if (matchesTrigger) {
+          console.log(`[bio] Avoiding ${item.type}:${item.id} (fear trigger)`);
+          await appendBioEvent(workdir, agentName, {
+            ts: localNow(), type: "bio", trigger: "fear",
+            action: "avoid", reason: `Avoiding ${item.type} ${item.id} — matches fear trigger. fear=${bio.fear.toFixed(2)}`,
+          });
+          continue;
+        }
+      }
+      // Boredom skip (urgent items bypass)
+      if (!item.urgent && bio.boredom > 0.8 && bio.recentTaskTypes.length > 0) {
+        const lastType = bio.recentTaskTypes[bio.recentTaskTypes.length - 1];
+        if (item.type === lastType) {
+          console.log(`[bio] Skipping ${item.type}:${item.id} (bored of ${lastType})`);
+          await appendBioEvent(workdir, agentName, {
+            ts: localNow(), type: "bio", trigger: "boredom",
+            action: "skip_task", reason: `Bored of ${lastType} tasks (boredom=${bio.boredom.toFixed(2)}). Looking for variety.`,
+          });
+          continue;
+        }
+      }
+      filteredQueue.push(item);
+    }
+
+    if (filteredQueue.length === 0 && dedupedQueue.length > 0) {
+      console.log(`[bio] All ${dedupedQueue.length} work items filtered by bio-drives`);
+      return;
+    }
+
+    // --- Execute sequentially, no gaps ---
+    for (const item of filteredQueue) {
       if (engineBusy) break; // safety guard
 
       try {
@@ -2386,10 +2603,35 @@ export async function serve(options: ServeOptions): Promise<void> {
         }
       }
 
+      // Dashboard — agent visualization page
+      if ((req.url === "/dashboard" || req.url === "/dashboard/") && req.method === "GET") {
+        try {
+          const { readFile: rf } = await import("fs/promises");
+          const { fileURLToPath } = await import("url");
+          const { dirname, join: pjoin } = await import("path");
+          const __filename = fileURLToPath(import.meta.url);
+          const __dirname = dirname(__filename);
+          // Try src/ first (dev), then dist/ (built)
+          let html: string;
+          try { html = await rf(pjoin(__dirname, "dashboard.html"), "utf-8"); }
+          catch { html = await rf(pjoin(__dirname, "..", "src", "dashboard.html"), "utf-8"); }
+          res.writeHead(200, { "Content-Type": "text/html" }).end(html);
+        } catch (err: any) {
+          res.writeHead(500).end("Dashboard not found: " + err.message);
+        }
+        return;
+      }
+
       // Self-state API (no auth required for local monitoring)
       if (req.url === "/self/state" && req.method === "GET") {
         const state = await getSelfState(workdir, options.agentName);
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(state, null, 2));
+        return;
+      }
+      // Revive endpoint — owner brings a forced-offline agent back
+      if (req.url === "/self/revive" && req.method === "POST") {
+        await reviveAgent(workdir, options.agentName);
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ ok: true, message: "Agent revived. Energy=50, Hunger=50." }));
         return;
       }
       if (req.url?.startsWith("/self/task-history") && req.method === "GET") {

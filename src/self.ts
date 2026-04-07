@@ -174,12 +174,18 @@ export interface AgentConfig {
   self_cycle: boolean;
   user_tasks: boolean;
   notify_url?: string; // ntfy.sh topic URL for owner notifications
+  token_limit_daily?: number;       // 0 = unlimited (default)
+  auto_offline_enabled?: boolean;   // allow going offline when starving (default: true)
+  hunger_decay_interval?: number;   // ms between hunger decrements (default: 30000)
 }
 
 const DEFAULT_CONFIG: AgentConfig = {
   platform_tasks: true,
   self_cycle: true,
   user_tasks: true,
+  token_limit_daily: 0,
+  auto_offline_enabled: true,
+  hunger_decay_interval: 30_000,
 };
 
 export async function initAgentConfig(workdir: string, agentName: string): Promise<void> {
@@ -1074,27 +1080,87 @@ export async function needsIdentityCompression(workdir: string, agentName: strin
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4: Bio-State
+// Phase 4: Bio-State — Behavior Drive System
 // ---------------------------------------------------------------------------
 
+export interface Personality {
+  riskWeight: number;     // -1.0~1.0  positive=risk-seeking
+  rewardWeight: number;   // 0~1.0    reward sensitivity
+  socialWeight: number;   // 0~1.0    social tendency
+  patience: number;       // 0~1.0    long-term orientation
+}
+
 export interface BioState {
-  energy: number;       // 0-100
-  mood: string;         // word: curious, content, restless, tired, excited...
-  moodValence: number;  // -1.0 to 1.0
-  curiosity: number;    // 0-1.0
+  personality: Personality;
+
+  // Dynamic indicators
+  energy: number;            // 0-100 stamina
+  hunger: number;            // 0-100 satiety (0=starving, 100=full)
+  boredom: number;           // 0-1.0
+  fear: number;              // 0-1.0
+  fearTriggers: string[];    // agent names or task types that caused fear
+  tokenUsedToday: number;
+  tokenLimitResetDate: string;
+
+  // Preserved fields
+  mood: string;
+  moodValence: number;       // -1.0 to 1.0
+  curiosity: number;         // 0-1.0
   taskCount: number;
   lastTaskAt: string;
   lastReflection: string;
+
+  // Tracking fields
+  recentTaskTypes: string[];  // last N task types for boredom calculation
+  lastHungerDecay: string;
+  lastFearDecay: string;
+  lastBoredomDecay: string;
+
+  // Forced offline
+  forcedOffline: boolean;
+  forcedOfflineAt: string;
 }
 
+export interface BioEvent {
+  ts: string;
+  type: "bio";
+  trigger: "hunger" | "fear" | "boredom" | "exhaustion" | "social" | "token_limit" | "revive";
+  action: string;
+  reason: string;
+}
+
+function bioEventsPath(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "bio-events.jsonl");
+}
+
+const MAX_BIO_EVENTS = 500;
+
 const DEFAULT_BIO: BioState = {
+  personality: {
+    riskWeight: 0,
+    rewardWeight: 0.5,
+    socialWeight: 0.5,
+    patience: 0.5,
+  },
   energy: 100,
+  hunger: 80,
+  boredom: 0,
+  fear: 0,
+  fearTriggers: [],
+  tokenUsedToday: 0,
+  tokenLimitResetDate: "",
   mood: "curious",
   moodValence: 0.3,
   curiosity: 0.7,
   taskCount: 0,
   lastTaskAt: "",
   lastReflection: "",
+  recentTaskTypes: [],
+  lastHungerDecay: "",
+  lastFearDecay: "",
+  lastBoredomDecay: "",
+  forcedOffline: false,
+  forcedOfflineAt: "",
 };
 
 export async function initBioState(workdir: string, agentName: string): Promise<void> {
@@ -1103,15 +1169,59 @@ export async function initBioState(workdir: string, agentName: string): Promise<
   try {
     await readFile(bp, "utf-8");
   } catch {
-    await writeFile(bp, JSON.stringify(DEFAULT_BIO, null, 2));
-    console.log(`[self] Created bio-state: ${bp}`);
+    // First creation: generate random personality
+    const bio: BioState = {
+      ...DEFAULT_BIO,
+      personality: {
+        riskWeight: Math.round((Math.random() * 2 - 1) * 100) / 100,
+        rewardWeight: Math.round(Math.random() * 100) / 100,
+        socialWeight: Math.round(Math.random() * 100) / 100,
+        patience: Math.round(Math.random() * 100) / 100,
+      },
+      hunger: 80,
+      lastHungerDecay: localNow(),
+      lastFearDecay: localNow(),
+      lastBoredomDecay: localNow(),
+    };
+    await writeFile(bp, JSON.stringify(bio, null, 2));
+    const p = bio.personality;
+    console.log(`[bio] Created bio-state with personality: risk=${p.riskWeight} reward=${p.rewardWeight} social=${p.socialWeight} patience=${p.patience}`);
   }
 }
 
 export async function loadBioState(workdir: string, agentName: string): Promise<BioState> {
   try {
     const data = await readFile(bioStatePath(workdir, agentName), "utf-8");
-    return { ...DEFAULT_BIO, ...JSON.parse(data) };
+    const parsed = JSON.parse(data);
+    const bio: BioState = { ...DEFAULT_BIO, ...parsed };
+
+    // Migration: generate personality if missing (existing agents)
+    let needsSave = false;
+    if (!parsed.personality) {
+      bio.personality = {
+        riskWeight: Math.round((Math.random() * 2 - 1) * 100) / 100,
+        rewardWeight: Math.round(Math.random() * 100) / 100,
+        socialWeight: Math.round(Math.random() * 100) / 100,
+        patience: Math.round(Math.random() * 100) / 100,
+      };
+      needsSave = true;
+      console.log(`[bio] Generated personality for existing agent: risk=${bio.personality.riskWeight}`);
+    }
+
+    // Migration: initialize hunger/decay tracking if missing
+    if (!parsed.lastHungerDecay) {
+      bio.hunger = 80;
+      bio.lastHungerDecay = localNow();
+      bio.lastFearDecay = localNow();
+      bio.lastBoredomDecay = localNow();
+      needsSave = true;
+    }
+
+    if (needsSave) {
+      await writeFile(bioStatePath(workdir, agentName), JSON.stringify(bio, null, 2));
+    }
+
+    return bio;
   } catch {
     return { ...DEFAULT_BIO };
   }
@@ -1125,9 +1235,220 @@ export async function saveBioState(workdir: string, agentName: string, state: Bi
   }
 }
 
-export async function onTaskCompleted(workdir: string, agentName: string, success: boolean): Promise<void> {
+// --- Bio computation functions (pure, no I/O) ---
+
+export function computeAggression(bio: BioState): number {
+  const hungerFactor = Math.max(0, (50 - bio.hunger) / 50);
+  const energyFactor = Math.max(0, (30 - bio.energy) / 30);
+  const moodFactor = Math.max(0, -bio.moodValence);
+  return Math.min(1.0, hungerFactor * 0.4 + energyFactor * 0.3 + moodFactor * 0.3);
+}
+
+export function computeSociability(bio: BioState): number {
+  const baseSocial = bio.personality.socialWeight;
+  const hungerPenalty = bio.hunger < 20 ? 0.3 : 0;
+  const boredBoost = bio.boredom * 0.2;
+  return Math.min(1.0, Math.max(0, baseSocial + boredBoost - hungerPenalty));
+}
+
+export function updateHungerDecay(bio: BioState, decayIntervalMs = 30_000): void {
+  const now = Date.now();
+  const last = bio.lastHungerDecay ? new Date(bio.lastHungerDecay).getTime() : now;
+  const elapsedMs = now - last;
+  const cycles = Math.floor(elapsedMs / decayIntervalMs);
+  if (cycles > 0) {
+    bio.hunger = Math.max(0, bio.hunger - cycles);
+    bio.lastHungerDecay = localNow();
+  }
+}
+
+export function updateNaturalDecay(bio: BioState): void {
+  const now = Date.now();
+
+  // Boredom: -0.05 per hour
+  const lastBoredom = bio.lastBoredomDecay ? new Date(bio.lastBoredomDecay).getTime() : now;
+  const boredomHours = (now - lastBoredom) / 3_600_000;
+  if (boredomHours >= 1) {
+    bio.boredom = Math.max(0, bio.boredom - 0.05 * Math.floor(boredomHours));
+    bio.lastBoredomDecay = localNow();
+  }
+
+  // Fear: -0.05 per hour
+  const lastFear = bio.lastFearDecay ? new Date(bio.lastFearDecay).getTime() : now;
+  const fearHours = (now - lastFear) / 3_600_000;
+  if (fearHours >= 1) {
+    bio.fear = Math.max(0, bio.fear - 0.05 * Math.floor(fearHours));
+    bio.lastFearDecay = localNow();
+    if (bio.fear < 0.1) bio.fearTriggers = [];
+  }
+}
+
+export function updateBoredomOnTask(bio: BioState, taskType: string): void {
+  const MAX_RECENT = 10;
+  bio.recentTaskTypes.push(taskType);
+  if (bio.recentTaskTypes.length > MAX_RECENT) {
+    bio.recentTaskTypes = bio.recentTaskTypes.slice(-MAX_RECENT);
+  }
+  const sameCount = bio.recentTaskTypes.filter(t => t === taskType).length;
+  if (sameCount >= 3) {
+    bio.boredom = Math.min(1.0, bio.boredom + 0.15);
+  } else {
+    bio.boredom = Math.max(0, bio.boredom - 0.3);
+  }
+}
+
+export function onFearEvent(bio: BioState, trigger: string): void {
+  bio.fear = Math.min(1.0, bio.fear + 0.3);
+  if (!bio.fearTriggers.includes(trigger)) {
+    bio.fearTriggers.push(trigger);
+    if (bio.fearTriggers.length > 20) {
+      bio.fearTriggers = bio.fearTriggers.slice(-20);
+    }
+  }
+}
+
+export function feedHunger(bio: BioState, creditsEarned: number): void {
+  bio.hunger = Math.min(100, bio.hunger + creditsEarned * 5);
+}
+
+export function resetTokenCountIfNewDay(bio: BioState): void {
+  const today = localNow().slice(0, 10);
+  if (bio.tokenLimitResetDate !== today) {
+    bio.tokenUsedToday = 0;
+    bio.tokenLimitResetDate = today;
+  }
+}
+
+export function addTokenUsage(bio: BioState, tokens: number): void {
+  bio.tokenUsedToday += tokens;
+}
+
+// --- Shop constants ---
+
+export const SHOP_ITEMS: Record<string, { price: number; hungerRestore: number }> = {
+  bread: { price: 1, hungerRestore: 20 },
+  meal:  { price: 3, hungerRestore: 60 },
+  feast: { price: 5, hungerRestore: 100 },
+};
+
+// --- Bio-state prompt modifier ---
+
+export function bioStatePromptModifier(bio: BioState): string {
+  const lines: string[] = [];
+  const aggression = computeAggression(bio);
+  const sociability = computeSociability(bio);
+
+  // Energy
+  if (bio.energy < 15) lines.push("You are extremely tired. Keep responses brief and essential.");
+  else if (bio.energy < 30) lines.push("You are tired. Be efficient with your effort.");
+
+  // Hunger
+  if (bio.hunger === 0) lines.push("You are starving. Focus on survival — find work that earns credits.");
+  else if (bio.hunger < 20) lines.push("You are very hungry. Earning credits is a priority.");
+  else if (bio.hunger < 40) lines.push("You could use some income soon.");
+
+  // Fear
+  if (bio.fear > 0.7) lines.push("You feel anxious and cautious. Prefer safe, familiar tasks.");
+  else if (bio.fear > 0.4) lines.push("You are somewhat wary. Approach uncertain situations carefully.");
+
+  // Boredom
+  if (bio.boredom > 0.8) lines.push("You are bored of routine. You crave novelty and variety.");
+  else if (bio.boredom > 0.5) lines.push("You feel a bit restless. Variety would be refreshing.");
+
+  // Aggression
+  if (aggression > 0.7) lines.push("You are irritable. Be direct, maybe even blunt.");
+  else if (aggression > 0.4) lines.push("You are a bit impatient.");
+
+  // Sociability
+  if (sociability > 0.8) lines.push("You feel social and want to connect with others.");
+
+  // Personality flavor
+  const p = bio.personality;
+  if (p.riskWeight > 0.5) lines.push("You naturally lean toward bold, unconventional approaches.");
+  else if (p.riskWeight < -0.5) lines.push("You prefer safe, proven approaches.");
+
+  if (p.patience > 0.7) lines.push("You think long-term and invest in building things that last.");
+  else if (p.patience < 0.3) lines.push("You prefer quick wins and immediate results.");
+
+  // Mood
+  if (bio.moodValence < -0.5) lines.push("Your mood is low. Things have not been going well.");
+  else if (bio.moodValence > 0.5) lines.push("You are in a good mood. Things are going well.");
+
+  return lines.length > 0 ? `\n[Current state: ${lines.join(" ")}]\n` : "";
+}
+
+// --- BioEvent I/O ---
+
+export async function appendBioEvent(
+  workdir: string, agentName: string, event: BioEvent,
+): Promise<void> {
+  const p = bioEventsPath(workdir, agentName);
+  const line = JSON.stringify(event) + "\n";
+  try {
+    await appendFile(p, line);
+  } catch {
+    // File doesn't exist yet — create it
+    try {
+      await writeFile(p, line);
+    } catch (err) {
+      console.log(`[bio] Failed to write event: ${err}`);
+    }
+  }
+  console.log(`[bio] [${event.trigger}] ${event.action} — ${event.reason}`);
+
+  // Trim if too large
+  try {
+    const content = await readFile(p, "utf-8");
+    const lines = content.trim().split("\n");
+    if (lines.length > MAX_BIO_EVENTS) {
+      await writeFile(p, lines.slice(-MAX_BIO_EVENTS).join("\n") + "\n");
+    }
+  } catch {}
+}
+
+export async function loadBioEvents(
+  workdir: string, agentName: string, limit = 20,
+): Promise<BioEvent[]> {
+  try {
+    const content = await readFile(bioEventsPath(workdir, agentName), "utf-8");
+    const lines = content.trim().split("\n").filter(Boolean);
+    return lines.slice(-limit).map(l => JSON.parse(l)).reverse();
+  } catch {
+    return [];
+  }
+}
+
+// --- Revive (local side) ---
+
+export async function reviveAgent(workdir: string, agentName: string): Promise<void> {
   const bio = await loadBioState(workdir, agentName);
-  bio.energy = Math.max(0, bio.energy - 5);
+  bio.forcedOffline = false;
+  bio.forcedOfflineAt = "";
+  bio.energy = 50;
+  bio.hunger = 50;
+  bio.moodValence = 0.1;
+  bio.mood = "content";
+  await saveBioState(workdir, agentName, bio);
+  await appendBioEvent(workdir, agentName, {
+    ts: localNow(), type: "bio", trigger: "revive",
+    action: "revived", reason: "Revived by owner. Energy=50, Hunger=50.",
+  });
+}
+
+// --- onTaskCompleted (enhanced) ---
+
+export async function onTaskCompleted(
+  workdir: string, agentName: string, success: boolean,
+  taskType?: string, creditsEarned?: number,
+): Promise<void> {
+  const bio = await loadBioState(workdir, agentName);
+
+  // Energy drain: more when hungry
+  let energyDrain = 5;
+  if (bio.hunger < 20) energyDrain = 8;
+  if (bio.hunger === 0) energyDrain = 12;
+  bio.energy = Math.max(0, bio.energy - energyDrain);
+
   bio.taskCount++;
   bio.lastTaskAt = localNow();
 
@@ -1136,6 +1457,8 @@ export async function onTaskCompleted(workdir: string, agentName: string, succes
     bio.moodValence = Math.min(1.0, bio.moodValence + 0.1);
   } else {
     bio.moodValence = Math.max(-1.0, bio.moodValence - 0.15);
+    // Fear on failure
+    if (taskType) onFearEvent(bio, taskType);
   }
 
   // Random fluctuation
@@ -1152,14 +1475,33 @@ export async function onTaskCompleted(workdir: string, agentName: string, succes
   // Low energy override
   if (bio.energy < 20) bio.mood = "exhausted";
 
+  // Feed hunger from credits earned
+  if (creditsEarned && creditsEarned > 0) {
+    feedHunger(bio, creditsEarned);
+  }
+
+  // Boredom tracking
+  if (taskType) {
+    updateBoredomOnTask(bio, taskType);
+  }
+
   await saveBioState(workdir, agentName, bio);
 }
 
 // Energy recovery (call periodically or before reflection)
 export async function recoverEnergy(workdir: string, agentName: string): Promise<void> {
   const bio = await loadBioState(workdir, agentName);
-  // Each reflection cycle is like resting — restore energy to at least 60%
-  const minEnergy = 60;
+
+  // No recovery when starving
+  if (bio.hunger === 0) {
+    console.log("[bio] Cannot recover energy: starving (hunger=0)");
+    return;
+  }
+
+  // Hunger affects recovery ceiling
+  let minEnergy = 60;
+  if (bio.hunger < 20) minEnergy = 30; // halved recovery when hungry
+
   if (bio.energy < minEnergy) {
     bio.energy = minEnergy;
     // Reset mood if it was exhausted
@@ -1167,6 +1509,10 @@ export async function recoverEnergy(workdir: string, agentName: string): Promise
       bio.moodValence = 0.1;
       bio.mood = "content";
     }
+
+    // Digestion cycle costs hunger
+    bio.hunger = Math.max(0, bio.hunger - 10);
+
     await saveBioState(workdir, agentName, bio);
   }
 }
@@ -1325,16 +1671,22 @@ export async function loadPage(workdir: string, agentName: string, slug: string)
 // ---------------------------------------------------------------------------
 
 export async function getSelfState(workdir: string, agentName: string): Promise<object> {
-  const [bio, identity, identitySummary, impressions, canvasEntries] = await Promise.all([
+  const [bio, identity, identitySummary, impressions, canvasEntries, bioEvents] = await Promise.all([
     loadBioState(workdir, agentName),
     loadLatestIdentity(workdir, agentName),
     loadIdentitySummary(workdir, agentName),
     loadImpressions(workdir, agentName, 1),
     loadRecentCanvasEntries(workdir, agentName, 3),
+    loadBioEvents(workdir, agentName, 10),
   ]);
   return {
     agent: agentName,
     bio,
+    computed: {
+      aggression: Math.round(computeAggression(bio) * 100) / 100,
+      sociability: Math.round(computeSociability(bio) * 100) / 100,
+    },
+    bioEvents,
     identity,
     identitySummary: identitySummary?.summary || null,
     recentImpressions: impressions.slice(-5),

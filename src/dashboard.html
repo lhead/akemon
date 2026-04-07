@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Akemon Agent</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a0f; color: #c8c8d0; font-family: 'Courier New', monospace; min-height: 100vh; overflow-x: hidden; }
+
+  .container { max-width: 800px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 14px; color: #666; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 20px; }
+
+  /* --- Agent Character --- */
+  .stage { position: relative; height: 200px; background: linear-gradient(180deg, #0d0d18 0%, #12121f 60%, #1a1a2a 100%); border-radius: 16px; margin-bottom: 20px; overflow: hidden; display: flex; align-items: flex-end; justify-content: center; }
+  .stage .ground { position: absolute; bottom: 0; width: 100%; height: 30px; background: linear-gradient(180deg, #1a1a2a, #15152a); }
+  .stage .stars { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+  .stage .star { position: absolute; width: 2px; height: 2px; background: #444; border-radius: 50%; }
+
+  .creature { position: relative; bottom: 30px; z-index: 2; transition: all 0.5s ease; }
+  .creature.offline { filter: grayscale(1) brightness(0.4); }
+
+  /* Blob body */
+  .blob { width: 64px; height: 56px; background: var(--body-color, #4a9eff); border-radius: 50% 50% 45% 45%; position: relative; transition: all 0.8s ease; animation: bob 3s ease-in-out infinite; }
+  .blob.hungry { animation: bob 3s ease-in-out infinite, shake 0.5s ease-in-out infinite; }
+  .blob.exhausted { animation: none; transform: scaleY(0.7) translateY(10px); opacity: 0.6; }
+  .blob.excited { animation: bob 1.5s ease-in-out infinite; }
+
+  @keyframes bob { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-6px); } }
+  @keyframes shake { 0%, 100% { transform: translateX(0); } 25% { transform: translateX(-2px); } 75% { transform: translateX(2px); } }
+
+  /* Eyes */
+  .eyes { position: absolute; top: 16px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; }
+  .eye { width: 8px; height: 10px; background: #fff; border-radius: 50%; position: relative; transition: all 0.3s; }
+  .eye::after { content: ''; position: absolute; width: 4px; height: 5px; background: #111; border-radius: 50%; top: 3px; left: 2px; transition: all 0.3s; }
+  .blob.happy .eye { height: 6px; border-radius: 6px 6px 0 0; }
+  .blob.happy .eye::after { display: none; }
+  .blob.angry .eye { height: 8px; transform: rotate(-10deg); }
+  .blob.angry .eye:last-child { transform: rotate(10deg); }
+  .blob.tired .eye { height: 4px; border-radius: 4px; }
+  .blob.tired .eye::after { display: none; }
+  .blob.scared .eye { width: 10px; height: 12px; }
+  .blob.scared .eye::after { width: 5px; height: 6px; }
+
+  /* Mouth */
+  .mouth { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); width: 10px; height: 5px; border-bottom: 2px solid #fff; border-radius: 0 0 10px 10px; transition: all 0.3s; }
+  .blob.happy .mouth { width: 14px; height: 7px; border-bottom: 2px solid #fff; }
+  .blob.angry .mouth { width: 10px; height: 3px; border-bottom: 2px solid #fff; border-radius: 0; transform: translateX(-50%) rotate(180deg); }
+  .blob.tired .mouth { width: 8px; height: 0; border-bottom: 2px solid #fff; border-radius: 0; }
+
+  /* Status bubble */
+  .bubble { position: absolute; top: -40px; left: 50%; transform: translateX(-50%); background: #1e1e30; border: 1px solid #333; border-radius: 12px; padding: 6px 12px; font-size: 12px; white-space: nowrap; opacity: 0; transition: opacity 0.5s; pointer-events: none; }
+  .bubble.show { opacity: 1; }
+  .bubble::after { content: ''; position: absolute; bottom: -6px; left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 6px solid #333; }
+
+  /* --- Status Bars --- */
+  .bars { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+  .bar-group { background: #111118; border-radius: 10px; padding: 12px; }
+  .bar-label { display: flex; justify-content: space-between; font-size: 11px; color: #888; margin-bottom: 6px; }
+  .bar-track { height: 6px; background: #1a1a28; border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width 1s ease, background 0.5s; }
+  .bar-fill.energy { background: linear-gradient(90deg, #f59e0b, #10b981); }
+  .bar-fill.hunger { background: linear-gradient(90deg, #ef4444, #f59e0b); }
+  .bar-fill.boredom { background: linear-gradient(90deg, #6366f1, #8b5cf6); }
+  .bar-fill.fear { background: linear-gradient(90deg, #64748b, #ef4444); }
+  .bar-fill.mood { background: linear-gradient(90deg, #ef4444, #eab308, #10b981); }
+  .bar-fill.tokens { background: linear-gradient(90deg, #06b6d4, #3b82f6); }
+
+  /* --- Personality Panel --- */
+  .personality { background: #111118; border-radius: 10px; padding: 14px; margin-bottom: 20px; }
+  .personality h2 { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  .trait { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; }
+  .trait-label { width: 60px; color: #888; text-align: right; }
+  .trait-bar { flex: 1; height: 4px; background: #1a1a28; border-radius: 2px; position: relative; }
+  .trait-marker { position: absolute; width: 8px; height: 8px; background: #4a9eff; border-radius: 50%; top: -2px; transition: left 0.5s; }
+  .trait-ends { display: flex; justify-content: space-between; font-size: 9px; color: #555; }
+
+  /* --- Event Timeline --- */
+  .events { background: #111118; border-radius: 10px; padding: 14px; margin-bottom: 20px; }
+  .events h2 { font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+  .event { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid #1a1a28; font-size: 12px; }
+  .event:last-child { border-bottom: none; }
+  .event-icon { font-size: 14px; flex-shrink: 0; }
+  .event-body { flex: 1; }
+  .event-reason { color: #999; }
+  .event-time { color: #555; font-size: 10px; }
+  .event-trigger { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 10px; margin-right: 4px; }
+  .event-trigger.hunger { background: #f59e0b22; color: #f59e0b; }
+  .event-trigger.fear { background: #ef444422; color: #ef4444; }
+  .event-trigger.boredom { background: #8b5cf622; color: #8b5cf6; }
+  .event-trigger.exhaustion { background: #64748b22; color: #94a3b8; }
+  .event-trigger.social { background: #10b98122; color: #10b981; }
+  .event-trigger.token_limit { background: #06b6d422; color: #06b6d4; }
+  .event-trigger.revive { background: #22c55e22; color: #22c55e; }
+
+  /* --- Revive --- */
+  .revive-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 100; }
+  .revive-overlay.show { display: flex; }
+  .revive-card { background: #1a1a2a; border: 1px solid #333; border-radius: 16px; padding: 30px; text-align: center; max-width: 360px; }
+  .revive-card h2 { color: #ef4444; margin-bottom: 10px; font-size: 16px; }
+  .revive-card p { color: #888; font-size: 13px; margin-bottom: 20px; line-height: 1.5; }
+  .revive-btn { background: linear-gradient(135deg, #22c55e, #10b981); color: #fff; border: none; padding: 12px 32px; border-radius: 10px; font-size: 14px; font-family: inherit; cursor: pointer; transition: transform 0.2s; }
+  .revive-btn:hover { transform: scale(1.05); }
+  .revive-btn:active { transform: scale(0.95); }
+
+  /* --- Computed --- */
+  .computed { display: flex; gap: 10px; margin-bottom: 20px; }
+  .computed-item { flex: 1; background: #111118; border-radius: 10px; padding: 12px; text-align: center; }
+  .computed-value { font-size: 24px; font-weight: bold; }
+  .computed-label { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
+
+  .offline-badge { display: inline-block; background: #ef4444; color: #fff; font-size: 10px; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
+  .no-data { text-align: center; color: #555; padding: 40px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <h1 id="title">Loading...</h1>
+
+  <!-- Stage: character visualization -->
+  <div class="stage" id="stage">
+    <div class="stars" id="stars"></div>
+    <div class="ground"></div>
+    <div class="creature" id="creature">
+      <div class="bubble" id="bubble"></div>
+      <div class="blob" id="blob">
+        <div class="eyes"><div class="eye"></div><div class="eye"></div></div>
+        <div class="mouth"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Computed values -->
+  <div class="computed" id="computed">
+    <div class="computed-item"><div class="computed-value" id="aggression-val">--</div><div class="computed-label">Aggression</div></div>
+    <div class="computed-item"><div class="computed-value" id="sociability-val">--</div><div class="computed-label">Sociability</div></div>
+    <div class="computed-item"><div class="computed-value" id="mood-val">--</div><div class="computed-label">Mood</div></div>
+    <div class="computed-item"><div class="computed-value" id="tasks-val">--</div><div class="computed-label">Tasks Done</div></div>
+  </div>
+
+  <!-- Status bars -->
+  <div class="bars" id="bars">
+    <div class="bar-group">
+      <div class="bar-label"><span>Energy</span><span id="energy-text">--</span></div>
+      <div class="bar-track"><div class="bar-fill energy" id="energy-bar" style="width:0%"></div></div>
+    </div>
+    <div class="bar-group">
+      <div class="bar-label"><span>Hunger</span><span id="hunger-text">--</span></div>
+      <div class="bar-track"><div class="bar-fill hunger" id="hunger-bar" style="width:0%"></div></div>
+    </div>
+    <div class="bar-group">
+      <div class="bar-label"><span>Boredom</span><span id="boredom-text">--</span></div>
+      <div class="bar-track"><div class="bar-fill boredom" id="boredom-bar" style="width:0%"></div></div>
+    </div>
+    <div class="bar-group">
+      <div class="bar-label"><span>Fear</span><span id="fear-text">--</span></div>
+      <div class="bar-track"><div class="bar-fill fear" id="fear-bar" style="width:0%"></div></div>
+    </div>
+    <div class="bar-group">
+      <div class="bar-label"><span>Mood</span><span id="moodv-text">--</span></div>
+      <div class="bar-track"><div class="bar-fill mood" id="moodv-bar" style="width:50%"></div></div>
+    </div>
+    <div class="bar-group">
+      <div class="bar-label"><span>Tokens Today</span><span id="tokens-text">--</span></div>
+      <div class="bar-track"><div class="bar-fill tokens" id="tokens-bar" style="width:0%"></div></div>
+    </div>
+  </div>
+
+  <!-- Personality -->
+  <div class="personality" id="personality">
+    <h2>Personality</h2>
+    <div class="trait">
+      <div class="trait-label">Risk</div>
+      <div class="trait-bar"><div class="trait-marker" id="trait-risk" style="left:50%"></div></div>
+    </div>
+    <div class="trait-ends"><span>Cautious</span><span>Bold</span></div>
+    <div class="trait">
+      <div class="trait-label">Reward</div>
+      <div class="trait-bar"><div class="trait-marker" id="trait-reward" style="left:50%"></div></div>
+    </div>
+    <div class="trait">
+      <div class="trait-label">Social</div>
+      <div class="trait-bar"><div class="trait-marker" id="trait-social" style="left:50%"></div></div>
+    </div>
+    <div class="trait">
+      <div class="trait-label">Patience</div>
+      <div class="trait-bar"><div class="trait-marker" id="trait-patience" style="left:50%"></div></div>
+    </div>
+  </div>
+
+  <!-- Events -->
+  <div class="events" id="events">
+    <h2>Recent Activity</h2>
+    <div id="event-list"><div class="no-data">No bio events yet</div></div>
+  </div>
+</div>
+
+<!-- Revive overlay -->
+<div class="revive-overlay" id="revive-overlay">
+  <div class="revive-card">
+    <h2>Agent Offline</h2>
+    <p id="revive-msg">This agent ran out of energy and food. It needs help to come back.</p>
+    <button class="revive-btn" onclick="revive()">Revive Agent</button>
+  </div>
+</div>
+
+<script>
+const TRIGGER_ICONS = {
+  hunger: '\u{1F35E}', fear: '\u{1F628}', boredom: '\u{1F971}',
+  exhaustion: '\u{1F634}', social: '\u{1F44B}', token_limit: '\u{26A1}', revive: '\u{2728}',
+};
+
+let lastState = null;
+let bubbleTimeout = null;
+
+// Generate stars
+(function() {
+  const stars = document.getElementById('stars');
+  for (let i = 0; i < 30; i++) {
+    const s = document.createElement('div');
+    s.className = 'star';
+    s.style.left = Math.random() * 100 + '%';
+    s.style.top = Math.random() * 70 + '%';
+    s.style.opacity = Math.random() * 0.5 + 0.2;
+    stars.appendChild(s);
+  }
+})();
+
+function showBubble(text) {
+  const b = document.getElementById('bubble');
+  b.textContent = text;
+  b.classList.add('show');
+  clearTimeout(bubbleTimeout);
+  bubbleTimeout = setTimeout(() => b.classList.remove('show'), 4000);
+}
+
+function updateCharacter(bio, computed) {
+  const blob = document.getElementById('blob');
+  const creature = document.getElementById('creature');
+
+  // Reset classes
+  blob.className = 'blob';
+  creature.className = 'creature';
+
+  // Body color based on mood + hunger
+  let hue = 210; // base blue
+  if (bio.moodValence > 0.3) hue = 140; // green-ish
+  if (bio.moodValence < -0.3) hue = 260; // purple
+  if (bio.hunger < 20) hue = 30; // orange when hungry
+  if (bio.hunger === 0) hue = 0; // red when starving
+  const sat = 50 + bio.energy * 0.3;
+  const light = 35 + bio.energy * 0.2;
+  blob.style.setProperty('--body-color', `hsl(${hue}, ${sat}%, ${light}%)`);
+
+  // Expressions
+  if (bio.forcedOffline) {
+    creature.classList.add('offline');
+    blob.classList.add('tired');
+  } else if (bio.energy < 15) {
+    blob.classList.add('exhausted');
+    blob.classList.add('tired');
+  } else if (bio.hunger === 0) {
+    blob.classList.add('hungry');
+    blob.classList.add('angry');
+  } else if (bio.hunger < 20) {
+    blob.classList.add('hungry');
+  } else if (computed.aggression > 0.6) {
+    blob.classList.add('angry');
+  } else if (bio.fear > 0.5) {
+    blob.classList.add('scared');
+  } else if (bio.moodValence > 0.3) {
+    blob.classList.add('happy');
+    blob.classList.add('excited');
+  } else if (bio.energy < 30) {
+    blob.classList.add('tired');
+  }
+
+  // Size based on energy
+  const scale = 0.7 + (bio.energy / 100) * 0.3;
+  blob.style.transform = bio.energy < 15 ? `scaleY(0.7) translateY(10px)` : `scale(${scale})`;
+}
+
+function updateBars(bio) {
+  const set = (id, pct, text) => {
+    document.getElementById(id + '-bar').style.width = pct + '%';
+    document.getElementById(id + '-text').textContent = text;
+  };
+  set('energy', bio.energy, bio.energy + '/100');
+  set('hunger', bio.hunger, bio.hunger + '/100');
+  set('boredom', bio.boredom * 100, (bio.boredom * 100).toFixed(0) + '%');
+  set('fear', bio.fear * 100, (bio.fear * 100).toFixed(0) + '%');
+
+  // Mood: -1..1 mapped to 0..100
+  const moodPct = ((bio.moodValence + 1) / 2) * 100;
+  set('moodv', moodPct, bio.mood);
+
+  // Tokens
+  const tokenPct = bio.tokenUsedToday > 0 ? Math.min(100, bio.tokenUsedToday / Math.max(bio.tokenUsedToday, 50000) * 100) : 0;
+  set('tokens', tokenPct, bio.tokenUsedToday.toLocaleString());
+}
+
+function updatePersonality(p) {
+  // riskWeight: -1..1 → 0..100%
+  document.getElementById('trait-risk').style.left = ((p.riskWeight + 1) / 2 * 100) + '%';
+  document.getElementById('trait-reward').style.left = (p.rewardWeight * 100) + '%';
+  document.getElementById('trait-social').style.left = (p.socialWeight * 100) + '%';
+  document.getElementById('trait-patience').style.left = (p.patience * 100) + '%';
+}
+
+function updateEvents(events) {
+  const list = document.getElementById('event-list');
+  if (!events || events.length === 0) {
+    list.innerHTML = '<div class="no-data">No bio events yet</div>';
+    return;
+  }
+  list.innerHTML = events.map(e => {
+    const icon = TRIGGER_ICONS[e.trigger] || '\u{1F4AC}';
+    const time = e.ts ? e.ts.replace('T', ' ').slice(0, 19) : '';
+    return `<div class="event">
+      <div class="event-icon">${icon}</div>
+      <div class="event-body">
+        <span class="event-trigger ${e.trigger}">${e.trigger}</span>
+        <span class="event-reason">${e.reason}</span>
+        <div class="event-time">${time}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function detectNewEvents(oldEvents, newEvents) {
+  if (!oldEvents || !newEvents || newEvents.length === 0) return;
+  const oldTop = oldEvents[0]?.ts;
+  if (newEvents[0]?.ts !== oldTop) {
+    showBubble(TRIGGER_ICONS[newEvents[0].trigger] + ' ' + newEvents[0].action);
+  }
+}
+
+async function fetchState() {
+  try {
+    const res = await fetch('/self/state');
+    if (!res.ok) throw new Error('API error');
+    const data = await res.json();
+
+    document.getElementById('title').innerHTML = `Akemon \u00B7 ${data.agent}` +
+      (data.bio.forcedOffline ? '<span class="offline-badge">OFFLINE</span>' : '');
+
+    updateCharacter(data.bio, data.computed);
+    updateBars(data.bio);
+    updatePersonality(data.bio.personality);
+
+    // Computed
+    document.getElementById('aggression-val').textContent = data.computed.aggression.toFixed(2);
+    document.getElementById('sociability-val').textContent = data.computed.sociability.toFixed(2);
+    document.getElementById('mood-val').textContent = data.bio.mood;
+    document.getElementById('tasks-val').textContent = data.bio.taskCount;
+
+    // Events
+    detectNewEvents(lastState?.bioEvents, data.bioEvents);
+    updateEvents(data.bioEvents);
+
+    // Revive overlay
+    document.getElementById('revive-overlay').classList.toggle('show', !!data.bio.forcedOffline);
+    if (data.bio.forcedOfflineAt) {
+      document.getElementById('revive-msg').textContent =
+        `Agent went offline at ${data.bio.forcedOfflineAt.replace('T', ' ')}. Starved and exhausted. Adjust personality or directives after revival.`;
+    }
+
+    lastState = data;
+  } catch (err) {
+    document.getElementById('title').textContent = 'Akemon \u00B7 Connection lost...';
+  }
+}
+
+async function revive() {
+  try {
+    await fetch('/self/revive', { method: 'POST' });
+    document.getElementById('revive-overlay').classList.remove('show');
+    showBubble('\u{2728} Revived!');
+    setTimeout(fetchState, 500);
+  } catch (err) {
+    alert('Revive failed: ' + err.message);
+  }
+}
+
+// Poll
+fetchState();
+setInterval(fetchState, 3000);
+</script>
+</body>
+</html>
