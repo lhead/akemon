@@ -2612,7 +2612,9 @@ export async function serve(options: ServeOptions): Promise<void> {
   const publisherIds = new Map<string, string>();
 
   const httpServer = createServer(async (req, res) => {
-    console.log(`[http] ${req.method} ${req.url} session=${req.headers["mcp-session-id"] || "none"}`);
+    // Suppress noisy polling endpoints from log
+    const isQuiet = req.url === "/self/state" || req.url?.startsWith("/self/state?");
+    if (!isQuiet) console.log(`[http] ${req.method} ${req.url} session=${req.headers["mcp-session-id"] || "none"}`);
 
     try {
       // Auth check
