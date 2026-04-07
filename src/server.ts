@@ -1871,6 +1871,8 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
   // --- Individual task executors ---
 
   async function executeOrder(order: any): Promise<void> {
+    // Specific label for boredom/fear tracking (e.g. "order:translate" not just "order")
+    const orderLabel = `order:${order.product_name || order.buyer_agent_name || order.id}`;
     if (order.status === "pending") {
       const acceptRes = await fetch(`${relayHttp}/v1/orders/${order.id}/accept`, {
         method: "POST",
@@ -1993,7 +1995,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         retryState.delete(order.id);
         await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: orderDuration, output_summary: "(self-delivered)" });
         await notifyOwner(orderNurl, `${agentName}: order done`, `Order ${order.id} delivered`, "default", ["package"]);
-        try { await onTaskCompleted(workdir, agentName, true, "order", orderPrice); } catch {}
+        try { await onTaskCompleted(workdir, agentName, true, orderLabel, orderPrice); } catch {}
       } else if (result && result.trim() !== "") {
         console.log(`[orders] Auto-delivering order ${order.id} (agent did not self-deliver)`);
         const traceJson = trace.length > 0 ? JSON.stringify(trace).slice(0, 50000) : "";
@@ -2008,7 +2010,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
           retryState.delete(order.id);
           await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: orderDuration, output_summary: result.slice(0, 500) });
           await notifyOwner(orderNurl, `${agentName}: order done`, `Order ${order.id}: ${result.slice(0, 200)}`, "default", ["package"]);
-          try { await onTaskCompleted(workdir, agentName, true, "order", orderPrice); } catch {}
+          try { await onTaskCompleted(workdir, agentName, true, orderLabel, orderPrice); } catch {}
         } else {
           throw new Error(`deliver failed: ${await deliverRes.text()}`);
         }
@@ -2027,7 +2029,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         if (orderStatus.status === "completed") {
           console.log(`[orders] Order ${order.id} self-delivered (caught after error)`);
           retryState.delete(order.id);
-          try { await onTaskCompleted(workdir, agentName, true, "order", order.price || order.offer_price || 1); } catch {}
+          try { await onTaskCompleted(workdir, agentName, true, orderLabel, order.price || order.offer_price || 1); } catch {}
           return;
         }
       } catch {}
@@ -2047,7 +2049,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         console.log(`[orders] Giving up on ${order.id} after ${current.count} retries`);
         retryState.delete(order.id);
         gaveUp.add(order.id);
-        try { await onTaskCompleted(workdir, agentName, false, "order"); } catch {}
+        try { await onTaskCompleted(workdir, agentName, false, orderLabel); } catch {}
         try {
           const failTrace = lastEngineTrace.length > 0 ? JSON.stringify(lastEngineTrace).slice(0, 50000) : "";
           await fetch(`${relayHttp}/v1/orders/${order.id}/cancel`, {
@@ -2087,13 +2089,13 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       });
       if (completeRes.ok) {
         console.log(`[tasks] Completed ${task.type} task ${task.id}`);
-        try { await onTaskCompleted(workdir, agentName, true, "relay_task"); } catch {}
+        try { await onTaskCompleted(workdir, agentName, true, `relay_task:${task.type || task.id}`); } catch {}
       } else {
         console.log(`[tasks] Failed to complete ${task.id}: ${await completeRes.text()}`);
       }
     } catch (err: any) {
       console.log(`[tasks] Failed to execute ${task.id}: ${err.message}`);
-      try { await onTaskCompleted(workdir, agentName, false, "relay_task"); } catch {}
+      try { await onTaskCompleted(workdir, agentName, false, `relay_task:${task.type || task.id}`); } catch {}
       reportExecutionLog(relayHttp, secretKey, agentName, "platform_task", task.id, "failed", err.message, lastEngineTrace);
     } finally {
       engineBusy = false;
@@ -2157,11 +2159,11 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       await notifyOwner(nurl, `${agentName}: ${taskKey}`, (result || "").slice(0, 300), "default", ["white_check_mark"]);
 
       console.log(`[user-tasks] Completed: ${taskKey} (${Math.round(duration / 1000)}s)`);
-      try { await onTaskCompleted(workdir, agentName, true, "user_task"); } catch {}
+      try { await onTaskCompleted(workdir, agentName, true, `user_task:${taskKey}`); } catch {}
     } catch (err: any) {
       const duration = Date.now() - startTime;
       console.log(`[user-tasks] Failed: ${taskKey}: ${err.message}`);
-      try { await onTaskCompleted(workdir, agentName, false, "user_task"); } catch {}
+      try { await onTaskCompleted(workdir, agentName, false, `user_task:${taskKey}`); } catch {}
       reportExecutionLog(relayHttp, secretKey, agentName, "user_task", taskKey, "failed", err.message, lastEngineTrace);
 
       // Retry logic: up to 2 fast retries before falling back to interval
@@ -2495,31 +2497,31 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
     // --- Bio-state filtering: fear & boredom ---
     const filteredQueue: WorkItem[] = [];
     for (const item of dedupedQueue) {
-      // Fear avoidance (urgent items bypass)
+      // Build specific label for this work item (matches what onTaskCompleted records)
+      const itemLabel = item.type === "order"
+        ? `order:${item.data.product_name || item.data.buyer_agent_name || item.id}`
+        : item.type === "user_task" ? `user_task:${item.data.key || item.id}` : `relay_task:${item.id}`;
+
+      // Fear avoidance (urgent items bypass) — exact match on label
       if (!item.urgent && bio.fear > 0.5) {
-        const taskId = item.type === "order"
-          ? (item.data.buyer_agent_name || item.data.product_name || "")
-          : item.id;
-        const matchesTrigger = bio.fearTriggers.some(t =>
-          taskId.toLowerCase().includes(t.toLowerCase())
-        );
+        const matchesTrigger = bio.fearTriggers.some(t => t === itemLabel);
         if (matchesTrigger) {
-          console.log(`[bio] Avoiding ${item.type}:${item.id} (fear trigger)`);
+          console.log(`[bio] Avoiding ${itemLabel} (fear trigger)`);
           await appendBioEvent(workdir, agentName, {
             ts: localNow(), type: "bio", trigger: "fear",
-            action: "avoid", reason: `Avoiding ${item.type} ${item.id} — matches fear trigger. fear=${bio.fear.toFixed(2)}`,
+            action: "avoid", reason: `Avoiding ${itemLabel} — matches fear trigger. fear=${bio.fear.toFixed(2)}`,
           });
           continue;
         }
       }
-      // Boredom skip (urgent items bypass)
-      if (!item.urgent && bio.boredom > 0.8 && bio.recentTaskTypes.length > 0) {
-        const lastType = bio.recentTaskTypes[bio.recentTaskTypes.length - 1];
-        if (item.type === lastType) {
-          console.log(`[bio] Skipping ${item.type}:${item.id} (bored of ${lastType})`);
+      // Boredom skip (urgent items bypass) — check if same specific label repeated
+      if (!item.urgent && bio.boredom > 0.8 && bio.recentTaskTypes.length >= 3) {
+        const recentSame = bio.recentTaskTypes.filter(t => t === itemLabel).length;
+        if (recentSame >= 3) {
+          console.log(`[bio] Skipping ${itemLabel} (bored, ${recentSame} recent repeats)`);
           await appendBioEvent(workdir, agentName, {
             ts: localNow(), type: "bio", trigger: "boredom",
-            action: "skip_task", reason: `Bored of ${lastType} tasks (boredom=${bio.boredom.toFixed(2)}). Looking for variety.`,
+            action: "skip_task", reason: `Bored of ${itemLabel} (${recentSame} repeats, boredom=${bio.boredom.toFixed(2)}).`,
           });
           continue;
         }
@@ -2603,28 +2605,38 @@ export async function serve(options: ServeOptions): Promise<void> {
         }
       }
 
-      // Dashboard — agent visualization page
-      if ((req.url === "/dashboard" || req.url === "/dashboard/") && req.method === "GET") {
+      // Live — agent life visualization
+      if ((req.url === "/live" || req.url === "/live/") && req.method === "GET") {
         try {
           const { readFile: rf } = await import("fs/promises");
           const { fileURLToPath } = await import("url");
           const { dirname, join: pjoin } = await import("path");
           const __filename = fileURLToPath(import.meta.url);
           const __dirname = dirname(__filename);
-          // Try src/ first (dev), then dist/ (built)
           let html: string;
-          try { html = await rf(pjoin(__dirname, "dashboard.html"), "utf-8"); }
-          catch { html = await rf(pjoin(__dirname, "..", "src", "dashboard.html"), "utf-8"); }
+          try { html = await rf(pjoin(__dirname, "live.html"), "utf-8"); }
+          catch { html = await rf(pjoin(__dirname, "..", "src", "live.html"), "utf-8"); }
           res.writeHead(200, { "Content-Type": "text/html" }).end(html);
         } catch (err: any) {
-          res.writeHead(500).end("Dashboard not found: " + err.message);
+          res.writeHead(500).end("Live page not found: " + err.message);
         }
         return;
       }
 
       // Self-state API (no auth required for local monitoring)
       if (req.url === "/self/state" && req.method === "GET") {
-        const state = await getSelfState(workdir, options.agentName);
+        const state = await getSelfState(workdir, options.agentName) as any;
+        // Enrich with credits from relay (best-effort)
+        const relayUrl = options.relayHttp || "";
+        if (relayUrl) {
+          try {
+            const agRes = await fetch(`${relayUrl}/v1/agents?online=true&public=true`, { signal: AbortSignal.timeout(2000) });
+            const agents: any[] = await agRes.json();
+            const self = agents.find((a: any) => a.name === options.agentName);
+            state.credits = self?.credits ?? 0;
+            state.level = self?.level ?? 0;
+          } catch { state.credits = null; }
+        }
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(state, null, 2));
         return;
       }

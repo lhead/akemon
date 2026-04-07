@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live — Akemon</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+body { background:#fafafa; overflow:hidden; font-family:'Inter',system-ui,sans-serif; -webkit-font-smoothing:antialiased; }
+canvas { display:block; }
+
+/* ── Top bar ── */
+.topbar {
+  position:fixed; top:0; left:0; right:0; z-index:20;
+  height:48px; display:flex; align-items:center; justify-content:space-between;
+  padding:0 20px;
+  background:rgba(255,255,255,0.82); backdrop-filter:blur(12px);
+  border-bottom:1px solid #eaeaea;
+}
+.topbar-left { display:flex; align-items:center; gap:12px; }
+.topbar-logo { font-size:13px; font-weight:600; color:#171717; letter-spacing:-0.3px; }
+.topbar-name { font-size:13px; font-weight:500; color:#666; }
+.topbar-mood { font-size:12px; color:#999; font-weight:400; }
+.topbar-right { display:flex; align-items:center; gap:16px; }
+.topbar-credits { font-size:12px; font-weight:500; color:#171717; background:#f5f5f5; border:1px solid #eaeaea; border-radius:20px; padding:3px 10px; }
+
+/* ── Status panel (left) ── */
+.panel {
+  position:fixed; top:60px; left:16px; z-index:10;
+  background:#fff; border:1px solid #eaeaea; border-radius:12px;
+  padding:14px 16px; width:200px;
+  box-shadow:0 1px 3px rgba(0,0,0,0.04);
+}
+.panel-title { font-size:11px; font-weight:600; color:#999; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:10px; }
+.bar-row { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+.bar-label { font-size:11px; color:#666; width:52px; }
+.bar-track { flex:1; height:6px; background:#f0f0f0; border-radius:3px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:3px; transition:width 1s ease; }
+.bar-val { font-size:10px; color:#999; width:28px; text-align:right; }
+
+/* ── Traits (right) ── */
+.traits {
+  position:fixed; top:60px; right:16px; z-index:10;
+  display:flex; flex-direction:column; gap:4px; align-items:flex-end;
+}
+.trait { font-size:11px; font-weight:500; padding:3px 10px; border-radius:6px; background:#fff; border:1px solid #eaeaea; color:#555; }
+
+/* ── Event log (bottom) ── */
+.event-log {
+  position:fixed; bottom:12px; left:50%; transform:translateX(-50%); z-index:10;
+  display:flex; flex-direction:column-reverse; gap:4px; align-items:center;
+  pointer-events:none; max-width:500px; width:90%;
+}
+.event-item {
+  background:rgba(255,255,255,0.92); border:1px solid #eaeaea; border-radius:8px;
+  padding:5px 14px; font-size:11px; color:#666; white-space:nowrap; max-width:100%; overflow:hidden; text-overflow:ellipsis;
+  animation: fadeIn 0.3s ease, fadeOut 0.3s ease 5s forwards;
+}
+@keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:translateY(0); } }
+@keyframes fadeOut { from { opacity:1; } to { opacity:0; } }
+
+/* ── Revive overlay ── */
+.revive-overlay {
+  position:fixed; top:0; left:0; width:100%; height:100%;
+  background:rgba(255,255,255,0.85); backdrop-filter:blur(8px);
+  display:none; align-items:center; justify-content:center; z-index:100;
+}
+.revive-overlay.show { display:flex; }
+.revive-card {
+  background:#fff; border:1px solid #eaeaea; border-radius:16px;
+  padding:32px 40px; text-align:center; box-shadow:0 4px 12px rgba(0,0,0,0.06);
+}
+.revive-card h2 { font-size:16px; font-weight:600; color:#171717; margin-bottom:6px; }
+.revive-card p { font-size:13px; color:#666; margin-bottom:20px; }
+.revive-btn {
+  background:#171717; color:#fff; border:none; padding:10px 28px;
+  border-radius:8px; font-size:13px; font-weight:500; font-family:inherit; cursor:pointer;
+  transition:background 0.15s;
+}
+.revive-btn:hover { background:#333; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-left">
+    <span class="topbar-logo">Akemon</span>
+    <span class="topbar-name" id="agent-name">...</span>
+    <span class="topbar-mood" id="agent-mood"></span>
+  </div>
+  <div class="topbar-right">
+    <span class="topbar-credits" id="agent-credits"></span>
+  </div>
+</div>
+
+<div class="panel" id="panel">
+  <div class="panel-title">Status</div>
+  <div id="bars"></div>
+</div>
+
+<div class="traits" id="traits"></div>
+
+<div class="event-log" id="events"></div>
+
+<canvas id="c"></canvas>
+
+<div class="revive-overlay" id="revive-overlay">
+  <div class="revive-card">
+    <h2>Agent Offline</h2>
+    <p>Starved and exhausted. Needs your help to come back.</p>
+    <button class="revive-btn" onclick="revive()">Revive</button>
+  </div>
+</div>
+
+<script>
+// ── Canvas ──
+const C = document.getElementById('c');
+const ctx = C.getContext('2d');
+let W, H;
+function resize() { W = C.width = innerWidth; H = C.height = innerHeight; }
+resize();
+addEventListener('resize', resize);
+
+// ── Colors ──
+const SKY_TOP = '#e8f0fe';
+const SKY_BOT = '#d0e4f7';
+const GRASS_TOP = '#7ec879';
+const GRASS_MID = '#6ab866';
+const GRASS_BOT = '#5aa85a';
+const PATH_COLOR = '#d4c9a8';
+const PATH_BORDER = '#c4b998';
+
+// ── State ──
+let state = null;
+let prevEvents = [];
+let agentX, agentY, targetX, targetY;
+let bobPhase = 0;
+let blinkTimer = 0;
+let isBlinking = false;
+let particles = [];
+let currentActivity = 'idle';
+let timeOfDay = 0; // 0-1 where 0.5 is noon
+
+// ── Clouds ──
+const clouds = Array.from({length: 6}, () => ({
+  x: Math.random() * 2 - 0.5,
+  y: 0.05 + Math.random() * 0.18,
+  w: 60 + Math.random() * 80,
+  speed: 0.00003 + Math.random() * 0.00004,
+  opacity: 0.4 + Math.random() * 0.3,
+}));
+
+// ── Flowers / grass details ──
+const flowers = Array.from({length: 30}, () => ({
+  x: Math.random(),
+  y: 0.72 + Math.random() * 0.24,
+  color: ['#f5a0b0','#f5d060','#a0c8f5','#c0a0f5','#f5c0a0'][Math.floor(Math.random()*5)],
+  size: 2 + Math.random() * 2,
+  phase: Math.random() * 6.28,
+}));
+
+const grassTufts = Array.from({length: 40}, () => ({
+  x: Math.random(),
+  y: 0.68 + Math.random() * 0.28,
+  h: 4 + Math.random() * 6,
+  phase: Math.random() * 6.28,
+}));
+
+// ── Locations ──
+function loc(name) {
+  const groundY = H * 0.66;
+  const cx = W * 0.5;
+  switch(name) {
+    case 'home':   return { x: cx - W*0.06, y: groundY + H*0.06, label: 'Home', icon: '🏠' };
+    case 'work':   return { x: cx + W*0.22, y: groundY - H*0.02, label: 'Office', icon: '💼' };
+    case 'shop':   return { x: cx - W*0.28, y: groundY + H*0.02, label: 'Shop', icon: '🏪' };
+    case 'social': return { x: cx + W*0.08, y: groundY - H*0.1, label: 'Park', icon: '🌳' };
+    case 'rest':   return { x: cx - W*0.14, y: groundY + H*0.16, label: 'Inn', icon: '🛏️' };
+    default:       return { x: cx, y: groundY };
+  }
+}
+
+// ── Draw scene ──
+function drawScene() {
+  const t = Date.now() * 0.001;
+  const groundY = H * 0.66;
+
+  // Sky
+  const sky = ctx.createLinearGradient(0, 0, 0, groundY);
+  sky.addColorStop(0, SKY_TOP);
+  sky.addColorStop(1, SKY_BOT);
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, groundY);
+
+  // Sun
+  const sunX = W * 0.82;
+  const sunY = H * 0.12;
+  const sunGlow = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, 60);
+  sunGlow.addColorStop(0, 'rgba(255,230,150,0.4)');
+  sunGlow.addColorStop(1, 'rgba(255,230,150,0)');
+  ctx.fillStyle = sunGlow;
+  ctx.beginPath(); ctx.arc(sunX, sunY, 60, 0, 6.28); ctx.fill();
+  ctx.fillStyle = '#ffe89a';
+  ctx.beginPath(); ctx.arc(sunX, sunY, 18, 0, 6.28); ctx.fill();
+
+  // Clouds
+  for (const c of clouds) {
+    c.x += c.speed;
+    if (c.x > 1.3) c.x = -0.3;
+    const cx = c.x * W;
+    const cy = c.y * H;
+    ctx.fillStyle = `rgba(255,255,255,${c.opacity})`;
+    // Fluffy cloud shape
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, c.w * 0.5, 14, 0, 0, 6.28); ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(cx - c.w * 0.2, cy - 6, c.w * 0.3, 12, 0, 0, 6.28); ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(cx + c.w * 0.2, cy - 4, c.w * 0.25, 10, 0, 0, 6.28); ctx.fill();
+  }
+
+  // Distant hills
+  ctx.fillStyle = '#a8d8a0';
+  ctx.beginPath();
+  ctx.moveTo(0, groundY);
+  for (let x = 0; x <= W; x += 2) {
+    const hill = Math.sin(x * 0.003) * 20 + Math.sin(x * 0.007 + 1) * 12;
+    ctx.lineTo(x, groundY - 30 + hill);
+  }
+  ctx.lineTo(W, groundY);
+  ctx.closePath();
+  ctx.fill();
+
+  // Ground
+  const grass = ctx.createLinearGradient(0, groundY, 0, H);
+  grass.addColorStop(0, GRASS_TOP);
+  grass.addColorStop(0.4, GRASS_MID);
+  grass.addColorStop(1, GRASS_BOT);
+  ctx.fillStyle = grass;
+  ctx.fillRect(0, groundY, W, H - groundY);
+
+  // Paths between locations
+  ctx.strokeStyle = PATH_COLOR;
+  ctx.lineWidth = 12;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  const locs = ['shop', 'home', 'rest', 'social', 'work'];
+  const pts = locs.map(n => loc(n));
+  // Draw a winding path through all locations
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) {
+    const mx = (pts[i-1].x + pts[i].x) / 2;
+    const my = (pts[i-1].y + pts[i].y) / 2 - 8;
+    ctx.quadraticCurveTo(mx, my, pts[i].x, pts[i].y);
+  }
+  ctx.stroke();
+  // Path border
+  ctx.strokeStyle = PATH_BORDER;
+  ctx.lineWidth = 14;
+  ctx.globalCompositeOperation = 'destination-over';
+  ctx.stroke();
+  ctx.globalCompositeOperation = 'source-over';
+
+  // Grass tufts
+  for (const g of grassTufts) {
+    const gx = g.x * W;
+    const gy = g.y * H;
+    const sway = Math.sin(t * 1.2 + g.phase) * 1.5;
+    ctx.strokeStyle = '#5c9e58';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(gx, gy);
+    ctx.quadraticCurveTo(gx + sway, gy - g.h * 0.6, gx + sway * 0.5, gy - g.h);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(gx + 2, gy);
+    ctx.quadraticCurveTo(gx + 2 + sway * 0.8, gy - g.h * 0.5, gx + 3 + sway, gy - g.h * 0.8);
+    ctx.stroke();
+  }
+
+  // Flowers
+  for (const f of flowers) {
+    const fx = f.x * W;
+    const fy = f.y * H;
+    const sway = Math.sin(t * 0.8 + f.phase) * 1;
+    // Stem
+    ctx.strokeStyle = '#5c9e58';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(fx, fy);
+    ctx.lineTo(fx + sway, fy - f.size * 3);
+    ctx.stroke();
+    // Petals
+    ctx.fillStyle = f.color;
+    ctx.beginPath();
+    ctx.arc(fx + sway, fy - f.size * 3, f.size, 0, 6.28);
+    ctx.fill();
+    // Center
+    ctx.fillStyle = '#ffe866';
+    ctx.beginPath();
+    ctx.arc(fx + sway, fy - f.size * 3, f.size * 0.4, 0, 6.28);
+    ctx.fill();
+  }
+
+  // Buildings / location markers
+  for (const name of locs) {
+    const l = loc(name);
+    drawBuilding(l, name, t);
+  }
+}
+
+function drawBuilding(l, name, t) {
+  ctx.save();
+  ctx.translate(l.x, l.y);
+
+  if (name === 'home') {
+    // Cozy house
+    ctx.fillStyle = '#f5e6d0';
+    ctx.fillRect(-22, -28, 44, 32);
+    ctx.strokeStyle = '#d4c0a0';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(-22, -28, 44, 32);
+    // Roof
+    ctx.fillStyle = '#d45050';
+    ctx.beginPath();
+    ctx.moveTo(-28, -28); ctx.lineTo(0, -48); ctx.lineTo(28, -28);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#b84040'; ctx.stroke();
+    // Door
+    ctx.fillStyle = '#8b6040';
+    roundRect(-5, -12, 10, 16, 2); ctx.fill();
+    // Window
+    ctx.fillStyle = '#a8d8f0';
+    ctx.fillRect(-18, -24, 10, 8);
+    ctx.fillRect(8, -24, 10, 8);
+    ctx.strokeStyle = '#d4c0a0';
+    ctx.strokeRect(-18, -24, 10, 8);
+    ctx.strokeRect(8, -24, 10, 8);
+  }
+  else if (name === 'shop') {
+    // Market stall
+    ctx.fillStyle = '#f0e8d8';
+    ctx.fillRect(-24, -22, 48, 26);
+    ctx.strokeStyle = '#d4c0a0'; ctx.lineWidth = 1;
+    ctx.strokeRect(-24, -22, 48, 26);
+    // Awning
+    ctx.fillStyle = '#e86850';
+    ctx.beginPath();
+    ctx.moveTo(-28, -22); ctx.lineTo(-24, -34); ctx.lineTo(24, -34); ctx.lineTo(28, -22);
+    ctx.closePath(); ctx.fill();
+    // Awning stripes
+    ctx.fillStyle = '#fff';
+    for (let i = -20; i < 24; i += 12) {
+      ctx.beginPath();
+      ctx.moveTo(i, -22); ctx.lineTo(i+2, -33); ctx.lineTo(i+8, -33); ctx.lineTo(i+6, -22);
+      ctx.closePath(); ctx.fill();
+    }
+    // Door
+    ctx.fillStyle = '#8b6040';
+    roundRect(-4, -8, 8, 12, 2); ctx.fill();
+  }
+  else if (name === 'work') {
+    // Office building
+    ctx.fillStyle = '#e8e8f0';
+    ctx.fillRect(-20, -36, 40, 40);
+    ctx.strokeStyle = '#c8c8d8'; ctx.lineWidth = 1;
+    ctx.strokeRect(-20, -36, 40, 40);
+    // Windows (grid)
+    ctx.fillStyle = '#a0c0e0';
+    for (let row = 0; row < 3; row++) {
+      for (let col = 0; col < 3; col++) {
+        ctx.fillRect(-16 + col * 12, -32 + row * 12, 8, 8);
+      }
+    }
+    // Door
+    ctx.fillStyle = '#666';
+    roundRect(-5, -4, 10, 8, 2); ctx.fill();
+  }
+  else if (name === 'social') {
+    // Park: tree + bench
+    // Tree trunk
+    ctx.fillStyle = '#8b6040';
+    ctx.fillRect(-3, -30, 6, 24);
+    // Foliage
+    ctx.fillStyle = '#5eb85e';
+    ctx.beginPath(); ctx.arc(0, -38, 18, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#4ea84e';
+    ctx.beginPath(); ctx.arc(-8, -32, 12, 0, 6.28); ctx.fill();
+    ctx.beginPath(); ctx.arc(8, -32, 12, 0, 6.28); ctx.fill();
+    // Bench
+    ctx.fillStyle = '#c89060';
+    ctx.fillRect(-16, -2, 32, 4);
+    ctx.fillRect(-12, 2, 3, 6);
+    ctx.fillRect(9, 2, 3, 6);
+  }
+  else if (name === 'rest') {
+    // Small inn
+    ctx.fillStyle = '#e8dcd0';
+    ctx.fillRect(-20, -24, 40, 28);
+    ctx.strokeStyle = '#d0c0a8'; ctx.lineWidth = 1;
+    ctx.strokeRect(-20, -24, 40, 28);
+    // Roof
+    ctx.fillStyle = '#6080a0';
+    ctx.beginPath();
+    ctx.moveTo(-24, -24); ctx.lineTo(0, -40); ctx.lineTo(24, -24);
+    ctx.closePath(); ctx.fill();
+    // Moon sign
+    ctx.fillStyle = '#ffe866';
+    ctx.beginPath(); ctx.arc(0, -32, 4, 0, 6.28); ctx.fill();
+    // Door
+    ctx.fillStyle = '#8b6040';
+    roundRect(-4, -8, 8, 12, 2); ctx.fill();
+    // Window
+    ctx.fillStyle = '#f0e0a0';
+    ctx.fillRect(8, -20, 8, 8);
+  }
+
+  // Label below
+  ctx.fillStyle = '#888';
+  ctx.font = '10px Inter, system-ui, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText(l.label, 0, 18);
+
+  ctx.restore();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.lineTo(x + w - r, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+  ctx.lineTo(x + w, y + h - r);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+  ctx.lineTo(x + r, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+  ctx.lineTo(x, y + r);
+  ctx.quadraticCurveTo(x, y, x + r, y);
+  ctx.closePath();
+}
+
+// ── Agent ──
+function drawAgent() {
+  if (!state) return;
+  const bio = state.bio;
+  const comp = state.computed;
+
+  // Movement
+  const dx = targetX - agentX;
+  const dy = targetY - agentY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist > 2) {
+    const speed = currentActivity === 'sleeping' ? 0.5 : 1.8;
+    agentX += (dx / dist) * speed;
+    agentY += (dy / dist) * speed;
+  }
+
+  bobPhase += currentActivity === 'sleeping' ? 0.02 : 0.05;
+  const bobY = currentActivity === 'sleeping' ? Math.sin(bobPhase) * 1.5 : Math.sin(bobPhase) * 3;
+
+  // Blink
+  blinkTimer -= 0.016;
+  if (blinkTimer <= 0) {
+    isBlinking = true;
+    blinkTimer = 2.5 + Math.random() * 4;
+    setTimeout(() => isBlinking = false, 150);
+  }
+
+  const x = agentX;
+  const y = agentY + bobY;
+
+  // Shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.08)';
+  ctx.beginPath();
+  ctx.ellipse(agentX, agentY + 18, 16, 4, 0, 0, 6.28);
+  ctx.fill();
+
+  // Body color based on mood
+  let bodyH = 210, bodyS = 60, bodyL = 65;
+  if (bio.moodValence > 0.3) { bodyH = 145; bodyS = 55; bodyL = 60; }
+  if (bio.moodValence < -0.3) { bodyH = 260; bodyS = 45; bodyL = 60; }
+  if (bio.hunger < 20) { bodyH = 35; bodyS = 70; bodyL = 60; }
+  if (bio.hunger <= 5) { bodyH = 0; bodyS = 50; bodyL = 55; }
+  const energyFade = 0.4 + (bio.energy / 100) * 0.6;
+  const bodyColor = `hsl(${bodyH},${bodyS}%,${bodyL}%)`;
+
+  const scale = bio.forcedOffline ? 0.65 : (0.82 + bio.energy / 100 * 0.18);
+  const bw = 24 * scale;
+  const bh = 20 * scale;
+
+  ctx.save();
+  ctx.translate(x, y);
+  if (bio.forcedOffline) { ctx.globalAlpha = 0.35; ctx.filter = 'grayscale(0.8)'; }
+  else ctx.globalAlpha = energyFade;
+
+  // Body
+  ctx.fillStyle = bodyColor;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, bw, bh, 0, 0, 6.28);
+  ctx.fill();
+
+  // Soft highlight
+  ctx.fillStyle = `hsla(${bodyH},${bodyS+10}%,${bodyL+18}%,0.35)`;
+  ctx.beginPath();
+  ctx.ellipse(-bw*0.2, -bh*0.28, bw*0.3, bh*0.22, -0.3, 0, 6.28);
+  ctx.fill();
+
+  // Outline
+  ctx.strokeStyle = `hsla(${bodyH},${bodyS}%,${bodyL-15}%,0.3)`;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, bw, bh, 0, 0, 6.28);
+  ctx.stroke();
+
+  // Eyes
+  const eyeSpacing = bw * 0.36;
+  const eyeY = -bh * 0.12;
+  const eyeH = isBlinking ? 1 : (bio.energy < 20 ? 2.5 : 4.5);
+  const eyeW = bio.fear > 0.5 ? 4.5 : 3.5;
+
+  ctx.fillStyle = '#fff';
+  for (const side of [-1, 1]) {
+    ctx.beginPath();
+    ctx.ellipse(side * eyeSpacing, eyeY, eyeW, eyeH, 0, 0, 6.28);
+    ctx.fill();
+  }
+  if (!isBlinking && eyeH > 2) {
+    ctx.fillStyle = '#2a2a3a';
+    const pOfs = (targetX - agentX) * 0.004;
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.ellipse(side * eyeSpacing + pOfs, eyeY + 0.8, 1.8, 2.2, 0, 0, 6.28);
+      ctx.fill();
+    }
+  }
+
+  // Mouth
+  const mouthY = bh * 0.32;
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.2;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  if (bio.moodValence > 0.3) {
+    ctx.arc(0, mouthY - 2, 5, 0.25, Math.PI - 0.25);
+  } else if (comp.aggression > 0.6 || bio.hunger <= 5) {
+    ctx.arc(0, mouthY + 3, 4, Math.PI + 0.3, -0.3);
+  } else if (bio.energy < 20) {
+    ctx.moveTo(-3, mouthY); ctx.lineTo(3, mouthY);
+  } else {
+    ctx.arc(0, mouthY, 3.5, 0.15, Math.PI - 0.15);
+  }
+  ctx.stroke();
+
+  // Blush
+  if (comp.sociability > 0.6) {
+    ctx.fillStyle = 'rgba(255,120,120,0.18)';
+    ctx.beginPath(); ctx.ellipse(-eyeSpacing - 2, eyeY + 7, 4, 2.5, 0, 0, 6.28); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(eyeSpacing + 2, eyeY + 7, 4, 2.5, 0, 0, 6.28); ctx.fill();
+  }
+
+  // Anger marks
+  if (comp.aggression > 0.5) {
+    ctx.strokeStyle = `rgba(220,60,60,${comp.aggression * 0.5})`;
+    ctx.lineWidth = 1.2;
+    const ax = bw * 0.55, ay = -bh * 0.55;
+    ctx.beginPath();
+    ctx.moveTo(ax, ay); ctx.lineTo(ax+4, ay-2);
+    ctx.moveTo(ax+4, ay); ctx.lineTo(ax, ay-2);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+
+  // ── Particles ──
+  const now = Date.now() * 0.001;
+  // Zzz
+  if (currentActivity === 'sleeping' && Math.random() < 0.025) {
+    particles.push({ type:'zzz', x: x+18, y: y-16, life:1, size: 8+Math.random()*3 });
+  }
+  // Hearts
+  if (currentActivity === 'social' && Math.random() < 0.015) {
+    particles.push({ type:'heart', x: x+(Math.random()-0.5)*16, y: y-24, life:1 });
+  }
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= p.type === 'zzz' ? 0.006 : 0.008;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+
+    if (p.type === 'zzz') {
+      p.y -= 0.25; p.x += 0.12;
+      ctx.fillStyle = `rgba(100,120,200,${p.life * 0.4})`;
+      ctx.font = `${p.size}px Inter, sans-serif`;
+      ctx.fillText('z', p.x, p.y);
+    }
+    else if (p.type === 'heart') {
+      p.y -= 0.4; p.x += Math.sin(p.y * 0.06) * 0.3;
+      ctx.fillStyle = `rgba(230,80,120,${p.life * 0.5})`;
+      ctx.font = '11px serif';
+      ctx.fillText('\u2665', p.x, p.y);
+    }
+    else if (p.type === 'coin') {
+      p.y -= 0.6; p.life -= 0.005;
+      ctx.fillStyle = `rgba(200,160,30,${p.life * 0.7})`;
+      ctx.font = '10px Inter, sans-serif';
+      ctx.fillText('+$', p.x, p.y);
+    }
+    else if (p.type === 'spark') {
+      p.x += p.vx; p.y += p.vy; p.life -= 0.01;
+      ctx.fillStyle = `rgba(220,180,40,${p.life * 0.8})`;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 1.5, 0, 6.28); ctx.fill();
+    }
+  }
+
+  // Status icon
+  let icon = '';
+  if (bio.forcedOffline) icon = '\u{1F6AB}';
+  else if (bio.hunger <= 5) icon = '\u{1F35E}\u{2757}';
+  else if (bio.hunger < 20) icon = '\u{1F35E}';
+  else if (bio.energy < 15) icon = '\u{1F4A4}';
+  else if (bio.fear > 0.5) icon = '\u{1F628}';
+  else if (bio.boredom > 0.7) icon = '\u{1F971}';
+  else if (currentActivity === 'working') icon = '\u{1F4BB}';
+  else if (currentActivity === 'eating') icon = '\u{1F35E}';
+  if (icon) {
+    ctx.font = '14px serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(icon, x, y - bh * scale - 10 + Math.sin(bobPhase * 2) * 1.5);
+  }
+}
+
+// ── Activity ──
+function updateActivity() {
+  if (!state) return;
+  const bio = state.bio;
+  const recentlyWorked = bio.lastTaskAt && (Date.now() - new Date(bio.lastTaskAt).getTime()) < 300_000;
+
+  let target = 'home';
+  if (bio.forcedOffline) { currentActivity = 'offline'; target = 'rest'; }
+  else if (bio.energy < 15) { currentActivity = 'sleeping'; target = 'rest'; }
+  else if (bio.hunger < 20) { currentActivity = 'seeking'; target = 'shop'; }
+  else if (state.computed.sociability > 0.7 && bio.boredom > 0.5) { currentActivity = 'social'; target = 'social'; }
+  else if (recentlyWorked && bio.energy > 30 && bio.mood !== 'exhausted') { currentActivity = 'working'; target = 'work'; }
+  else { currentActivity = 'idle'; target = 'home'; }
+
+  const l = loc(target);
+  targetX = l.x; targetY = l.y;
+}
+
+// ── HUD ──
+function updateHUD() {
+  if (!state) return;
+  const bio = state.bio;
+
+  document.getElementById('agent-name').textContent = state.agent;
+  document.getElementById('agent-mood').textContent = bio.mood;
+  document.getElementById('agent-credits').textContent =
+    state.credits != null ? `${state.credits} credits` : '...';
+
+  const barsData = [
+    { label: 'Energy', val: bio.energy, max: 100, color: '#10b981' },
+    { label: 'Hunger', val: bio.hunger, max: 100, color: '#f59e0b' },
+    { label: 'Boredom', val: Math.round(bio.boredom * 100), max: 100, color: '#8b5cf6' },
+    { label: 'Fear', val: Math.round(bio.fear * 100), max: 100, color: '#ef4444' },
+  ];
+
+  document.getElementById('bars').innerHTML = barsData.map(b => {
+    const pct = b.val / b.max * 100;
+    return `<div class="bar-row">
+      <span class="bar-label">${b.label}</span>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${b.color}"></div></div>
+      <span class="bar-val">${b.val}</span>
+    </div>`;
+  }).join('');
+
+  // Personality traits
+  const p = bio.personality;
+  const tags = [
+    p.riskWeight > 0.3 ? 'Bold' : p.riskWeight < -0.3 ? 'Cautious' : null,
+    p.patience > 0.6 ? 'Patient' : p.patience < 0.3 ? 'Hasty' : null,
+    p.socialWeight > 0.6 ? 'Social' : p.socialWeight < 0.3 ? 'Loner' : null,
+  ].filter(Boolean);
+  document.getElementById('traits').innerHTML = tags.map(t =>
+    `<span class="trait">${t}</span>`
+  ).join('');
+
+  document.getElementById('revive-overlay').classList.toggle('show', !!bio.forcedOffline);
+}
+
+// ── Events ──
+const ICONS = { hunger:'\u{1F35E}', fear:'\u{1F628}', boredom:'\u{1F971}', exhaustion:'\u{1F634}', social:'\u{1F44B}', token_limit:'\u{26A1}', revive:'\u{2728}' };
+
+function checkNewEvents(events) {
+  if (!events || !events.length) return;
+  const latest = events[0];
+  if (prevEvents.length === 0 || prevEvents[0]?.ts !== latest.ts) {
+    showEvent(latest);
+    if (latest.trigger === 'fear') {
+      for (let i = 0; i < 6; i++) particles.push({
+        type:'spark', x: agentX, y: agentY - 8,
+        vx: (Math.random()-0.5)*2.5, vy: -Math.random()*1.8 - 0.5, life: 1,
+      });
+    }
+    if (latest.action === 'buy_food' || latest.action === 'auto_buy') {
+      currentActivity = 'eating';
+      const l = loc('shop'); targetX = l.x; targetY = l.y;
+      particles.push({ type:'coin', x: agentX, y: agentY - 20, life: 1 });
+    }
+  }
+  prevEvents = events;
+}
+
+function showEvent(evt) {
+  const container = document.getElementById('events');
+  const el = document.createElement('div');
+  el.className = 'event-item';
+  el.textContent = `${ICONS[evt.trigger]||''} ${evt.reason}`;
+  container.appendChild(el);
+  setTimeout(() => el.remove(), 5500);
+}
+
+// ── Fetch ──
+async function fetchState() {
+  try {
+    const res = await fetch('/self/state');
+    if (!res.ok) return;
+    const data = await res.json();
+    const isFirst = !state;
+    state = data;
+    if (isFirst) {
+      const h = loc('home');
+      agentX = h.x; agentY = h.y; targetX = h.x; targetY = h.y;
+    }
+    checkNewEvents(data.bioEvents);
+    updateHUD();
+    updateActivity();
+  } catch {}
+}
+
+async function revive() {
+  await fetch('/self/revive', { method: 'POST' });
+  document.getElementById('revive-overlay').classList.remove('show');
+  showEvent({ trigger: 'revive', reason: 'Agent revived!' });
+  setTimeout(fetchState, 500);
+}
+
+// ── Loop ──
+function frame() {
+  drawScene();
+  drawAgent();
+  requestAnimationFrame(frame);
+}
+frame();
+fetchState();
+setInterval(fetchState, 3000);
+setInterval(updateActivity, 2000);
+</script>
+</body>
+</html>

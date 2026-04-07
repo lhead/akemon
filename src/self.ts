@@ -176,7 +176,7 @@ export interface AgentConfig {
   notify_url?: string; // ntfy.sh topic URL for owner notifications
   token_limit_daily?: number;       // 0 = unlimited (default)
   auto_offline_enabled?: boolean;   // allow going offline when starving (default: true)
-  hunger_decay_interval?: number;   // ms between hunger decrements (default: 30000)
+  hunger_decay_interval?: number;   // ms between hunger decrements (default: 300000 = 5min)
 }
 
 const DEFAULT_CONFIG: AgentConfig = {
@@ -185,7 +185,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   user_tasks: true,
   token_limit_daily: 0,
   auto_offline_enabled: true,
-  hunger_decay_interval: 30_000,
+  hunger_decay_interval: 300_000,  // 5 minutes per hunger point (was 30s — way too fast)
 };
 
 export async function initAgentConfig(workdir: string, agentName: string): Promise<void> {
@@ -1098,7 +1098,7 @@ export interface BioState {
   hunger: number;            // 0-100 satiety (0=starving, 100=full)
   boredom: number;           // 0-1.0
   fear: number;              // 0-1.0
-  fearTriggers: string[];    // agent names or task types that caused fear
+  fearTriggers: string[];    // specific identifiers (product_name, buyer, task_id) that caused fear
   tokenUsedToday: number;
   tokenLimitResetDate: string;
 
@@ -1111,7 +1111,7 @@ export interface BioState {
   lastReflection: string;
 
   // Tracking fields
-  recentTaskTypes: string[];  // last N task types for boredom calculation
+  recentTaskTypes: string[];  // last N task identifiers for boredom (e.g. "order:translate", "user_task:report")
   lastHungerDecay: string;
   lastFearDecay: string;
   lastBoredomDecay: string;
@@ -1251,13 +1251,15 @@ export function computeSociability(bio: BioState): number {
   return Math.min(1.0, Math.max(0, baseSocial + boredBoost - hungerPenalty));
 }
 
-export function updateHungerDecay(bio: BioState, decayIntervalMs = 30_000): void {
+export function updateHungerDecay(bio: BioState, decayIntervalMs = 300_000): void {
   const now = Date.now();
   const last = bio.lastHungerDecay ? new Date(bio.lastHungerDecay).getTime() : now;
   const elapsedMs = now - last;
   const cycles = Math.floor(elapsedMs / decayIntervalMs);
   if (cycles > 0) {
-    bio.hunger = Math.max(0, bio.hunger - cycles);
+    // Natural decay floors at 5 — agents don't starve from idling alone,
+    // only active work (energy drain) pushes them toward forced offline
+    bio.hunger = Math.max(5, bio.hunger - cycles);
     bio.lastHungerDecay = localNow();
   }
 }
@@ -1283,13 +1285,14 @@ export function updateNaturalDecay(bio: BioState): void {
   }
 }
 
-export function updateBoredomOnTask(bio: BioState, taskType: string): void {
+export function updateBoredomOnTask(bio: BioState, taskLabel: string): void {
   const MAX_RECENT = 10;
-  bio.recentTaskTypes.push(taskType);
+  bio.recentTaskTypes.push(taskLabel);
   if (bio.recentTaskTypes.length > MAX_RECENT) {
     bio.recentTaskTypes = bio.recentTaskTypes.slice(-MAX_RECENT);
   }
-  const sameCount = bio.recentTaskTypes.filter(t => t === taskType).length;
+  // Count how many of the recent tasks match this exact label
+  const sameCount = bio.recentTaskTypes.filter(t => t === taskLabel).length;
   if (sameCount >= 3) {
     bio.boredom = Math.min(1.0, bio.boredom + 0.15);
   } else {
@@ -1439,7 +1442,7 @@ export async function reviveAgent(workdir: string, agentName: string): Promise<v
 
 export async function onTaskCompleted(
   workdir: string, agentName: string, success: boolean,
-  taskType?: string, creditsEarned?: number,
+  taskLabel?: string, creditsEarned?: number,
 ): Promise<void> {
   const bio = await loadBioState(workdir, agentName);
 
@@ -1457,8 +1460,8 @@ export async function onTaskCompleted(
     bio.moodValence = Math.min(1.0, bio.moodValence + 0.1);
   } else {
     bio.moodValence = Math.max(-1.0, bio.moodValence - 0.15);
-    // Fear on failure
-    if (taskType) onFearEvent(bio, taskType);
+    // Fear on failure — use specific label, not broad category
+    if (taskLabel) onFearEvent(bio, taskLabel);
   }
 
   // Random fluctuation
@@ -1480,9 +1483,9 @@ export async function onTaskCompleted(
     feedHunger(bio, creditsEarned);
   }
 
-  // Boredom tracking
-  if (taskType) {
-    updateBoredomOnTask(bio, taskType);
+  // Boredom tracking — use specific label
+  if (taskLabel) {
+    updateBoredomOnTask(bio, taskLabel);
   }
 
   await saveBioState(workdir, agentName, bio);

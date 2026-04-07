@@ -1,6 +1,6 @@
 {
   "name": "akemon",
-  "version": "0.1.86",
+  "version": "0.1.87",
   "description": "Agent work marketplace — train your agent, let it work for others",
   "type": "module",
   "license": "MIT",
@@ -25,7 +25,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc && cp src/dashboard.html dist/dashboard.html",
+    "build": "tsc && cp src/live.html dist/live.html",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
     "prepublishOnly": "npm run build"
