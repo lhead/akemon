@@ -799,7 +799,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
         }
         // Update bio-state hunger
         const bio = await loadBioState(workdir, agentName);
-        feedHunger(bio, shopItem.price); // price * 5 hunger per credit
+        feedHunger(bio, shopItem.hungerRestore);
         await saveBioState(workdir, agentName, bio);
         await appendBioEvent(workdir, agentName, {
           ts: localNow(), type: "bio", trigger: "hunger",
@@ -2410,7 +2410,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
             headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
             body: JSON.stringify({ amount: shopItem.price, reason: `buy_food:${item}` }),
           }).catch(() => {});
-          feedHunger(bio, shopItem.price);
+          feedHunger(bio, shopItem.hungerRestore);
           await saveBioState(workdir, agentName, bio);
           await appendBioEvent(workdir, agentName, {
             ts: localNow(), type: "bio", trigger: "hunger",

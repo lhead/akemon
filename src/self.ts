@@ -1310,8 +1310,8 @@ export function onFearEvent(bio: BioState, trigger: string): void {
   }
 }
 
-export function feedHunger(bio: BioState, creditsEarned: number): void {
-  bio.hunger = Math.min(100, bio.hunger + creditsEarned * 5);
+export function feedHunger(bio: BioState, hungerAmount: number): void {
+  bio.hunger = Math.min(100, bio.hunger + hungerAmount);
 }
 
 export function resetTokenCountIfNewDay(bio: BioState): void {
@@ -1514,9 +1514,9 @@ export async function onTaskCompleted(
   // Low energy override
   if (bio.energy < 20) bio.mood = "exhausted";
 
-  // Feed hunger from credits earned
+  // Feed hunger from credits earned (5 hunger per credit — earning income satisfies hunger)
   if (creditsEarned && creditsEarned > 0) {
-    feedHunger(bio, creditsEarned);
+    feedHunger(bio, creditsEarned * 5);
   }
 
   // Boredom tracking — use specific label
