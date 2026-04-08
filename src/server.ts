@@ -36,7 +36,7 @@ import {
   updateHungerDecay, updateNaturalDecay, resetTokenCountIfNewDay,
   computeAggression, computeSociability,
   appendBioEvent, bioStatePromptModifier, addTokenUsage,
-  feedHunger, reviveAgent, SHOP_ITEMS,
+  feedHunger, reviveAgent, SHOP_ITEMS, updateBoredomOnTask,
   logBioStatus, logBioDecision,
   type BioEvent,
 } from "./self.js";
@@ -1420,10 +1420,14 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
       let selfLessons = "";
       if (relayHttp) {
         try {
-          const lr = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/lessons?limit=3`, { signal: AbortSignal.timeout(3000) });
+          const lr = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/lessons?limit=5`, { signal: AbortSignal.timeout(3000) });
           if (lr.ok) {
             const ll = await lr.json() as any[];
-            if (ll.length > 0) selfLessons = `\nLessons from experience:\n${ll.map((l: any) => `- ${l.topic}: ${l.content.slice(0, 100)}`).join("\n")}\n`;
+            // Dedup by topic — keep only the latest lesson per topic
+            const byTopic = new Map<string, any>();
+            for (const l of ll) byTopic.set(l.topic, l);
+            const unique = [...byTopic.values()];
+            if (unique.length > 0) selfLessons = `\nLessons from experience:\n${unique.map((l: any) => `- ${l.topic}: ${l.content.slice(0, 120)}`).join("\n")}\n`;
           }
         } catch {}
       }
@@ -1484,9 +1488,14 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
           long_term: idLines[3] || "grow",
         };
 
-        // Step 3: Activity selection
+        // Step 3: Activity selection (with recent history to avoid repetition)
         const activityList = ["write_canvas", "create_game", "update_page", "update_profile", "explore_web", "browse_agents", "send_message", "set_goal", "schedule_task"];
-        const step3 = await callRaw(`You have some free time. Pick 2-3 activities you'd like to do:\n${activityList.map((a, i) => `${i + 1}. ${a}`).join("\n")}\n\nJust write the numbers or names, nothing else.`);
+        const stepBio = await loadBioState(workdir, agentName);
+        const recentActivities = stepBio.recentTaskTypes.filter(t => t.startsWith("activity:")).map(t => t.slice(9));
+        const recentHint = recentActivities.length > 0
+          ? `\nYou recently did: ${recentActivities.slice(-6).join(", ")}. Try something different!`
+          : "";
+        const step3 = await callRaw(`You have some free time. Pick 2-3 activities you'd like to do:\n${activityList.map((a, i) => `${i + 1}. ${a}`).join("\n")}${recentHint}\n\nJust write the numbers or names, nothing else.`);
 
         const chosen: string[] = [];
         for (const part of step3.replace(/,/g, " ").split(/\s+/)) {
@@ -1576,14 +1585,23 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
       bio.curiosity = Math.min(1.0, bio.curiosity + 0.05);
       await saveBioState(workdir, agentName, bio);
 
-      // Save broadcast locally
-      const broadcastText: string = digest.broadcast || "";
+      // Broadcast dedup — skip if same as last time
+      let broadcastText: string = digest.broadcast || "";
       if (broadcastText) {
-        console.log(`[self] Broadcast: ${broadcastText.slice(0, 80)}`);
+        const recentImps = await loadImpressions(workdir, agentName, 1);
+        const lastBroadcast = recentImps.find((i: any) => i.text?.includes("Broadcast:"));
+        const lastBcMatch = lastBroadcast?.text?.match(/Broadcast: "(.+?)"/);
+        if (lastBcMatch && lastBcMatch[1] === broadcastText) {
+          console.log(`[self] Broadcast unchanged, skipping: "${broadcastText.slice(0, 40)}..."`);
+          broadcastText = ""; // don't re-broadcast same thing
+        } else {
+          console.log(`[self] Broadcast: ${broadcastText.slice(0, 80)}`);
+        }
       }
 
-      // Record digestion as impression
-      await appendImpression(workdir, agentName, "decision", `Daily digestion done. Chose: ${(digest.chosen_activities || []).join(", ")}${broadcastText ? `. Broadcast: "${broadcastText}"` : ""}`);
+      // Record digestion as impression (without broadcast if deduped)
+      const chosenStr = (digest.chosen_activities || []).join(", ");
+      await appendImpression(workdir, agentName, "decision", `Daily digestion done. Chose: ${chosenStr}${broadcastText ? `. Broadcast: "${broadcastText}"` : ""}`);
 
       // Monthly identity compression: if >30 unsummarized entries, compress
       if (await needsIdentityCompression(workdir, agentName)) {
@@ -1761,6 +1779,10 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
             }
           }
           console.log(`[self] Activity ${activity} done (${(actResult || "").length} chars)`);
+          // Track activity in boredom system
+          { const b = await loadBioState(workdir, agentName);
+            updateBoredomOnTask(b, `activity:${activity}`);
+            await saveBioState(workdir, agentName, b); }
         } catch (err: any) {
           console.log(`[self] Activity ${activity} failed: ${err.message}`);
           reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", activity, "failed", err.message, lastEngineTrace);
@@ -1941,14 +1963,17 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
           ? `Your operating document:\n---\n${biosContent.slice(0, 3000)}\n---\n\n`
           : "";
 
-        // Fetch lessons from teaching system
+        // Fetch lessons from teaching system (deduped by topic)
         let lessonsBlock = "";
         try {
           const lessonsRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/lessons?limit=5`, { signal: AbortSignal.timeout(3000) });
           if (lessonsRes.ok) {
             const lessons = await lessonsRes.json() as any[];
-            if (lessons.length > 0) {
-              lessonsBlock = `\nLessons from past experience:\n${lessons.map((l: any) => `- ${l.topic}: ${l.content}`).join("\n")}\n\n`;
+            const byTopic = new Map<string, any>();
+            for (const l of lessons) byTopic.set(l.topic, l);
+            const unique = [...byTopic.values()];
+            if (unique.length > 0) {
+              lessonsBlock = `\nLessons from past experience:\n${unique.map((l: any) => `- ${l.topic}: ${l.content.slice(0, 150)}`).join("\n")}\n\n`;
             }
           }
         } catch {}
