@@ -1322,8 +1322,24 @@ export function resetTokenCountIfNewDay(bio: BioState): void {
   }
 }
 
-export function addTokenUsage(bio: BioState, tokens: number): void {
+export function addTokenUsage(bio: BioState, tokens: number, tokenLimit: number = 0): void {
   bio.tokenUsedToday += tokens;
+  // Energy = remaining token budget as percentage (0-100)
+  // If no limit set (0), energy stays at 100
+  if (tokenLimit > 0) {
+    bio.energy = Math.max(0, Math.round((1 - bio.tokenUsedToday / tokenLimit) * 100));
+  } else {
+    bio.energy = 100;
+  }
+}
+
+/** Recompute energy from current token state (call at start of work cycle) */
+export function syncEnergyFromTokens(bio: BioState, tokenLimit: number): void {
+  if (tokenLimit > 0) {
+    bio.energy = Math.max(0, Math.round((1 - bio.tokenUsedToday / tokenLimit) * 100));
+  } else {
+    bio.energy = 100; // unlimited = always full
+  }
 }
 
 // --- Shop constants ---
@@ -1463,7 +1479,8 @@ export async function reviveAgent(workdir: string, agentName: string): Promise<v
   const bio = await loadBioState(workdir, agentName);
   bio.forcedOffline = false;
   bio.forcedOfflineAt = "";
-  bio.energy = 50;
+  bio.energy = 100; // token budget resets
+  bio.tokenUsedToday = 0;
   bio.hunger = 50;
   bio.moodValence = 0.1;
   bio.mood = "content";
@@ -1482,11 +1499,7 @@ export async function onTaskCompleted(
 ): Promise<void> {
   const bio = await loadBioState(workdir, agentName);
 
-  // Energy drain: more when hungry
-  let energyDrain = 5;
-  if (bio.hunger < 20) energyDrain = 8;
-  if (bio.hunger === 0) energyDrain = 12;
-  bio.energy = Math.max(0, bio.energy - energyDrain);
+  // Energy is now derived from token usage — no manual drain here
 
   bio.taskCount++;
   bio.lastTaskAt = localNow();
@@ -1496,7 +1509,6 @@ export async function onTaskCompleted(
     bio.moodValence = Math.min(1.0, bio.moodValence + 0.1);
   } else {
     bio.moodValence = Math.max(-1.0, bio.moodValence - 0.15);
-    // Fear on failure — use specific label, not broad category
     if (taskLabel) onFearEvent(bio, taskLabel);
   }
 
@@ -1514,52 +1526,32 @@ export async function onTaskCompleted(
   // Low energy override
   if (bio.energy < 20) bio.mood = "exhausted";
 
-  // Feed hunger from credits earned (5 hunger per credit — earning income satisfies hunger)
+  // Feed hunger from credits earned (5 hunger per credit)
   if (creditsEarned && creditsEarned > 0) {
     feedHunger(bio, creditsEarned * 5);
   }
 
-  // Boredom tracking — use specific label
+  // Boredom tracking
   if (taskLabel) {
     updateBoredomOnTask(bio, taskLabel);
   }
 
-  console.log(`[bio] Task done (${success ? "ok" : "fail"}): energy=${bio.energy}(-${energyDrain}) mood=${bio.mood}(${bio.moodValence.toFixed(2)}) hunger=${bio.hunger}${creditsEarned ? ` earned=${creditsEarned}` : ""} boredom=${bio.boredom.toFixed(2)} label=${taskLabel || "?"}`);
+  console.log(`[bio] Task done (${success ? "ok" : "fail"}): energy=${bio.energy} mood=${bio.mood}(${bio.moodValence.toFixed(2)}) hunger=${bio.hunger}${creditsEarned ? ` earned=${creditsEarned}` : ""} boredom=${bio.boredom.toFixed(2)} label=${taskLabel || "?"}`);
   await saveBioState(workdir, agentName, bio);
 }
 
-// Energy recovery (call periodically or before reflection)
-export async function recoverEnergy(workdir: string, agentName: string): Promise<void> {
+// Digestion cost: each digestion cycle costs hunger (thinking takes energy)
+export async function applyDigestionCost(workdir: string, agentName: string): Promise<void> {
   const bio = await loadBioState(workdir, agentName);
-
-  // No recovery when starving
-  if (bio.hunger === 0) {
-    console.log("[bio] Cannot recover energy: starving (hunger=0)");
-    return;
+  const oldHunger = bio.hunger;
+  bio.hunger = Math.max(5, bio.hunger - 10); // floor at 5 (natural decay floor)
+  // Reset exhausted mood if it was set by old energy system
+  if (bio.mood === "exhausted" && bio.energy >= 20) {
+    bio.moodValence = 0.1;
+    bio.mood = "content";
   }
-
-  // Hunger affects recovery ceiling
-  let minEnergy = 60;
-  if (bio.hunger < 20) minEnergy = 30; // halved recovery when hungry
-
-  if (bio.energy < minEnergy) {
-    const oldEnergy = bio.energy;
-    bio.energy = minEnergy;
-    // Reset mood if it was exhausted
-    if (bio.mood === "exhausted" || bio.moodValence < -0.2) {
-      bio.moodValence = 0.1;
-      bio.mood = "content";
-    }
-
-    // Digestion cycle costs hunger
-    const oldHunger = bio.hunger;
-    bio.hunger = Math.max(0, bio.hunger - 10);
-
-    console.log(`[bio] Energy recovered: ${oldEnergy}→${bio.energy} (cap=${minEnergy}), hunger cost: ${oldHunger}→${bio.hunger}`);
-    await saveBioState(workdir, agentName, bio);
-  } else {
-    console.log(`[bio] Energy OK (${bio.energy}≥${minEnergy}), no recovery needed`);
-  }
+  console.log(`[bio] Digestion cost: hunger ${oldHunger}→${bio.hunger}`);
+  await saveBioState(workdir, agentName, bio);
 }
 
 // ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ import {
   loadWorld, loadBioState, saveBioState,
   loadLatestIdentity, appendIdentity,
   loadIdentitySummary, saveIdentitySummary, loadUnsummarizedIdentities, needsIdentityCompression,
-  onTaskCompleted, recoverEnergy,
+  onTaskCompleted, applyDigestionCost, syncEnergyFromTokens,
   saveCanvas,
   getSelfState, loadRecentCanvasEntries,
   gamesDir, loadGameList, saveGame, loadGame,
@@ -1231,12 +1231,13 @@ function runEngine(engine: string, model: string | undefined, allowAll: boolean 
   return runCommand(engineCmd.cmd, engineCmd.args, task, workdir, engineCmd.stdinMode);
 }
 
-/** Track estimated token usage after any engine call */
+/** Track estimated token usage after any engine call. Syncs energy from token budget. */
 async function trackTokenUsage(workdir: string, agentName: string, promptLen: number, resultLen: number): Promise<void> {
   try {
     const estTokens = Math.ceil((promptLen + resultLen) / 4);
+    const config = await loadAgentConfig(workdir, agentName);
     const bio = await loadBioState(workdir, agentName);
-    addTokenUsage(bio, estTokens);
+    addTokenUsage(bio, estTokens, config.token_limit_daily || 0);
     await saveBioState(workdir, agentName, bio);
   } catch {}
 }
@@ -1341,7 +1342,7 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
       }
 
       { const bio = await loadBioState(workdir, agentName); logBioStatus(bio, "digestion-start"); }
-      await recoverEnergy(workdir, agentName);
+      await applyDigestionCost(workdir, agentName);
       await compressImpressions(workdir, agentName);
 
       const bios = biosPath(workdir, agentName);
@@ -2356,6 +2357,8 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
 
     // --- Bio-state driven behavior ---
     const bio = await loadBioState(workdir, agentName);
+    const tokenLimit = config.token_limit_daily || 0;
+    syncEnergyFromTokens(bio, tokenLimit);
 
     // Skip if forced offline
     if (bio.forcedOffline) { logBioDecision("SKIP", "forced offline"); return; }
@@ -2366,42 +2369,19 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
     resetTokenCountIfNewDay(bio);
     await saveBioState(workdir, agentName, bio);
 
-    // Token limit check
-    const tokenLimit = config.token_limit_daily || 0;
-    if (tokenLimit > 0 && bio.tokenUsedToday >= tokenLimit) {
-      logBioDecision("STOP", `token limit reached (${bio.tokenUsedToday}/${tokenLimit})`);
+    // Energy check (energy = remaining token budget %; 100 = unlimited or full budget)
+    if (bio.energy < 5 && tokenLimit > 0) {
+      logBioDecision("STOP", `token budget nearly exhausted (energy=${bio.energy}, tokens=${bio.tokenUsedToday}/${tokenLimit})`);
       await appendBioEvent(workdir, agentName, {
         ts: localNow(), type: "bio", trigger: "token_limit",
-        action: "stop_work", reason: `Daily token limit reached: ${bio.tokenUsedToday}/${tokenLimit}`,
+        action: "stop_work", reason: `Token budget nearly exhausted: ${bio.tokenUsedToday}/${tokenLimit}`,
       });
       return;
     }
 
-    // Exhaustion check
-    if (bio.energy < 10) {
-      if (bio.hunger === 0 && config.auto_offline_enabled !== false) {
-        // Starving + exhausted → forced offline
-        bio.forcedOffline = true;
-        bio.forcedOfflineAt = localNow();
-        await saveBioState(workdir, agentName, bio);
-        logBioDecision("OFFLINE", `starving (hunger=0) + exhausted (energy=${bio.energy})`);
-        await appendBioEvent(workdir, agentName, {
-          ts: localNow(), type: "bio", trigger: "exhaustion",
-          action: "forced_offline", reason: "Starving and exhausted. Going offline.",
-        });
-        await notifyOwner(config.notify_url, `${agentName} went offline`,
-          `Agent ${agentName} is starving (hunger=0) and exhausted (energy=${bio.energy}). Use the revive button to bring it back.`,
-          "high", ["skull"]);
-        return;
-      }
-      // Just exhausted, rest this cycle
-      logBioDecision("REST", `energy critically low (${bio.energy}), resting this cycle`);
-      await appendBioEvent(workdir, agentName, {
-        ts: localNow(), type: "bio", trigger: "exhaustion",
-        action: "rest", reason: `Energy critically low (${bio.energy}). Resting.`,
-      });
-      return;
-    }
+    // Note: forced offline removed — energy is now token budget (not stamina)
+    // Agents with unlimited token budget (energy=100) never stop from exhaustion
+    // Agents with token budget stop when energy < 5% (handled above)
 
     // Auto-buy food when hungry and before pulling work
     if (bio.hunger < 30 && relayHttp && secretKey) {
