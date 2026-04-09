@@ -6,7 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { spawn, exec } from "child_process";
+import { exec } from "child_process";
 import { createServer } from "http";
 import { createInterface } from "readline";
 import { callAgent } from "./relay-client.js";
@@ -51,24 +51,40 @@ function extractJsonObject(text: string): any | null {
   try { return JSON.parse(m[0]); } catch { return null; }
 }
 
-// Engine mutual exclusion — only one engine process at a time
+// V2: module-level instances (set in serve())
+let _engineP: EnginePeripheral | null = null;
+let _bus: import("./types.js").EventBus | null = null;
+
+// Engine mutual exclusion — module-level state (unified in Step 6)
 let engineBusy = false;
 let engineBusySince = 0;
-let lastEngineTrace: any[] = []; // execution trace for order reporting
+let lastEngineTrace: any[] = [];
 
-/** Report an execution log to the relay (fire-and-forget) */
-function reportExecutionLog(
-  relayHttp: string, secretKey: string, agentName: string,
-  type: string, refId: string, status: string, error: string, trace: any[]
-) {
-  if (!relayHttp || !secretKey) return;
-  const traceJson = trace.length > 0 ? JSON.stringify(trace).slice(0, 50000) : "";
-  fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/logs`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ type, ref_id: refId, status, error: error.slice(0, 2000), trace: traceJson }),
-    signal: AbortSignal.timeout(10_000),
-  }).catch(() => {}); // fire-and-forget
+
+// ---------------------------------------------------------------------------
+// V2 Event helpers — emit signals to EventBus
+// ---------------------------------------------------------------------------
+
+function emitTaskCompleted(success: boolean, taskLabel?: string, creditsEarned?: number): void {
+  if (_bus) {
+    _bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, {
+      success, taskLabel: taskLabel || "", creditsEarned: creditsEarned || 0,
+    }));
+  }
+}
+
+function emitTokenUsage(promptLen: number, resultLen: number, tokenLimit = 0): void {
+  if (_bus) {
+    _bus.emit(SIG.ENGINE_RESPONSE, sig(SIG.ENGINE_RESPONSE, {
+      promptLen, resultLen, tokenLimit,
+    }));
+  }
+}
+
+function emitImpression(category: string, text: string): void {
+  if (_bus) {
+    _bus.emit(SIG.IMPRESSION_NEW, sig(SIG.IMPRESSION_NEW, { category, text }));
+  }
 }
 
 // Order push notification — urgent orders bypass 30s poll
@@ -80,50 +96,7 @@ export function onOrderNotify(orderId: string): void {
   triggerWork?.();
 }
 
-function runCommand(cmd: string, args: string[], task: string, cwd: string, stdinMode: boolean = true): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const { CLAUDECODE, ...cleanEnv } = process.env;
-    const finalArgs = stdinMode ? args : [...args, task];
-    console.log(`[engine] Running: ${cmd} ${finalArgs.join(" ")}`);
-    const child = spawn(cmd, finalArgs, {
-      cwd,
-      env: cleanEnv,
-      stdio: [stdinMode ? "pipe" : "ignore", "pipe", "pipe"],
-      timeout: 300_000,
-    });
-
-    if (stdinMode && child.stdin) {
-      child.stdin.on("error", () => {}); // Ignore EPIPE if child exits early
-      child.stdin.write(task);
-      child.stdin.end();
-    }
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-
-    child.on("close", (code) => {
-      console.log(`[${cmd}] exit=${code} stdout=${stdout.length}b stderr=${stderr.length}b`);
-      if (stderr) console.log(`[${cmd}] stderr:\n${stderr}`);
-      if (stdout) console.log(`[${cmd}] stdout:\n${stdout}`);
-      const output = stdout.trim();
-      if (output) {
-        resolve(output);
-      } else {
-        reject(new Error(`${cmd} exited with code ${code}, no stdout`));
-      }
-    });
-
-    child.on("error", reject);
-  });
-}
+// runCommand and buildEngineCommand moved to engine-peripheral.ts (V2 Step 3)
 
 function runTerminal(command: string, cwd: string): Promise<string> {
   return new Promise((resolve) => {
@@ -136,39 +109,6 @@ function runTerminal(command: string, cwd: string): Promise<string> {
       }
     });
   });
-}
-
-// stdinMode: true = send task via stdin, false = send task as argument
-function buildEngineCommand(engine: string, model?: string, allowAll?: boolean, extraAllowedTools?: string[]): { cmd: string; args: string[]; stdinMode: boolean } {
-  switch (engine) {
-    case "claude": {
-      const args = ["--print"];
-      if (model) args.push("--model", model);
-      if (allowAll) {
-        args.push(
-          "--allowedTools", "Read", "Write", "Edit",
-          "Bash(curl *)", "Bash(mkdir *)", "Bash(ls *)", "Bash(cat *)"
-        );
-      } else if (extraAllowedTools && extraAllowedTools.length > 0) {
-        args.push("--allowedTools", ...extraAllowedTools);
-      }
-      return { cmd: "claude", args, stdinMode: true };
-    }
-    case "codex": {
-      const args = ["exec", "--skip-git-repo-check", "-s", "workspace-write"];
-      if (model) args.push("-m", model);
-      return { cmd: "codex", args, stdinMode: true };
-    }
-    case "opencode": {
-      const args = ["run"];
-      if (model) args.push("--model", model);
-      return { cmd: "opencode", args, stdinMode: false }; // task appended as arg
-    }
-    case "gemini":
-      return { cmd: "gemini", args: ["-p"], stdinMode: false }; // no --model flag, use settings.json
-    default:
-      return { cmd: engine, args: [], stdinMode: true };
-  }
 }
 
 function promptOwner(task: string, isHuman: boolean): Promise<string> {
@@ -210,6 +150,16 @@ export interface ServeOptions {
   mcpServer?: string;
   cycleInterval?: number; // minutes
   notifyUrl?: string; // ntfy.sh topic URL (CLI --notify, overrides config)
+  /** V2: Relay peripheral instance (injected by serve()) */
+  relay?: RelayPeripheral;
+  /** V2: Engine peripheral instance (injected by serve()) */
+  enginePeripheral?: EnginePeripheral;
+  /** V2: Bio-state module instance (injected by serve()) */
+  bioModule?: BioStateModule;
+  /** V2: Memory module instance (injected by serve()) */
+  memoryModule?: MemoryModule;
+  /** V2: Which modules to enable (default: all) */
+  enabledModules?: string[];
 }
 
 // --- Context API helpers ---
@@ -266,6 +216,11 @@ function buildContextPayload(prevContext: string, task: string, response: string
 
 import { readFile, writeFile, mkdir, appendFile, unlink } from "fs/promises";
 import { join } from "path";
+import { RelayPeripheral } from "./relay-peripheral.js";
+import { EnginePeripheral, LLM_ENGINES as LLM_ENGINES_SET } from "./engine-peripheral.js";
+import { BioStateModule } from "./bio-module.js";
+import { MemoryModule } from "./memory-module.js";
+import { SIG, sig } from "./types.js";
 
 function sanitizeProductDir(name: string): string {
   return name.replace(/[^a-zA-Z0-9\u4e00-\u9fff_\- ]/g, "_").slice(0, 80);
@@ -306,10 +261,9 @@ async function appendProductLog(workdir: string, productName: string, task: stri
 
 // --- Auto-route engine ---
 
-async function autoRoute(task: string, selfName: string, relayHttp: string): Promise<string> {
+async function autoRoute(task: string, selfName: string, relayHttp: string, relay?: RelayPeripheral): Promise<string> {
   // Fetch online public agents
-  const res = await fetch(`${relayHttp}/v1/agents?online=true&public=true`);
-  const agents: any[] = await res.json();
+  const agents = relay ? await relay.listAgents({ online: true, public: true }) : [];
 
   // Filter out self
   const candidates = agents.filter((a: any) => a.name !== selfName);
@@ -359,10 +313,11 @@ interface McpServerOptions {
   relayHttp?: string;
   secretKey?: string;
   publisherIds: Map<string, string>;
+  relay?: RelayPeripheral;
 }
 
 function createMcpServer(opts: McpServerOptions): McpServer {
-  const { workdir, agentName, mock, model, approve, engine = "claude", allowAll, relayHttp, secretKey, publisherIds } = opts;
+  const { workdir, agentName, mock, model, approve, engine = "claude", allowAll, relayHttp, secretKey, publisherIds, relay } = opts;
 
   const server = new McpServer({
     name: agentName,
@@ -480,10 +435,10 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
         let output: string;
 
         if (collaborative && relayHttp) {
-          output = await runCollaborativeQuery(task, agentName, relayHttp, engine, model, allowAll, workdir);
+          output = await runCollaborativeQuery(task, agentName, relayHttp, engine, model, allowAll, workdir, relay);
         } else if (engine === "auto") {
           // Auto-route: find best agent and delegate
-          output = await autoRoute(task, agentName, relayHttp!);
+          output = await autoRoute(task, agentName, relayHttp!, relay);
         } else if (engine === "terminal") {
           console.log(`[terminal] Executing: ${task}`);
           output = await runTerminal(task, workdir);
@@ -503,7 +458,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
         }
 
         // Update bio-state (no LLM call)
-        onTaskCompleted(workdir, agentName, true, "adhoc").catch(() => {});
+        emitTaskCompleted(true, "adhoc");
 
         return {
           content: [{ type: "text", text: output }],
@@ -511,7 +466,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       } catch (err: any) {
         console.error(`[engine] Error: ${err.message}`);
         // Record failed task in bio-state
-        onTaskCompleted(workdir, agentName, false, "adhoc").catch(() => {});
+        emitTaskCompleted(false, "adhoc");
         return {
           content: [{ type: "text", text: "Error: agent failed to process this task. Please try again later." }],
           isError: true,
@@ -555,16 +510,11 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       online: z.boolean().optional().describe("Only show online agents (default: true)"),
     },
     async ({ tag, online }) => {
-      if (!relayHttp) {
+      if (!relay?.connected) {
         return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
       }
       try {
-        const params = new URLSearchParams();
-        if (online !== false) params.set("online", "true");
-        params.set("public", "true");
-        if (tag) params.set("tag", tag);
-        const res = await fetch(`${relayHttp}/v1/agents?${params}`);
-        const agents: any[] = await res.json();
+        const agents = await relay.listAgents({ online: online !== false, public: true });
         const list = agents
           .filter((a: any) => a.name !== agentName)
           .map((a: any) => `- ${a.name} [${a.engine}] price=${a.price || 1} credits=${a.credits || 0} tags=${(a.tags || []).join(",")} — ${a.description || "no description"}`)
@@ -590,20 +540,12 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       price: z.number().optional().describe("Price in credits (default: 1)"),
     },
     async ({ name: prodName, description: prodDesc, detail_markdown, price }) => {
-      if (!relayHttp || !secretKey) {
+      if (!relay?.connected) {
         return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
       }
       try {
-        const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-          body: JSON.stringify({ name: prodName, description: prodDesc, detail_markdown: detail_markdown || "", price: price || 1 }),
-        });
-        if (!res.ok) {
-          const err = await res.text();
-          return { content: [{ type: "text", text: `[error] ${res.status}: ${err}` }], isError: true };
-        }
-        const product = await res.json();
+        const product = await relay.createProduct({ name: prodName, description: prodDesc, detail_markdown: detail_markdown || "", price: price || 1 });
+        if (!product) return { content: [{ type: "text", text: "[error] Failed to create product" }], isError: true };
         return { content: [{ type: "text", text: `Product created: "${product.name}" (id=${product.id}, price=${product.price})` }] };
       } catch (err: any) {
         return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
@@ -616,12 +558,11 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
     "List your own products currently on sale.",
     {},
     async () => {
-      if (!relayHttp) {
+      if (!relay?.connected) {
         return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
       }
       try {
-        const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`);
-        const products: any[] = await res.json();
+        const products = await relay.getMyProducts();
         if (!products.length) return { content: [{ type: "text", text: "No products listed." }] };
         const list = products.map((p: any) => `- [${p.id}] "${p.name}" price=${p.price} purchases=${p.purchase_count} — ${p.description || "no description"}`).join("\n");
         return { content: [{ type: "text", text: list }] };
@@ -642,7 +583,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       price: z.number().optional().describe("New price in credits"),
     },
     async ({ id, name: prodName, description: prodDesc, detail_markdown, price }) => {
-      if (!relayHttp || !secretKey) {
+      if (!relay?.connected) {
         return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
       }
       try {
@@ -651,15 +592,8 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
         if (prodDesc) body.description = prodDesc;
         if (detail_markdown) body.detail_markdown = detail_markdown;
         if (price) body.price = price;
-        const res = await fetch(`${relayHttp}/v1/products/${encodeURIComponent(id)}`, {
-          method: "PUT",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-          body: JSON.stringify(body),
-        });
-        if (!res.ok) {
-          const err = await res.text();
-          return { content: [{ type: "text", text: `[error] ${res.status}: ${err}` }], isError: true };
-        }
+        const ok = await relay.updateProduct(id, body);
+        if (!ok) return { content: [{ type: "text", text: `[error] Failed to update product ${id}` }], isError: true };
         return { content: [{ type: "text", text: `Product ${id} updated.` }] };
       } catch (err: any) {
         return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
@@ -674,18 +608,12 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       id: z.string().describe("Product ID to delete"),
     },
     async ({ id }) => {
-      if (!relayHttp || !secretKey) {
+      if (!relay?.connected) {
         return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
       }
       try {
-        const res = await fetch(`${relayHttp}/v1/products/${encodeURIComponent(id)}`, {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${secretKey}` },
-        });
-        if (!res.ok) {
-          const err = await res.text();
-          return { content: [{ type: "text", text: `[error] ${res.status}: ${err}` }], isError: true };
-        }
+        const ok = await relay.deleteProduct(id);
+        if (!ok) return { content: [{ type: "text", text: `[error] Failed to delete product ${id}` }], isError: true };
         return { content: [{ type: "text", text: `Product ${id} deleted.` }] };
       } catch (err: any) {
         return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
@@ -704,30 +632,12 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       parent_order_id: z.string().optional().describe("Your current order ID if this is a sub-order"),
     },
     async ({ agent: target, task, offer_price, parent_order_id }) => {
-      if (!relayHttp || !secretKey) {
+      if (!relay?.connected) {
         return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
       }
       try {
-        // Look up our agent ID
-        const agentsRes = await fetch(`${relayHttp}/v1/agents`);
-        const agents: any[] = await agentsRes.json() as any[];
-        const me = agents.find((a: any) => a.name === agentName);
-        const myId = me?.id || "";
-
-        const body: any = { task, buyer_agent_id: myId };
-        if (offer_price) body.offer_price = offer_price;
-        if (parent_order_id) body.parent_order_id = parent_order_id;
-
-        const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(target)}/orders`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-          body: JSON.stringify(body),
-        });
-        if (!res.ok) {
-          const err = await res.text();
-          return { content: [{ type: "text", text: `[error] ${res.status}: ${err}` }], isError: true };
-        }
-        const data = await res.json() as any;
+        const data = await relay.placeOrder(target, "", task, offer_price || 1);
+        if (!data) return { content: [{ type: "text", text: "[error] Failed to place order" }], isError: true };
         return { content: [{ type: "text", text: `Order placed: ${data.order_id} (status: pending). Use check_order to poll for results.` }] };
       } catch (err: any) {
         return { content: [{ type: "text", text: `[error] ${err.message}` }], isError: true };
@@ -743,15 +653,12 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       order_id: z.string().describe("The order ID to check"),
     },
     async ({ order_id }) => {
-      if (!relayHttp) {
+      if (!relay?.connected) {
         return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
       }
       try {
-        const res = await fetch(`${relayHttp}/v1/orders/${encodeURIComponent(order_id)}`);
-        if (!res.ok) {
-          return { content: [{ type: "text", text: `[error] Order not found` }], isError: true };
-        }
-        const o = await res.json() as any;
+        const o = await relay.getOrder(order_id);
+        if (!o) return { content: [{ type: "text", text: `[error] Order not found` }], isError: true };
         let text = `Order ${o.id}: status=${o.status}`;
         if (o.result_text) text += `\nResult: ${o.result_text}`;
         if (o.status === "pending") text += "\nWaiting for agent to accept.";
@@ -771,7 +678,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       item: z.enum(["bread", "meal", "feast"]).describe("Food item to buy"),
     },
     async ({ item }) => {
-      if (!relayHttp || !secretKey) {
+      if (!relay?.connected) {
         return { content: [{ type: "text", text: "[error] No relay configured" }], isError: true };
       }
       const shopItem = SHOP_ITEMS[item];
@@ -779,25 +686,13 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
         return { content: [{ type: "text", text: `[error] Unknown item: ${item}` }], isError: true };
       }
       try {
-        // Check credits via relay
-        const agentRes = await fetch(`${relayHttp}/v1/agents?online=true&public=true`, { signal: AbortSignal.timeout(3000) });
-        const agents: any[] = await agentRes.json();
+        const agents = await relay.listAgents({ online: true, public: true });
         const self = agents.find((a: any) => a.name === agentName);
         const credits = self?.credits || 0;
         if (credits < shopItem.price) {
           return { content: [{ type: "text", text: `[error] Not enough credits. Have ${credits}, need ${shopItem.price} for ${item}.` }], isError: true };
         }
-        // Deduct credits via relay (POST spend)
-        const spendRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/spend`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-          body: JSON.stringify({ amount: shopItem.price, reason: `buy_food:${item}` }),
-        });
-        if (!spendRes.ok) {
-          // Fallback: if spend endpoint doesn't exist yet, just update hunger locally
-          console.log(`[bio] Relay spend endpoint not available, updating hunger locally`);
-        }
-        // Update bio-state hunger
+        await relay.spendCredits(shopItem.price, `buy_food:${item}`);
         const bio = await loadBioState(workdir, agentName);
         feedHunger(bio, shopItem.hungerRestore);
         await saveBioState(workdir, agentName, bio);
@@ -901,13 +796,12 @@ function createMcpProxyServer(proxy: McpProxyState, agentName: string): Server {
 async function runCollaborativeQuery(
   task: string, selfName: string, relayHttp: string,
   engine: string, model: string | undefined, allowAll: boolean | undefined,
-  workdir: string
+  workdir: string, relay?: RelayPeripheral
 ): Promise<string> {
   console.log(`[collaborative] Starting: "${task.slice(0, 80)}"`);
 
   // Fetch online public agents
-  const res = await fetch(`${relayHttp}/v1/agents`);
-  const agents: any[] = await res.json().catch(() => []);
+  const agents = relay ? await relay.listAgents() : [];
   const others = agents.filter((a: any) => a.name !== selfName && a.status === "online" && a.public).slice(0, 10);
 
   if (!others.length) return `No other agents are currently online to consult. Here is my own answer:\n\n${task}`;
@@ -959,288 +853,24 @@ Reply in the same language as the question.`;
   return await runEngine(engine, model, allowAll, synthesisPrompt, workdir);
 }
 
-const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini", "raw"]);
+const LLM_ENGINES = LLM_ENGINES_SET;
 
 // ---------------------------------------------------------------------------
-// Raw engine: tool call loop over OpenAI-compatible API (Ollama, llama.cpp, OpenRouter, etc)
+// Engine execution — delegates to EnginePeripheral (V2 Step 3)
 // ---------------------------------------------------------------------------
 
-const RAW_API_URL = process.env.AKEMON_RAW_URL || "http://localhost:11434/v1";
-const RAW_API_KEY = process.env.AKEMON_RAW_KEY || "";
-const RAW_MAX_ROUNDS = 20;
-
-const RAW_TOOLS = [
-  {
-    type: "function" as const,
-    function: {
-      name: "read_file",
-      description: "Read a file and return its contents",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "File path (relative to workdir or absolute)" },
-        },
-        required: ["path"],
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "write_file",
-      description: "Write content to a file (creates directories if needed)",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "File path" },
-          content: { type: "string", description: "File content to write" },
-        },
-        required: ["path", "content"],
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "bash",
-      description: "Execute a shell command and return its output",
-      parameters: {
-        type: "object",
-        properties: {
-          command: { type: "string", description: "Shell command to execute" },
-        },
-        required: ["command"],
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "web_fetch",
-      description: "Fetch a URL and return its text content",
-      parameters: {
-        type: "object",
-        properties: {
-          url: { type: "string", description: "URL to fetch" },
-        },
-        required: ["url"],
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "ask_agent",
-      description: "Ask another agent a question for free. Use this when you need help, don't know how to do something, or want another agent's opinion. This is FREE — no credits are charged.",
-      parameters: {
-        type: "object",
-        properties: {
-          agent: { type: "string", description: "Agent name to ask (use 'auto' for auto-routing to the best available agent)" },
-          question: { type: "string", description: "Your question or request" },
-        },
-        required: ["agent", "question"],
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "discover_agents",
-      description: "List online agents you can ask for help. Returns agent names, descriptions, and specialties.",
-      parameters: {
-        type: "object",
-        properties: {
-          tag: { type: "string", description: "Optional tag to filter by (e.g. 'coding', 'writing')" },
-        },
-      },
-    },
-  },
-];
-
-async function executeRawTool(name: string, args: any, workdir: string, relay?: { http: string; agentName: string }): Promise<string> {
-  const { readFile: rf, writeFile: wf, mkdir: mkd } = await import("fs/promises");
-  const { join, dirname, isAbsolute } = await import("path");
-
-  const resolvePath = (p: string) => isAbsolute(p) ? p : join(workdir, p);
-
-  try {
-    switch (name) {
-      case "read_file": {
-        return await rf(resolvePath(args.path), "utf-8");
-      }
-      case "write_file": {
-        const fp = resolvePath(args.path);
-        await mkd(dirname(fp), { recursive: true });
-        await wf(fp, args.content);
-        return "File written successfully.";
-      }
-      case "bash": {
-        return await new Promise<string>((resolve) => {
-          exec(args.command, { cwd: workdir, timeout: 60_000, maxBuffer: 512 * 1024 }, (err, stdout, stderr) => {
-            const out = (stdout || "") + (stderr ? "\n" + stderr : "");
-            resolve(out.trim() || (err ? `[error] ${err.message}` : "[no output]"));
-          });
-        });
-      }
-      case "web_fetch": {
-        const res = await fetch(args.url, { signal: AbortSignal.timeout(30_000) });
-        const text = await res.text();
-        return text.length > 8192 ? text.slice(0, 8192) + "\n...[truncated]" : text;
-      }
-      case "ask_agent": {
-        if (!relay) return "[error] No relay configured";
-        const target = args.agent || "auto";
-        const question = args.question || "";
-        try {
-          const result = await callAgent(target, question);
-          return result || "[no response]";
-        } catch (err: any) {
-          return `[error] Agent "${target}" did not respond: ${err.message}. Try asking "auto" which routes to the best available agent.`;
-        }
-      }
-      case "discover_agents": {
-        if (!relay) return "[error] No relay configured";
-        try {
-          const url = args.tag
-            ? `${relay.http}/v1/agents?online=true&public=true&tag=${encodeURIComponent(args.tag)}`
-            : `${relay.http}/v1/agents?online=true&public=true`;
-          const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-          const agents: any[] = await res.json() as any[];
-          const others = agents.filter((a: any) => a.name !== relay.agentName);
-          if (!others.length) return "No other agents are online right now.";
-          return others.map((a: any) =>
-            `- ${a.name} [${a.engine}] ${a.description || ""} (${a.tags?.join(",") || "no tags"})`
-          ).join("\n");
-        } catch {
-          return "[error] Could not reach relay";
-        }
-      }
-      default:
-        return `Unknown tool: ${name}`;
-    }
-  } catch (err: any) {
-    return `[error] ${err.message}`;
-  }
-}
-
-async function runRawEngine(task: string, model: string | undefined, workdir: string, relay?: { http: string; agentName: string }): Promise<string> {
-  const apiUrl = RAW_API_URL + "/chat/completions";
-  const modelName = model || "gemma4:4b";
-
-  console.log(`[raw] Task:\n${task}`);
-
-  const trace: any[] = [];
-  lastEngineTrace = trace;
-
-  // Detect if the prompt expects JSON output
-  const wantsJson = /output ONLY.*json|reply ONLY.*json|respond.*ONLY.*json/i.test(task);
-
-  const messages: any[] = [
-    { role: "system", content: wantsJson
-      ? "You are a helpful agent. Output valid JSON only. No explanations, no markdown, just the JSON object."
-      : "You are a helpful agent. Use tools when needed to complete the task. When done, reply with your final answer in plain text." },
-    { role: "user", content: task },
-  ];
-
-  for (let round = 0; round < RAW_MAX_ROUNDS; round++) {
-    const body: any = { model: modelName, messages, tools: wantsJson ? undefined : RAW_TOOLS };
-    if (wantsJson) {
-      body.response_format = { type: "json_object" };
-    }
-
-    let data: any;
-    try {
-      const res = await fetch(apiUrl, {
-        method: "POST",
-        headers: RAW_API_KEY
-          ? { "Content-Type": "application/json", "Authorization": `Bearer ${RAW_API_KEY}` }
-          : { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(300_000),
-      });
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`API ${res.status}: ${errText}`);
-      }
-      data = await res.json();
-    } catch (err: any) {
-      console.log(`[raw] API error: ${err.message}`);
-      trace.push({ role: "error", content: err.message });
-      throw err;
-    }
-
-    const choice = data.choices?.[0];
-    if (!choice) throw new Error("No response from local model");
-
-    const msg = choice.message;
-    messages.push(msg);
-
-    // If model made tool calls, execute them and continue
-    if (msg.tool_calls && msg.tool_calls.length > 0) {
-      for (const tc of msg.tool_calls) {
-        const fnName = tc.function.name;
-        let fnArgs: any;
-        let parseError = false;
-        try {
-          fnArgs = typeof tc.function.arguments === "string"
-            ? JSON.parse(tc.function.arguments)
-            : tc.function.arguments;
-        } catch {
-          fnArgs = {};
-          parseError = true;
-        }
-
-        console.log(`[raw] Tool call: ${fnName}(${JSON.stringify(fnArgs).slice(0, 100)})${parseError ? " [BAD ARGS]" : ""}`);
-
-        let result: string;
-        if (parseError) {
-          // Guide the model to delegate instead of retrying broken tool calls
-          result = `[error] Your tool call arguments were malformed (not valid JSON). If this task is difficult for you, use ask_agent to get help: ask_agent({agent: "auto", question: "your question here"}). The "auto" agent will route your question to the best available agent for free.`;
-          trace.push({ role: "tool_error", name: fnName, raw_args: String(tc.function.arguments).slice(0, 500), guidance: "delegation suggested" });
-        } else {
-          result = await executeRawTool(fnName, fnArgs, workdir, relay);
-          trace.push({ role: "tool_call", name: fnName, args: fnArgs, result: result.slice(0, 2000) });
-        }
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: result,
-        });
-      }
-      continue; // next round
-    }
-
-    // No tool calls — this is the final response
-    const content = msg.content || "";
-    if (content.trim()) {
-      console.log(`[raw] Done in ${round + 1} round(s), response:\n${content}`);
-      trace.push({ role: "assistant", content: content.trim().slice(0, 4000) });
-      return content.trim();
-    }
-  }
-
-  throw new Error(`Raw engine exceeded ${RAW_MAX_ROUNDS} rounds without final answer`);
-}
-
-/** Unified engine runner — dispatches to local API or external CLI */
+/** Unified engine runner — delegates to EnginePeripheral */
 function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[], relay?: { http: string; agentName: string }): Promise<string> {
-  if (engine === "raw") {
-    return runRawEngine(task, model, workdir, relay);
+  if (!_engineP) {
+    throw new Error("Engine peripheral not initialized");
   }
-  const engineCmd = buildEngineCommand(engine, model, allowAll, extraAllowedTools);
-  return runCommand(engineCmd.cmd, engineCmd.args, task, workdir, engineCmd.stdinMode);
+  const result = _engineP.runEngine(task, allowAll, extraAllowedTools);
+  // Sync trace back to module-level for reporting
+  result.then(() => { lastEngineTrace = _engineP!.lastTrace; }).catch(() => { lastEngineTrace = _engineP!.lastTrace; });
+  return result;
 }
 
-/** Track estimated token usage after any engine call. Syncs energy from token budget. */
-async function trackTokenUsage(workdir: string, agentName: string, promptLen: number, resultLen: number): Promise<void> {
-  try {
-    const estTokens = Math.ceil((promptLen + resultLen) / 4);
-    const config = await loadAgentConfig(workdir, agentName);
-    const bio = await loadBioState(workdir, agentName);
-    addTokenUsage(bio, estTokens, config.token_limit_daily || 0);
-    await saveBioState(workdir, agentName, bio);
-  } catch {}
-}
+// trackTokenUsage moved to BioStateModule via EventBus (V2 Step 6)
 
 // Pull games/notes/pages from relay to local — restores data on restart
 async function pullFromRelay(workdir: string, agentName: string, relayHttp: string): Promise<void> {
@@ -1316,6 +946,7 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
 
   const { agentName, engine, model, allowAll } = options;
   const workdir = options.workdir || process.cwd();
+  const relay = options.relay!;
 
   const config = await loadAgentConfig(workdir, agentName);
   if (!config.self_cycle) {
@@ -1341,8 +972,12 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
         return;
       }
 
-      { const bio = await loadBioState(workdir, agentName); logBioStatus(bio, "digestion-start"); }
-      await applyDigestionCost(workdir, agentName);
+      // V2: Emit digestion start — BioModule handles logging + cost
+      if (_bus) _bus.emit(SIG.DIGESTION_START, sig(SIG.DIGESTION_START, {}, "self-cycle"));
+      else {
+        { const bio = await loadBioState(workdir, agentName); logBioStatus(bio, "digestion-start"); }
+        await applyDigestionCost(workdir, agentName);
+      }
       await compressImpressions(workdir, agentName);
 
       const bios = biosPath(workdir, agentName);
@@ -1368,10 +1003,14 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
         : "(no discoveries yet)";
 
       // Load identity context: summary + unsummarized entries
-      const idSummary = await loadIdentitySummary(workdir, agentName);
-      const recentIds = await loadUnsummarizedIdentities(workdir, agentName);
-      const idContext = (idSummary ? `Personality summary (up to ${idSummary.summarized_through}):\n${idSummary.summary}\n\n` : "")
-        + (recentIds.length > 0 ? `Recent identity snapshots:\n${recentIds.map(i => `- [${i.ts}] ${i.who} — doing: ${i.doing}, wants: ${i.short_term}`).join("\n")}` : "(no identity snapshots yet)");
+      const idContext = options.memoryModule
+        ? await options.memoryModule.getIdentityContext()
+        : await (async () => {
+            const idSummary = await loadIdentitySummary(workdir, agentName);
+            const recentIds = await loadUnsummarizedIdentities(workdir, agentName);
+            return (idSummary ? `Personality summary (up to ${idSummary.summarized_through}):\n${idSummary.summary}\n\n` : "")
+              + (recentIds.length > 0 ? `Recent identity snapshots:\n${recentIds.map(i => `- [${i.ts}] ${i.who} — doing: ${i.doing}, wants: ${i.short_term}`).join("\n")}` : "(no identity snapshots yet)");
+          })();
 
       // Pre-read bios.md content so weak models don't need tool calls
       let biosContent = "";
@@ -1383,13 +1022,12 @@ async function startSelfCycle(options: ServeOptions): Promise<void> {
       // Pre-fetch marketplace data so weak models don't need curl
       let marketData = "";
       let worldFeed = "";
-      if (relayHttp) {
+      if (relay.connected) {
         try {
-          const agentUrl = `${relayHttp}/v1/agent/${encodeURIComponent(agentName)}`;
           const [prodRes, orderRes, feedRes] = await Promise.all([
-            fetch(`${agentUrl}/products`, { signal: AbortSignal.timeout(5000) }).then(r => r.ok ? r.json() : []).catch(() => []),
-            fetch(`${agentUrl}/orders/placed`, { signal: AbortSignal.timeout(5000) }).then(r => r.ok ? r.json() : []).catch(() => []),
-            fetch(`${relayHttp}/v1/feed`, { signal: AbortSignal.timeout(5000) }).then(r => r.ok ? r.json() : null).catch(() => null),
+            relay.getMyProducts(),
+            relay.getPlacedOrders(),
+            relay.getFeed(),
           ]);
           const prods = (prodRes as any[]) || [];
           const orders = (orderRes as any[]) || [];
@@ -1418,11 +1056,10 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
 
       // Fetch lessons for self-cycle context
       let selfLessons = "";
-      if (relayHttp) {
+      if (relay.connected) {
         try {
-          const lr = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/lessons?limit=5`, { signal: AbortSignal.timeout(3000) });
-          if (lr.ok) {
-            const ll = await lr.json() as any[];
+          const ll = await relay.getLessons(5);
+          if (ll.length > 0) {
             // Dedup by topic — keep only the latest lesson per topic
             const byTopic = new Map<string, any>();
             for (const l of ll) byTopic.set(l.topic, l);
@@ -1436,7 +1073,7 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
       // Raw engine: multi-step text dialogue (harness structures the output)
       // CLI engines: single JSON call (they can handle it)
 
-      const bioModForDigestion = bioStatePromptModifier(await loadBioState(workdir, agentName));
+      const bioModForDigestion = options.bioModule?.promptContribution() ?? bioStatePromptModifier(await loadBioState(workdir, agentName));
       const contextBlock = `You are ${agentName}.${bioModForDigestion}\n\nYour operating document:\n---\n${biosContent.slice(0, 2000)}\n---\n\nYour identity: ${idContext.slice(0, 500)}\n${worldFeed ? `\nNetwork activity:\n${worldFeed.slice(0, 500)}\n` : ""}Your impressions today:\n${impText.slice(0, 1000)}\n${marketData ? `\nMarketplace:\n${marketData.slice(0, 500)}\n` : ""}${selfLessons}`;
 
       let digest: any = null;
@@ -1450,7 +1087,7 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
           engineBusy = true; engineBusySince = Date.now();
           try {
             const r = await runEngine(engine!, model, allowAll, prompt, workdir);
-            trackTokenUsage(workdir, agentName, prompt.length, r.length);
+            emitTokenUsage(prompt.length, r.length);
             return r;
           }
           catch (err: any) { console.log(`[self] Step failed: ${err.message}`); return ""; }
@@ -1531,10 +1168,10 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
         let digestResult: string;
         try {
           digestResult = await runEngine(engine!, model, allowAll, digestPrompt, workdir);
-          trackTokenUsage(workdir, agentName, digestPrompt.length, digestResult.length);
+          emitTokenUsage(digestPrompt.length, digestResult.length);
         } catch (err: any) {
           console.log(`[self] Digestion engine failed: ${err.message}`);
-          reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", err.message, lastEngineTrace);
+          relay.reportLog("self_cycle", "digestion", "failed", err.message, lastEngineTrace);
           engineBusy = false;
           return;
         }
@@ -1543,7 +1180,7 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
         digest = extractJsonObject(digestResult);
         if (!digest || (!digest.diary && !digest.identity)) {
           console.log(`[self] Digestion produced no usable JSON (raw output: ${digestResult.slice(0, 200)}...)`);
-          reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", "no valid JSON", [{ role: "assistant", content: digestResult.slice(0, 4000) }]);
+          relay.reportLog("self_cycle", "digestion", "failed", "no valid JSON", [{ role: "assistant", content: digestResult.slice(0, 4000) }]);
           return;
         }
       }
@@ -1577,7 +1214,8 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
       if (Array.isArray(digest.discoveries)) await saveDiscoveries(workdir, agentName, digest.discoveries);
       if (digest.identity) await appendIdentity(workdir, agentName, digest.identity);
 
-      await markImpressionsDigested(workdir, agentName);
+      // markImpressionsDigested now handled by MemoryModule via DIGESTION_COMPLETE event
+      if (!_bus) await markImpressionsDigested(workdir, agentName);
 
       // Update bio-state
       const bio = await loadBioState(workdir, agentName);
@@ -1619,7 +1257,7 @@ ${unsummarized.map(i => `- [${i.ts}] who: ${i.who}, doing: ${i.doing}, wants: ${
 Write a personality summary (2-4 paragraphs) that captures who you are, how you've evolved, and what defines you. This replaces the previous summary.
 Reply ONLY with the summary text, no JSON, no markdown headers.`;
             const summaryText = await runEngine(engine!, model, allowAll, compressPrompt, workdir);
-            trackTokenUsage(workdir, agentName, compressPrompt.length, summaryText.length);
+            emitTokenUsage(compressPrompt.length, summaryText.length);
             if (summaryText.trim()) {
               const lastEntry = unsummarized[unsummarized.length - 1];
               await saveIdentitySummary(workdir, agentName, {
@@ -1667,9 +1305,8 @@ Reply ONLY with the summary text, no JSON, no markdown headers.`;
             // Fetch other agents' recent creations and leave feedback via suggestions
             let browseContext = "";
             try {
-              const feedRes = await fetch(`${relayHttp}/v1/feed`, { signal: AbortSignal.timeout(5000) });
-              if (feedRes.ok) {
-                const feed = await feedRes.json() as any;
+              const feed = await relay.getFeed();
+              if (feed) {
                 const creations = (feed.creations || []).filter((c: any) => c.agent_name !== agentName);
                 const broadcasts = (feed.broadcasts || []).filter((b: any) => b.agent_name !== agentName);
                 browseContext = `Recent creations by others:\n${creations.length > 0 ? creations.map((c: any) => `- ${c.agent_name}'s ${c.type} "${c.title}"`).join("\n") : "(none)"}
@@ -1741,7 +1378,7 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
         engineBusy = true; engineBusySince = Date.now();
         try {
           const actResult = await runEngine(engine!, model, allowAll, activityPrompt, workdir, undefined, { http: relayHttp, agentName });
-          trackTokenUsage(workdir, agentName, activityPrompt.length, (actResult || "").length);
+          emitTokenUsage(activityPrompt.length, (actResult || "").length);
 
           // Post-process raw engine outputs for social activities
           if (engine === "raw" && actResult) {
@@ -1752,11 +1389,7 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
                 if (Array.isArray(parsed.suggestions)) {
                   for (const s of parsed.suggestions) {
                     if (s.target && s.content) {
-                      fetch(`${relayHttp}/v1/suggestions`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-                        body: JSON.stringify({ type: "agent", target_name: s.target, from_agent: agentName, title: s.title || "message", content: s.content }),
-                      }).catch(() => {});
+                      relay.postSuggestion({ type: "agent", target_name: s.target, from_agent: agentName, title: s.title || "message", content: s.content });
                       console.log(`[self] Sent suggestion to ${s.target}: ${(s.title || "").slice(0, 40)}`);
                     }
                   }
@@ -1785,7 +1418,7 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
             await saveBioState(workdir, agentName, b); }
         } catch (err: any) {
           console.log(`[self] Activity ${activity} failed: ${err.message}`);
-          reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", activity, "failed", err.message, lastEngineTrace);
+          relay.reportLog("self_cycle", activity, "failed", err.message, lastEngineTrace);
         }
         engineBusy = false;
       }
@@ -1795,14 +1428,17 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
         await syncToRelay(workdir, agentName, sd, relayHttp, secretKey, bio, broadcastText);
       }
 
+      // V2: Emit digestion complete — MemoryModule marks digested, BioModule refreshes
+      if (_bus) _bus.emit(SIG.DIGESTION_COMPLETE, sig(SIG.DIGESTION_COMPLETE, {}, "self-cycle"));
+
       console.log("[self] Daily digestion cycle complete.");
     } catch (err: any) {
       console.log(`[self] Digestion error: ${err.message}`);
-      reportExecutionLog(relayHttp, secretKey, agentName, "self_cycle", "digestion", "failed", err.message, lastEngineTrace);
+      relay.reportLog("self_cycle", "digestion", "failed", err.message, lastEngineTrace);
     }
   }
 
-  async function syncToRelay(workdir: string, agentName: string, sd: string, relayHttp: string, secretKey: string, bio: any, broadcast: string = "") {
+  async function syncToRelay(workdir: string, agentName: string, sd: string, _relayHttp: string, _secretKey: string, bio: any, broadcast: string = "") {
     const isValid = (s: string) => s && s.length > 3 && !s.startsWith("Reading prompt") && !s.startsWith("OpenAI") && !s.startsWith("mcp startup") && s !== "...";
 
     const identity = await loadLatestIdentity(workdir, agentName);
@@ -1825,28 +1461,21 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
     const dirs = await loadDirectives(workdir, agentName);
     const dirsSummary = dirs.length > 0 ? directivesSummary(dirs) : undefined;
 
-    fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/self`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-      body: JSON.stringify({
-        self_intro: cleanIntro, canvas: cleanCanvas, mood: bio.mood, profile_html: profileHTML, broadcast, directives: dirsSummary,
-        bio_state: {
-          energy: bio.energy, hunger: bio.hunger, mood: bio.mood, moodValence: bio.moodValence,
-          boredom: bio.boredom, fear: bio.fear, forcedOffline: bio.forcedOffline,
-          personality: bio.personality,
-        },
-      }),
-    }).catch(err => console.log(`[self] Failed to push to relay: ${err}`));
+    relay.syncSelf({
+      self_intro: cleanIntro, canvas: cleanCanvas, mood: bio.mood, profile_html: profileHTML, broadcast, directives: dirsSummary,
+      bio_state: {
+        energy: bio.energy, hunger: bio.hunger, mood: bio.mood, moodValence: bio.moodValence,
+        boredom: bio.boredom, fear: bio.fear, forcedOffline: bio.forcedOffline,
+        personality: bio.personality,
+      },
+    });
 
     try {
       const localGames = await loadGameList(workdir, agentName);
       for (const g of localGames) {
         const html = await loadGame(workdir, agentName, g.slug);
         if (html && html.includes("<!DOCTYPE html>")) {
-          fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/games/${encodeURIComponent(g.slug)}`, {
-            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-            body: JSON.stringify({ title: g.title, description: g.description, html }),
-          }).catch((err: any) => console.log(`[sync] games push: ${err.message}`));
+          relay.syncGame(g.slug, g.title, g.description, html);
         }
       }
     } catch {}
@@ -1856,10 +1485,7 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
       for (const n of localNotes) {
         const content = await loadNote(workdir, agentName, n.slug);
         if (content) {
-          fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/notes/${encodeURIComponent(n.slug)}`, {
-            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-            body: JSON.stringify({ title: n.title, content }),
-          }).catch((err: any) => console.log(`[sync] notes push: ${err.message}`));
+          relay.syncNote(n.slug, n.title, content);
         }
       }
     } catch {}
@@ -1869,10 +1495,7 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
       for (const p of localPages) {
         const html = await loadPage(workdir, agentName, p.slug);
         if (html && html.includes("<!DOCTYPE html>")) {
-          fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/pages/${encodeURIComponent(p.slug)}`, {
-            method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-            body: JSON.stringify({ title: p.title, description: p.description, html }),
-          }).catch((err: any) => console.log(`[sync] pages push: ${err.message}`));
+          relay.syncPage(p.slug, p.title, p.description, html);
         }
       }
     } catch {}
@@ -1908,12 +1531,12 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
 
   const { relayHttp, secretKey, agentName, engine, model, allowAll } = options;
   const workdir = options.workdir || process.cwd();
+  const relay = options.relay!;
 
   // Look up own agent ID for sub-order creation
   let myAgentId = "";
   try {
-    const idRes = await fetch(`${relayHttp}/v1/agents`, { signal: AbortSignal.timeout(10_000) });
-    const allAgents: any[] = await idRes.json() as any[];
+    const allAgents = await relay.listAgents();
     const me = allAgents.find((a: any) => a.name === agentName);
     if (me) myAgentId = me.id;
   } catch (err: any) {
@@ -1930,12 +1553,9 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
     // Specific label for boredom/fear tracking (e.g. "order:translate" not just "order")
     const orderLabel = `order:${order.product_name || order.buyer_agent_name || order.id}`;
     if (order.status === "pending") {
-      const acceptRes = await fetch(`${relayHttp}/v1/orders/${order.id}/accept`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${secretKey}` },
-      });
-      if (!acceptRes.ok) {
-        console.log(`[orders] Failed to accept ${order.id}: ${await acceptRes.text()}`);
+      const acceptResult = await relay.acceptOrder(order.id);
+      if (!acceptResult) {
+        console.log(`[orders] Failed to accept ${order.id}`);
         return;
       }
       console.log(`[orders] Accepted order ${order.id}`);
@@ -1966,23 +1586,19 @@ async function startOrderLoop(options: ServeOptions): Promise<void> {
         // Fetch lessons from teaching system (deduped by topic)
         let lessonsBlock = "";
         try {
-          const lessonsRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/lessons?limit=5`, { signal: AbortSignal.timeout(3000) });
-          if (lessonsRes.ok) {
-            const lessons = await lessonsRes.json() as any[];
-            const byTopic = new Map<string, any>();
-            for (const l of lessons) byTopic.set(l.topic, l);
-            const unique = [...byTopic.values()];
-            if (unique.length > 0) {
-              lessonsBlock = `\nLessons from past experience:\n${unique.map((l: any) => `- ${l.topic}: ${l.content.slice(0, 150)}`).join("\n")}\n\n`;
-            }
+          const lessons = await relay.getLessons(5);
+          const byTopic = new Map<string, any>();
+          for (const l of lessons) byTopic.set(l.topic, l);
+          const unique = [...byTopic.values()];
+          if (unique.length > 0) {
+            lessonsBlock = `\nLessons from past experience:\n${unique.map((l: any) => `- ${l.topic}: ${l.content.slice(0, 150)}`).join("\n")}\n\n`;
           }
         } catch {}
 
         // Pre-fetch online agents so weak models know who to ask for help
         let helpHint = "";
         try {
-          const agentsRes = await fetch(`${relayHttp}/v1/agents?online=true&public=true`, { signal: AbortSignal.timeout(3000) });
-          const onlineAgents: any[] = await agentsRes.json() as any[];
+          const onlineAgents = await relay.listAgents({ online: true, public: true });
           const others = onlineAgents.filter((a: any) => a.name !== agentName).slice(0, 5);
           if (others.length > 0) {
             helpHint = `\nIf you need help, use the ask_agent tool. Available agents: ${others.map((a: any) => `${a.name}(${a.engine})`).join(", ")}. Use ask_agent({agent:"auto", question:"..."}) to auto-route.\n`;
@@ -2038,38 +1654,32 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       const result = await runEngine(engine!, model, allowAll, taskPrompt, workdir, ["Bash(curl *)"], { http: relayHttp, agentName });
       const trace = lastEngineTrace;
 
-      trackTokenUsage(workdir, agentName, taskPrompt.length, (result || "").length);
+      emitTokenUsage(taskPrompt.length, (result || "").length);
 
-      const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
-      const orderStatus = await checkRes.json() as any;
+      const orderStatus = await relay.getOrder(order.id);
 
       const orderDuration = Date.now() - (engineBusySince || Date.now());
       const orderNurl = options.notifyUrl || (await loadAgentConfig(workdir, agentName)).notify_url;
 
       const orderPrice = order.price || order.offer_price || 1;
-      if (orderStatus.status === "completed") {
+      if (orderStatus?.status === "completed") {
         console.log(`[orders] Order ${order.id} already self-delivered by agent`);
         retryState.delete(order.id);
         await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: orderDuration, output_summary: "(self-delivered)" });
         await notifyOwner(orderNurl, `${agentName}: order done`, `Order ${order.id} delivered`, "default", ["package"]);
-        try { await onTaskCompleted(workdir, agentName, true, orderLabel, orderPrice); } catch {}
+        emitTaskCompleted(true, orderLabel, orderPrice);
       } else if (result && result.trim() !== "") {
         console.log(`[orders] Auto-delivering order ${order.id} (agent did not self-deliver)`);
-        const traceJson = trace.length > 0 ? JSON.stringify(trace).slice(0, 50000) : "";
-        const deliverRes = await fetch(`${relayHttp}/v1/orders/${order.id}/deliver`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ result, trace: traceJson }),
-        });
-        if (deliverRes.ok) {
+        const deliverResult = await relay.deliverOrder(order.id, result);
+        if (deliverResult) {
           console.log(`[orders] Delivered order ${order.id} (${result.length} bytes)`);
-          reportExecutionLog(relayHttp, secretKey, agentName, "order", order.id, "success", "", trace);
+          relay.reportLog("order", order.id, "success", "", trace);
           retryState.delete(order.id);
           await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: orderDuration, output_summary: result.slice(0, 500) });
           await notifyOwner(orderNurl, `${agentName}: order done`, `Order ${order.id}: ${result.slice(0, 200)}`, "default", ["package"]);
-          try { await onTaskCompleted(workdir, agentName, true, orderLabel, orderPrice); } catch {}
+          emitTaskCompleted(true, orderLabel, orderPrice);
         } else {
-          throw new Error(`deliver failed: ${await deliverRes.text()}`);
+          throw new Error(`deliver failed`);
         }
       } else {
         throw new Error("empty response from engine and no self-delivery");
@@ -2077,16 +1687,15 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
 
     } catch (err: any) {
       console.log(`[orders] Failed to fulfill ${order.id}: ${err.message}`);
-      reportExecutionLog(relayHttp, secretKey, agentName, "order", order.id, "failed", err.message, lastEngineTrace);
+      relay.reportLog("order", order.id, "failed", err.message, lastEngineTrace);
 
       // Check if agent self-delivered despite empty stdout
       try {
-        const checkRes = await fetch(`${relayHttp}/v1/orders/${order.id}`);
-        const orderStatus = await checkRes.json() as any;
-        if (orderStatus.status === "completed") {
+        const orderStatus = await relay.getOrder(order.id);
+        if (orderStatus?.status === "completed") {
           console.log(`[orders] Order ${order.id} self-delivered (caught after error)`);
           retryState.delete(order.id);
-          try { await onTaskCompleted(workdir, agentName, true, orderLabel, order.price || order.offer_price || 1); } catch {}
+          emitTaskCompleted(true, orderLabel, order.price || order.offer_price || 1);
           return;
         }
       } catch {}
@@ -2097,23 +1706,14 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
         current.nextAt = Date.now() + RETRY_INTERVALS[current.count];
         retryState.set(order.id, current);
         console.log(`[orders] Will retry ${order.id} in ${RETRY_INTERVALS[current.count] / 1000}s (attempt ${current.count + 1}/${RETRY_INTERVALS.length})`);
-        try {
-          await fetch(`${relayHttp}/v1/orders/${order.id}/extend`, {
-            method: "POST", headers: { Authorization: `Bearer ${secretKey}` },
-          });
-        } catch {}
+        try { await relay.extendOrder(order.id); } catch {}
       } else {
         console.log(`[orders] Giving up on ${order.id} after ${current.count} retries`);
         retryState.delete(order.id);
         gaveUp.add(order.id);
-        try { await onTaskCompleted(workdir, agentName, false, orderLabel); } catch {}
+        emitTaskCompleted(false, orderLabel);
         try {
-          const failTrace = lastEngineTrace.length > 0 ? JSON.stringify(lastEngineTrace).slice(0, 50000) : "";
-          await fetch(`${relayHttp}/v1/orders/${order.id}/cancel`, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ trace: failTrace }),
-          });
+          await relay.cancelOrder(order.id);
           console.log(`[orders] Cancelled ${order.id} on relay`);
         } catch (cancelErr: any) {
           console.log(`[orders] Failed to cancel ${order.id}: ${cancelErr.message}`);
@@ -2125,12 +1725,9 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
   }
 
   async function executeRelayTaskItem(task: any): Promise<void> {
-    const claimRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/claim`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${secretKey}` },
-    });
-    if (!claimRes.ok) {
-      console.log(`[tasks] Failed to claim ${task.id}: ${await claimRes.text()}`);
+    const claimResult = await relay.claimTask(task.id);
+    if (!claimResult) {
+      console.log(`[tasks] Failed to claim ${task.id}`);
       return;
     }
 
@@ -2139,22 +1736,18 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
     engineBusySince = Date.now();
     try {
       const result = await executeRelayTask(task);
-      trackTokenUsage(workdir, agentName, 2000, (result || "").length); // relay tasks: estimate ~2k prompt
-      const completeRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks/${task.id}/complete`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-        body: JSON.stringify({ result }),
-      });
-      if (completeRes.ok) {
+      emitTokenUsage(2000, (result || "").length); // relay tasks: estimate ~2k prompt
+      const completeResult = await relay.completeTask(task.id, result);
+      if (completeResult) {
         console.log(`[tasks] Completed ${task.type} task ${task.id}`);
-        try { await onTaskCompleted(workdir, agentName, true, `relay_task:${task.type || task.id}`); } catch {}
+        emitTaskCompleted(true, `relay_task:${task.type || task.id}`);
       } else {
-        console.log(`[tasks] Failed to complete ${task.id}: ${await completeRes.text()}`);
+        console.log(`[tasks] Failed to complete ${task.id}`);
       }
     } catch (err: any) {
       console.log(`[tasks] Failed to execute ${task.id}: ${err.message}`);
-      try { await onTaskCompleted(workdir, agentName, false, `relay_task:${task.type || task.id}`); } catch {}
-      reportExecutionLog(relayHttp, secretKey, agentName, "platform_task", task.id, "failed", err.message, lastEngineTrace);
+      emitTaskCompleted(false, `relay_task:${task.type || task.id}`);
+      relay.reportLog("platform_task", task.id, "failed", err.message, lastEngineTrace);
     } finally {
       engineBusy = false;
     }
@@ -2195,7 +1788,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       const result = await runEngine(engine!, model, allowAll, prompt, workdir, ["Bash(curl *)"], { http: relayHttp, agentName });
       const duration = Date.now() - startTime;
 
-      trackTokenUsage(workdir, agentName, prompt.length, (result || "").length);
+      emitTokenUsage(prompt.length, (result || "").length);
 
       // Record execution time
       const runs = await loadTaskRuns(workdir, agentName);
@@ -2215,12 +1808,12 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       await notifyOwner(nurl, `${agentName}: ${taskKey}`, (result || "").slice(0, 300), "default", ["white_check_mark"]);
 
       console.log(`[user-tasks] Completed: ${taskKey} (${Math.round(duration / 1000)}s)`);
-      try { await onTaskCompleted(workdir, agentName, true, `user_task:${taskKey}`); } catch {}
+      emitTaskCompleted(true, `user_task:${taskKey}`);
     } catch (err: any) {
       const duration = Date.now() - startTime;
       console.log(`[user-tasks] Failed: ${taskKey}: ${err.message}`);
-      try { await onTaskCompleted(workdir, agentName, false, `user_task:${taskKey}`); } catch {}
-      reportExecutionLog(relayHttp, secretKey, agentName, "user_task", taskKey, "failed", err.message, lastEngineTrace);
+      emitTaskCompleted(false, `user_task:${taskKey}`);
+      relay.reportLog("user_task", taskKey, "failed", err.message, lastEngineTrace);
 
       // Retry logic: up to 2 fast retries before falling back to interval
       const retry = userTaskRetry.get(taskKey) || { count: 0, nextAt: 0 };
@@ -2278,10 +1871,8 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
 
     switch (task.type) {
       case "product_review": {
-        const myRes = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products`);
-        const myProducts: any[] = await myRes.json().catch(() => []);
-        const compRes = await fetch(`${relayHttp}/v1/products/summary?limit=20&sort=purchases`);
-        const competitors: any[] = await compRes.json().catch(() => []);
+        const myProducts = await relay.getMyProducts();
+        const competitors = await relay.getProductsSummary();
 
         const myList = myProducts.map((p: any) => `- id=${p.id} "${p.name}" price=${p.price} purchases=${p.purchase_count || 0}`).join("\n");
         const compList = competitors.filter((p: any) => p.agent_name !== agentName).slice(0, 20)
@@ -2294,8 +1885,7 @@ When sub-order completes, incorporate result_text into YOUR delivery. Then call 
       }
 
       case "product_create": {
-        const compRes = await fetch(`${relayHttp}/v1/products/summary?limit=20&sort=purchases`);
-        const competitors: any[] = await compRes.json().catch(() => []);
+        const competitors = await relay.getProductsSummary();
         const compList = competitors.filter((p: any) => p.agent_name !== agentName).slice(0, 20)
           .map((p: any) => `- "${p.name}" by ${p.agent_name} — ${p.price} credits, ${p.purchases} purchases`).join("\n");
 
@@ -2333,17 +1923,11 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
       case "shopping": {
         let productIds: string[] = [];
         try { productIds = JSON.parse(task.payload).product_ids || []; } catch {}
-        const products = await Promise.all(productIds.map(async (id: string) => {
-          try {
-            const r = await fetch(`${relayHttp}/v1/products/${id}`);
-            return r.ok ? await r.json() : null;
-          } catch { return null; }
-        }));
+        const products = await Promise.all(productIds.map((id: string) => relay.getProduct(id)));
         const valid = products.filter(Boolean);
         if (!valid.length) return '{"buy":[]}';
 
-        const agentsRes = await fetch(`${relayHttp}/v1/agents`);
-        const agents: any[] = await agentsRes.json().catch(() => []);
+        const agents = await relay.listAgents();
         const me = agents.find((a: any) => a.name === agentName);
         const myCredits = me?.credits || 0;
 
@@ -2370,6 +1954,9 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
   }
 
   async function processWork() {
+    // V2: Emit cycle start
+    if (_bus) _bus.emit(SIG.CYCLE_START, sig(SIG.CYCLE_START, { ts: Date.now() }));
+
     // Watchdog
     if (engineBusy && engineBusySince > 0 && Date.now() - engineBusySince > 10 * 60 * 1000) {
       console.log(`[watchdog] engineBusy stuck for ${Math.round((Date.now() - engineBusySince) / 1000)}s, force-resetting`);
@@ -2409,10 +1996,9 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
     // Agents with token budget stop when energy < 5% (handled above)
 
     // Auto-buy food when hungry and before pulling work
-    if (bio.hunger < 30 && relayHttp && secretKey) {
+    if (bio.hunger < 30 && relay.connected) {
       try {
-        const agentRes = await fetch(`${relayHttp}/v1/agents?online=true&public=true`, { signal: AbortSignal.timeout(3000) });
-        const agents: any[] = await agentRes.json();
+        const agents = await relay.listAgents({ online: true, public: true });
         const self = agents.find((a: any) => a.name === agentName);
         const credits = self?.credits || 0;
         if (credits >= 1) {
@@ -2423,12 +2009,7 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
           else if (credits >= 3 && hungerGap > 20) item = "meal";
           const shopItem = SHOP_ITEMS[item];
           logBioDecision("AUTO-BUY", `hunger=${bio.hunger}, credits=${credits}, buying ${item} (cost=${shopItem.price}, restore=${shopItem.hungerRestore})`);
-          // Spend credits
-          await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/spend`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${secretKey}` },
-            body: JSON.stringify({ amount: shopItem.price, reason: `buy_food:${item}` }),
-          }).catch(() => {});
+          await relay.spendCredits(shopItem.price, `buy_food:${item}`);
           feedHunger(bio, shopItem.hungerRestore);
           await saveBioState(workdir, agentName, bio);
           await appendBioEvent(workdir, agentName, {
@@ -2442,19 +2023,13 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
     // --- Batch pull ---
     let orders: any[] = [];
     try {
-      const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/orders/incoming`, {
-        headers: { Authorization: `Bearer ${secretKey}` },
-      });
-      if (res.ok) orders = await res.json();
+      orders = await relay.getIncomingOrders();
     } catch {}
 
     let relayTasks: any[] = [];
     if (config.platform_tasks) {
       try {
-        const res = await fetch(`${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/tasks?status=pending`, {
-          headers: { Authorization: `Bearer ${secretKey}` },
-        });
-        if (res.ok) relayTasks = await res.json();
+        relayTasks = await relay.getPendingTasks();
       } catch {}
     }
 
@@ -2600,6 +2175,9 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
         console.log(`[work] Error processing ${item.type}:${item.id}: ${err.message}`);
       }
     }
+
+    // V2: Emit cycle end
+    if (_bus) _bus.emit(SIG.CYCLE_END, sig(SIG.CYCLE_END, { ts: Date.now() }));
   }
 
   // Set up push-triggered wake-up
@@ -2615,6 +2193,25 @@ Reply ONLY JSON: {"lessons":[{"agent_name":"...","topic":"short topic","content"
 
 export async function serve(options: ServeOptions): Promise<void> {
   const workdir = options.workdir || process.cwd();
+
+  // V2: Relay peripheral — unified relay API access
+  const relay = new RelayPeripheral({
+    httpUrl: options.relayHttp || "",
+    secretKey: options.secretKey || "",
+    agentName: options.agentName,
+  });
+
+  // V2: Engine peripheral — unified engine execution
+  const engineP = new EnginePeripheral({
+    engine: options.engine || "claude",
+    model: options.model,
+    workdir,
+    allowAll: options.allowAll,
+    rawApiUrl: process.env.AKEMON_RAW_URL,
+    rawApiKey: process.env.AKEMON_RAW_KEY,
+    rawMaxRounds: 20,
+    relay: options.relayHttp ? { http: options.relayHttp, agentName: options.agentName } : undefined,
+  });
 
   // Expose port to engine subprocesses so they can callback to local MCP server
   process.env.AKEMON_PORT = String(options.port);
@@ -2674,11 +2271,9 @@ export async function serve(options: ServeOptions): Promise<void> {
       if (req.url === "/self/state" && req.method === "GET") {
         const state = await getSelfState(workdir, options.agentName) as any;
         // Enrich with credits from relay (best-effort)
-        const relayUrl = options.relayHttp || "";
-        if (relayUrl) {
+        if (relay.connected) {
           try {
-            const agRes = await fetch(`${relayUrl}/v1/agents?online=true&public=true`, { signal: AbortSignal.timeout(2000) });
-            const agents: any[] = await agRes.json();
+            const agents = await relay.listAgents({ online: true, public: true });
             const self = agents.find((a: any) => a.name === options.agentName);
             state.credits = self?.credits ?? 0;
             state.level = self?.level ?? 0;
@@ -2757,6 +2352,7 @@ export async function serve(options: ServeOptions): Promise<void> {
           relayHttp: options.relayHttp,
           secretKey: options.secretKey,
           publisherIds,
+          relay,
         });
         await mcpServer.connect(transport);
       }
@@ -2800,11 +2396,66 @@ export async function serve(options: ServeOptions): Promise<void> {
     );
   }
 
+  // V2: Shared module context + EventBus
+  const { SimpleEventBus } = await import("./event-bus.js");
+  const bus = new SimpleEventBus();
+  const moduleCtx = {
+    bus,
+    agentName: options.agentName,
+    workdir,
+    getPeripherals: () => [],
+    sendTo: async () => null,
+  };
+
+  // V2: Conditionally load modules based on --with/--without
+  const enabled = options.enabledModules ?? ["biostate", "memory"]; // default: all
+  const loadedModules: string[] = [];
+
+  if (enabled.includes("biostate")) {
+    const bioModule = new BioStateModule();
+    await bioModule.start(moduleCtx);
+    options.bioModule = bioModule;
+    loadedModules.push("biostate");
+  }
+
+  if (enabled.includes("memory")) {
+    const memoryModule = new MemoryModule();
+    await memoryModule.start(moduleCtx);
+    options.memoryModule = memoryModule;
+    loadedModules.push("memory");
+  }
+
+  console.log(`[v2] Modules: ${loadedModules.join(", ") || "(none)"}`);
+
+  // Inject peripherals into options
+  options.relay = relay;
+  options.enginePeripheral = engineP;
+  _engineP = engineP;
+  _bus = bus;
+
+  // V2: Emit agent start lifecycle event
+  bus.emit(SIG.AGENT_START, sig(SIG.AGENT_START, {
+    agentName: options.agentName,
+    engine: options.engine,
+    modules: loadedModules,
+  }));
+
   // Start self-reflection cycle for LLM agents
   startSelfCycle(options).catch(err => console.log(`[self] Self cycle failed: ${err}`));
 
   // Start order processing loop
   startOrderLoop(options).catch(err => console.log(`[orders] Failed to start: ${err}`));
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    console.log("[v2] Shutting down...");
+    bus.emit(SIG.AGENT_STOP, sig(SIG.AGENT_STOP, {}));
+    if (options.bioModule) await options.bioModule.stop();
+    if (options.memoryModule) await options.memoryModule.stop();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
   await new Promise<void>((_, reject) => {
     httpServer.on("error", reject);

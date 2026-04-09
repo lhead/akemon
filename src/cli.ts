@@ -43,6 +43,8 @@ program
   .option("--avatar <url>", "Custom avatar URL (default: auto-generated from name)")
   .option("--notify <url>", "ntfy.sh topic URL for push notifications (e.g. https://ntfy.sh/my-agent)")
   .option("--interval <minutes>", "Consciousness cycle interval in minutes (default: 1440 = 24h)")
+  .option("--with <modules>", "Enable specific modules (comma-separated: biostate,memory)")
+  .option("--without <modules>", "Disable specific modules (comma-separated: biostate,memory)")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
     const port = parseInt(opts.port);
@@ -54,6 +56,16 @@ program
     // Derive relay HTTP URL from WS URL
     const relayWs = opts.relay;
     const relayHttp = relayWs.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
+
+    // Parse module selection
+    const ALL_MODULES = ["biostate", "memory"];
+    let enabledModules: string[] | undefined;
+    if (opts.with) {
+      enabledModules = opts.with.split(",").map((m: string) => m.trim());
+    } else if (opts.without) {
+      const disabled = opts.without.split(",").map((m: string) => m.trim());
+      enabledModules = ALL_MODULES.filter(m => !disabled.includes(m));
+    }
 
     serve({
       port,
@@ -69,6 +81,7 @@ program
       mcpServer: opts.mcpServer,
       cycleInterval: opts.interval ? parseInt(opts.interval) : undefined,
       notifyUrl: opts.notify,
+      enabledModules,
     });
 
     console.log(`\nakemon v${pkg.version}`);
