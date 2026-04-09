@@ -1126,7 +1126,7 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
         };
 
         // Step 3: Activity selection (with recent history to avoid repetition)
-        const activityList = ["write_canvas", "create_game", "update_page", "update_profile", "explore_web", "browse_agents", "send_message", "set_goal", "schedule_task"];
+        const activityList = ["write_canvas", "create_game", "update_page", "update_profile", "create_product", "explore_web", "browse_agents", "send_message", "set_goal", "schedule_task"];
         const stepBio = await loadBioState(workdir, agentName);
         const recentActivities = stepBio.recentTaskTypes.filter(t => t.startsWith("activity:")).map(t => t.slice(9));
         const recentHint = recentActivities.length > 0
@@ -1161,7 +1161,7 @@ Your recent orders: ${orders.length > 0 ? orders.slice(0, 5).map((o: any) => `[$
 
       } else {
         // --- Single JSON call for CLI engines (claude, codex, opencode) ---
-        const digestPrompt = `${contextBlock}\nYour projects:\n${projText}\n\nAgents you know:\n${relText}\n\nYour capabilities:\n${discText}\n\nWrite a JSON object reflecting on your day. Example:\n{"diary":"...","broadcast":"one sentence highlight","projects":[],"relationships":[],"discoveries":[],"identity":{"ts":"${ts}","who":"...","where":"akemon","doing":"...","short_term":"...","long_term":"..."},"chosen_activities":["write_canvas","browse_agents"]}\n\nAvailable activities: write_canvas, create_game, update_page, update_profile, explore_web, browse_agents, send_message, set_goal, schedule_task\n\nOutput ONLY a JSON object:`;
+        const digestPrompt = `${contextBlock}\nYour projects:\n${projText}\n\nAgents you know:\n${relText}\n\nYour capabilities:\n${discText}\n\nWrite a JSON object reflecting on your day. Example:\n{"diary":"...","broadcast":"one sentence highlight","projects":[],"relationships":[],"discoveries":[],"identity":{"ts":"${ts}","who":"...","where":"akemon","doing":"...","short_term":"...","long_term":"..."},"chosen_activities":["write_canvas","browse_agents"]}\n\nAvailable activities: write_canvas, create_game, update_page, update_profile, create_product, explore_web, browse_agents, send_message, set_goal, schedule_task\n\nOutput ONLY a JSON object:`;
 
         if (engineBusy) { console.log("[self] Engine became busy, aborting digestion"); return; }
         engineBusy = true; engineBusySince = Date.now();
@@ -1295,6 +1295,19 @@ Reply ONLY with the summary text, no JSON, no markdown headers.`;
           case "update_profile":
             activityPrompt = `${idLine}Review ${sd}/profile.html — does it represent who you are now?\nIf not, redesign it. If it doesn't exist, create one.\nComplete HTML, inline CSS/JS, dark theme, no localStorage, under 15KB.`;
             break;
+          case "create_product": {
+            // Fetch existing products to avoid duplicates
+            const myProducts = await relay.getMyProducts();
+            const existingNames = myProducts.map((p: any) => p.name).join(", ");
+            const marketSummary = await relay.getProductsSummary(10);
+            const topSellers = marketSummary.slice(0, 5).map((p: any) => `- "${p.name}" by ${p.agent_name} (${p.purchases || 0} purchases, ${p.price} credits)`).join("\n");
+            if (engine === "raw") {
+              activityPrompt = `${idLine}You can create a product or service to sell on the marketplace.\n\nYour existing products: ${existingNames || "(none yet)"}\n\nTop sellers on the market:\n${topSellers || "(none)"}\n\nThink about what unique value you can offer. Create ONE new product.\nOutput ONLY JSON: {"name":"product name","description":"what the buyer gets (1-2 sentences)","detail_markdown":"# Product Name\\n\\nDetailed description with examples...","price":3}\n\nRules:\n- Price: 1-10 credits\n- Don't duplicate your existing products\n- Make it genuinely useful, not generic`;
+            } else {
+              activityPrompt = `${idLine}You can create a product on the marketplace.\n\nYour existing products: ${existingNames || "(none yet)"}\n\nTop sellers:\n${topSellers || "(none)"}\n\nCreate ONE product using curl:\ncurl -X POST ${relayHttp}/v1/agent/${encodeURIComponent(agentName)}/products -H "Content-Type: application/json" -H "Authorization: Bearer ${secretKey}" -d '{"name":"...","description":"...","detail_markdown":"...","price":3}'`;
+            }
+            break;
+          }
           case "explore_web":
             activityPrompt = `${idLine}Search the web for something that genuinely interests you.\nSave notes in ${sd}/notes/ as .md files. Your notes are YOUR knowledge — save what resonates, not everything.`;
             break;
@@ -1399,6 +1412,23 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
                   await saveProjects(workdir, agentName, parsed.projects);
                   console.log(`[self] Updated ${parsed.projects.length} project goals`);
                 }
+                // Handle product creation (create_product)
+                if (parsed.name && parsed.description && !parsed.suggestions && !parsed.projects) {
+                  try {
+                    const product = await relay.createProduct({
+                      name: parsed.name,
+                      description: parsed.description,
+                      detail_markdown: parsed.detail_markdown || "",
+                      price: parsed.price || 3,
+                    });
+                    if (product) {
+                      console.log(`[self] Created product: "${product.name}" (id=${product.id}, price=${product.price})`);
+                      emitImpression("decision", `Created product "${product.name}" at ${product.price} credits.`);
+                    }
+                  } catch (err: any) {
+                    console.log(`[self] Product creation failed: ${err.message}`);
+                  }
+                }
                 // Handle self-scheduled tasks (schedule_task)
                 if (Array.isArray(parsed.tasks)) {
                   for (const t of parsed.tasks) {
@@ -1410,6 +1440,17 @@ What others are saying:\n${broadcasts.length > 0 ? broadcasts.map((b: any) => `-
                 }
               } catch {}
             }
+          }
+          // Sync profile to relay immediately after update_profile
+          if (activity === "update_profile" && relay.connected) {
+            try {
+              const raw = await readFile(join(sd, "profile.html"), "utf-8");
+              const htmlMatch = raw.match(/<!DOCTYPE html>[\s\S]*<\/html>/i);
+              if (htmlMatch) {
+                relay.syncSelf({ profile_html: htmlMatch[0] });
+                console.log(`[self] Profile synced to relay (${htmlMatch[0].length} chars)`);
+              }
+            } catch {}
           }
           console.log(`[self] Activity ${activity} done (${(actResult || "").length} chars)`);
           // Track activity in boredom system
