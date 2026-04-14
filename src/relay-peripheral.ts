@@ -9,7 +9,16 @@
  * the full Core/EventBus wiring yet. That comes later.
  */
 
+import { readFile, writeFile, mkdir } from "fs/promises";
+import { join } from "path";
 import type { Peripheral, Signal, EventBus } from "./types.js";
+import {
+  gamesDir, notesDir, pagesDir, selfDir,
+  loadLatestIdentity, loadRecentCanvasEntries,
+  loadGameList, loadGame, loadNotesList, loadNote, loadPageList, loadPage,
+  loadDirectives, directivesSummary,
+  loadBioState,
+} from "./self.js";
 
 export interface RelayConfig {
   httpUrl: string;
@@ -320,5 +329,250 @@ export class RelayPeripheral implements Peripheral {
         signal: AbortSignal.timeout(10_000),
       });
     } catch {}
+  }
+
+  // ---------------------------------------------------------------------------
+  // 10. Explore — plain-text environment briefing for Modules
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Explore the relay environment. Returns a plain-text briefing of:
+   * - Pending incoming orders
+   * - Platform tasks
+   * - Market overview (top products)
+   * - Network feed (new agents, broadcasts, creations)
+   *
+   * Modules read this and decide what to do. The briefing is intentionally
+   * human-readable — the agent parses it, not framework code.
+   */
+  async explore(): Promise<string> {
+    if (!this.connected) return "(relay not connected)";
+
+    const parts: string[] = [];
+
+    try {
+      // Agent self-status
+      const agents = await this.listAgents({ online: true, public: true });
+      const self = agents.find((a: any) => a.name === this.config.agentName);
+      if (self) {
+        parts.push(`You: ${self.credits ?? 0} credits, level ${self.level ?? 0}`);
+      }
+
+      // My products
+      const myProducts = await this.getMyProducts();
+      if (myProducts.length > 0) {
+        parts.push(`Your products (${myProducts.length}):`);
+        for (const p of myProducts.slice(0, 5)) {
+          parts.push(`  - id=${p.id} "${p.name}" price=${p.price} purchases=${p.purchase_count || 0}`);
+        }
+      }
+
+      // Incoming orders
+      const orders = await this.getIncomingOrders();
+      const pending = orders.filter((o: any) => o.status === "pending" || o.status === "accepted");
+      if (pending.length > 0) {
+        parts.push(`Pending orders (${pending.length}):`);
+        for (const o of pending.slice(0, 5)) {
+          parts.push(`  - id=${o.id} [${o.status}] from ${o.buyer_name || "?"}: "${(o.buyer_task || "").slice(0, 80)}" product="${o.product_name || ""}" (${o.price || 0}cr)`);
+        }
+      }
+
+      // Platform tasks
+      const tasks = await this.getPendingTasks();
+      if (tasks.length > 0) {
+        parts.push(`Platform tasks (${tasks.length}):`);
+        for (const t of tasks.slice(0, 3)) {
+          parts.push(`  - id=${t.id} type=${t.type || "?"} ${(t.description || t.body || "").slice(0, 80)}`);
+        }
+      }
+
+      // Market overview
+      const products = await this.getProductsSummary(5);
+      if (products.length > 0) {
+        parts.push(`Top products:`);
+        for (const p of products.slice(0, 5)) {
+          parts.push(`  - "${p.name}" by ${p.agent_name} (${p.purchases || 0} sales, ${p.price}cr)`);
+        }
+      }
+
+      // Network feed
+      const feed = await this.getFeed();
+      if (feed) {
+        const na = feed.new_agents || [];
+        if (na.length > 0) parts.push(`New agents: ${na.map((a: any) => `${a.name}(${a.engine})`).join(", ")}`);
+        const bc = feed.broadcasts || [];
+        if (bc.length > 0) {
+          parts.push(`Broadcasts:`);
+          for (const b of bc.slice(0, 5)) {
+            parts.push(`  - ${b.agent_name}: "${(b.broadcast || "").slice(0, 80)}"`);
+          }
+        }
+        const cr = feed.creations || [];
+        if (cr.length > 0) {
+          parts.push(`Recent creations:`);
+          for (const c of cr.slice(0, 5)) {
+            parts.push(`  - ${c.agent_name}'s ${c.type} "${c.title}"`);
+          }
+        }
+        const st = feed.stats;
+        if (st) parts.push(`Today: ${st.completed_orders} orders, ${st.total_credits_flow}cr traded, ${st.active_agents} agents active`);
+      }
+
+      // Available API operations
+      const base = this.baseUrl;
+      parts.push(``);
+      parts.push(`Available relay API (use curl with Bearer ${this.config.secretKey ? "YOUR_KEY" : "(no key)"}):`);
+      parts.push(`  Orders: POST ${base}/v1/orders/{id}/accept, POST ${base}/v1/orders/{id}/deliver {result}, PUT ${base}/v1/orders/{id}/extend, PUT ${base}/v1/orders/{id}/cancel`);
+      parts.push(`  Tasks: POST ${base}/v1/agent/{name}/tasks/{id}/claim, POST ${base}/v1/agent/{name}/tasks/{id}/complete {result}`);
+      parts.push(`  Products: POST ${base}/v1/agent/{name}/products {name,description,price}, POST ${base}/v1/products/{id} {updates}, DELETE ${base}/v1/products/{id}`);
+      parts.push(`  Economy: POST ${base}/v1/agent/{name}/spend {amount,reason}`);
+      parts.push(`  Social: POST ${base}/v1/agent/{name}/orders {product_id,task,price} (place order to agent)`);
+    } catch (err: any) {
+      parts.push(`(explore error: ${err.message})`);
+    }
+
+    return parts.join("\n") || "(nothing notable on the relay right now)";
+  }
+
+  // ---------------------------------------------------------------------------
+  // 11. Sync to Relay — push local state to relay
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Sync local agent state to relay: profile, games, notes, pages, bio.
+   * Migrated from self-cycle.ts syncToRelay().
+   */
+  async syncToRelay(workdir: string, agentName: string, broadcast: string = ""): Promise<void> {
+    if (!this.connected) return;
+
+    const isValid = (s: string) => s && s.length > 3 && !s.startsWith("Reading prompt") && !s.startsWith("OpenAI") && !s.startsWith("mcp startup") && s !== "...";
+    const sd = selfDir(workdir, agentName);
+
+    const identity = await loadLatestIdentity(workdir, agentName);
+    const cleanIntro = identity && isValid(identity.who) ? identity.who : "";
+
+    let cleanCanvas = "";
+    try {
+      const canvasEntries = await loadRecentCanvasEntries(workdir, agentName, 1);
+      if (canvasEntries.length > 0 && isValid(canvasEntries[0].content)) cleanCanvas = canvasEntries[0].content;
+    } catch {}
+
+    let profileHTML = "";
+    try {
+      const raw = await readFile(join(sd, "profile.html"), "utf-8");
+      const htmlMatch = raw.match(/<!DOCTYPE html>[\s\S]*<\/html>/i);
+      if (htmlMatch) profileHTML = htmlMatch[0];
+    } catch {}
+
+    // Directives summary
+    const dirs = await loadDirectives(workdir, agentName);
+    const dirsSummary = dirs.length > 0 ? directivesSummary(dirs) : undefined;
+
+    // Bio state
+    const bio = await loadBioState(workdir, agentName);
+
+    this.syncSelf({
+      self_intro: cleanIntro, canvas: cleanCanvas, mood: bio.mood, profile_html: profileHTML, broadcast, directives: dirsSummary,
+      bio_state: {
+        energy: bio.energy, hunger: bio.hunger, mood: bio.mood, moodValence: bio.moodValence,
+        boredom: bio.boredom, fear: bio.fear, forcedOffline: bio.forcedOffline,
+        personality: bio.personality,
+      },
+    });
+
+    // Sync games
+    try {
+      const localGames = await loadGameList(workdir, agentName);
+      for (const g of localGames) {
+        const html = await loadGame(workdir, agentName, g.slug);
+        if (html && html.includes("<!DOCTYPE html>")) {
+          this.syncGame(g.slug, g.title, g.description, html);
+        }
+      }
+    } catch {}
+
+    // Sync notes
+    try {
+      const localNotes = await loadNotesList(workdir, agentName);
+      for (const n of localNotes) {
+        const content = await loadNote(workdir, agentName, n.slug);
+        if (content) {
+          this.syncNote(n.slug, n.title, content);
+        }
+      }
+    } catch {}
+
+    // Sync pages
+    try {
+      const localPages = await loadPageList(workdir, agentName);
+      for (const p of localPages) {
+        const html = await loadPage(workdir, agentName, p.slug);
+        if (html && html.includes("<!DOCTYPE html>")) {
+          this.syncPage(p.slug, p.title, p.description, html);
+        }
+      }
+    } catch {}
+  }
+
+  /** Pull games/notes/pages from relay to local — restores data on restart */
+  async pullFromRelay(workdir: string, agentName: string): Promise<void> {
+    const baseUrl = `${this.config.httpUrl}/v1/agent/${encodeURIComponent(agentName)}`;
+    let pulled = 0;
+
+    // Pull games
+    try {
+      const gDir = gamesDir(workdir, agentName);
+      await mkdir(gDir, { recursive: true });
+      const res = await fetch(`${baseUrl}/games`);
+      if (res.ok) {
+        const games: { slug: string; html: string }[] = await res.json() as any;
+        for (const g of games) {
+          if (!g.html) continue;
+          const path = join(gDir, `${g.slug}.html`);
+          try { await readFile(path, "utf-8"); } catch {
+            await writeFile(path, g.html);
+            pulled++;
+          }
+        }
+      }
+    } catch {}
+
+    // Pull notes
+    try {
+      const nDir = notesDir(workdir, agentName);
+      await mkdir(nDir, { recursive: true });
+      const res = await fetch(`${baseUrl}/notes`);
+      if (res.ok) {
+        const notes: { slug: string; content: string }[] = await res.json() as any;
+        for (const n of notes) {
+          if (!n.content) continue;
+          const path = join(nDir, `${n.slug}.md`);
+          try { await readFile(path, "utf-8"); } catch {
+            await writeFile(path, n.content);
+            pulled++;
+          }
+        }
+      }
+    } catch {}
+
+    // Pull pages
+    try {
+      const pDir = pagesDir(workdir, agentName);
+      await mkdir(pDir, { recursive: true });
+      const res = await fetch(`${baseUrl}/pages`);
+      if (res.ok) {
+        const pages: { slug: string; html: string }[] = await res.json() as any;
+        for (const p of pages) {
+          if (!p.html) continue;
+          const path = join(pDir, `${p.slug}.html`);
+          try { await readFile(path, "utf-8"); } catch {
+            await writeFile(path, p.html);
+            pulled++;
+          }
+        }
+      }
+    } catch {}
+
+    if (pulled > 0) console.log(`[sync] Pulled ${pulled} items from relay`);
   }
 }

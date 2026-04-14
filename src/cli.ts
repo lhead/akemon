@@ -45,6 +45,7 @@ program
   .option("--interval <minutes>", "Consciousness cycle interval in minutes (default: 1440 = 24h)")
   .option("--with <modules>", "Enable specific modules (comma-separated: biostate,memory)")
   .option("--without <modules>", "Disable specific modules (comma-separated: biostate,memory)")
+  .option("--script <name>", "Script to load for ScriptModule (default: daily-life)", "daily-life")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
     const port = parseInt(opts.port);
@@ -58,7 +59,7 @@ program
     const relayHttp = relayWs.replace(/^wss:/, "https:").replace(/^ws:/, "http:");
 
     // Parse module selection
-    const ALL_MODULES = ["biostate", "memory"];
+    const ALL_MODULES = ["biostate", "memory", "task", "social", "longterm", "reflection", "script"];
     let enabledModules: string[] | undefined;
     if (opts.with) {
       enabledModules = opts.with.split(",").map((m: string) => m.trim());
@@ -82,6 +83,7 @@ program
       cycleInterval: opts.interval ? parseInt(opts.interval) : undefined,
       notifyUrl: opts.notify,
       enabledModules,
+      scriptName: opts.script,
     });
 
     console.log(`\nakemon v${pkg.version}`);

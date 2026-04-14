@@ -11,3 +11,5 @@ demo-*.mjs
 test-*.mjs
 .claude/
 web/
+.akemon/
+demo-profile-*.html

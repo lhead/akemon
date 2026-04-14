@@ -79,6 +79,31 @@ export interface Signal {
   ts?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Compute — Module requests engine compute through Core
+// ---------------------------------------------------------------------------
+
+/** Module → Core: "I need compute" */
+export interface ComputeRequest {
+  /** Module-prepared context (identity, memory, state, etc.) */
+  context: string;
+  /** The question or task to compute */
+  question: string;
+  /** Priority for queue ordering */
+  priority: "high" | "normal" | "low";
+  /** Extra tools to allow (e.g. ["Bash(curl *)"]) */
+  tools?: string[];
+  /** Relay info for engine (needed for relay-aware tools) */
+  relay?: { http: string; agentName: string };
+}
+
+/** Core → Module: compute result */
+export interface ComputeResult {
+  success: boolean;
+  response?: string;
+  error?: string;
+}
+
 /** Create a signal with auto-timestamp */
 export function sig(type: SignalType, data: Record<string, unknown>, source?: string): Signal {
   return { type, data, source, ts: new Date().toISOString() };
@@ -194,6 +219,14 @@ export interface Peripheral {
    * Returns null if the peripheral can't handle this signal type.
    */
   send(signal: Signal): Promise<Signal | null>;
+
+  /**
+   * Explore the environment this peripheral connects to.
+   * Returns a plain-text briefing of the current state — what's available,
+   * what's pending, what changed. The agent reads this and decides what to do.
+   * Peripherals that don't support exploration return an empty string.
+   */
+  explore?(): Promise<string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +286,14 @@ export interface ModuleContext {
   getPeripherals(capability: string): Peripheral[];
   /** Send a signal to the first peripheral that has a given capability */
   sendTo(capability: string, signal: Signal): Promise<Signal | null>;
+  /**
+   * Request engine compute. Module prepares context + question,
+   * Core queues, routes to engine, returns result.
+   * Module doesn't know which engine is used.
+   */
+  requestCompute(req: ComputeRequest): Promise<ComputeResult>;
+  /** Collect promptContribution() from all loaded modules */
+  getPromptContributions(): string[];
 }
 
 // ---------------------------------------------------------------------------

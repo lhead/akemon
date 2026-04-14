@@ -413,6 +413,8 @@ function updateActivity() {
   const bio = state.bio;
 
   let target = 'home';
+  // Check if agent worked recently (within last 5 minutes)
+  const recentlyWorked = bio.lastTaskAt && (Date.now() - new Date(bio.lastTaskAt).getTime()) < 300_000;
   if (bio.forcedOffline) {
     currentActivity = 'offline'; target = 'rest';
   } else if (bio.energy < 15) {
@@ -422,7 +424,7 @@ function updateActivity() {
   } else if (state.computed.sociability > 0.7 && bio.boredom > 0.5) {
     currentActivity = 'social'; target = 'social';
     if (Math.random() < 0.02) hearts.push({ x: agentX + (Math.random()-0.5)*10, y: agentY - 30, life: 1 });
-  } else if (bio.taskCount > 0 && bio.energy > 30 && bio.mood !== 'exhausted') {
+  } else if (recentlyWorked && bio.energy > 30 && bio.mood !== 'exhausted') {
     currentActivity = 'working'; target = 'work';
   } else {
     currentActivity = 'idle'; target = 'home';
@@ -438,7 +440,8 @@ function updateHUD() {
   if (!state) return;
   const bio = state.bio;
 
-  document.getElementById('hud-name').textContent = `${state.agent} \u00B7 ${bio.mood}`;
+  const creditsText = state.credits != null ? ` \u00B7 ${state.credits}\u{1FA99}` : '';
+  document.getElementById('hud-name').textContent = `${state.agent} \u00B7 ${bio.mood}${creditsText}`;
 
   const bars = [
     { icon: '\u26A1', val: bio.energy, max: 100, color: '#10b981' },
