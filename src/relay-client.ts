@@ -368,7 +368,7 @@ function handleMCPRequest(ws: WebSocket, msg: RelayMessage, localPort: number): 
     headers["x-publisher-id"] = msg.headers["x-publisher-id"];
   }
 
-  const bodyStr = typeof msg.body === "string" ? msg.body : JSON.stringify(msg.body);
+  const bodyStr = msg.body == null ? "" : (typeof msg.body === "string" ? msg.body : JSON.stringify(msg.body));
   const bodyBuf = Buffer.from(bodyStr);
 
   const req = http.request(
