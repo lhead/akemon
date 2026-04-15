@@ -181,12 +181,6 @@ export class TaskModule implements Module {
         const orders = await relay.getIncomingOrders();
         for (const order of orders) {
           if (this.gaveUp.has(order.id)) continue;
-          // Skip orders older than 1 hour — stale orders shouldn't block the agent
-          const orderAge = Date.now() - new Date(order.created_at || 0).getTime();
-          if (orderAge > 3_600_000) {
-            this.gaveUp.add(order.id);
-            continue;
-          }
           const retry = this.orderRetry.get(order.id);
           if (retry && Date.now() < retry.nextAt) continue;
           const urgent = this.urgentOrderIds.has(order.id);
