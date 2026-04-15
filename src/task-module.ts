@@ -185,7 +185,6 @@ export class TaskModule implements Module {
           const orderAge = Date.now() - new Date(order.created_at || 0).getTime();
           if (orderAge > 3_600_000) {
             this.gaveUp.add(order.id);
-            try { await relay.cancelOrder(order.id); } catch {}
             continue;
           }
           const retry = this.orderRetry.get(order.id);

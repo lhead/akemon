@@ -375,6 +375,13 @@ export async function serve(options: ServeOptions): Promise<void> {
     // Wait for engine to become free (poll with backoff, max 5 min)
     const deadline = Date.now() + 5 * 60 * 1000;
     while (engineBusy) {
+      // If engine has been busy for >10 min, it's stuck — force release
+      if (engineBusySince && Date.now() - engineBusySince > 10 * 60 * 1000) {
+        console.log(`[engine] Force-releasing stuck engine lock (busy for ${Math.round((Date.now() - engineBusySince) / 60000)}min)`);
+        engineBusy = false;
+        engineBusySince = 0;
+        break;
+      }
       if (Date.now() > deadline) {
         return { success: false, error: "Engine busy timeout (5 min)" };
       }
@@ -387,15 +394,21 @@ export async function serve(options: ServeOptions): Promise<void> {
       const prompt = req.context
         ? `${req.context}\n\n---\n\n${req.question}`
         : req.question;
-      const response = await runEngine(
-        options.engine || "claude",
-        options.model,
-        options.allowAll,
-        prompt,
-        workdir,
-        req.tools,
-        req.relay,
-      );
+      // Hard timeout: if engine doesn't respond in 8 min, give up
+      const engineTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Engine execution timeout (8 min)")), 8 * 60 * 1000));
+      const response = await Promise.race([
+        runEngine(
+          options.engine || "claude",
+          options.model,
+          options.allowAll,
+          prompt,
+          workdir,
+          req.tools,
+          req.relay,
+        ),
+        engineTimeout,
+      ]);
       // Track token usage via EventBus
       emitTokenUsage(prompt.length, response.length);
       return { success: true, response };
