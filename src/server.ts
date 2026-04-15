@@ -99,7 +99,7 @@ import { ReflectionModule } from "./reflection-module.js";
 import { ScriptModule } from "./script-module.js";
 import { SIG, sig } from "./types.js";
 import type { ComputeRequest, ComputeResult, Peripheral } from "./types.js";
-import { ServeOptions, fetchContext, storeContext, buildContextPayload, loadProductContext, appendProductLog } from "./context.js";
+import { ServeOptions, loadConversation, listConversations, buildLLMContext, resolveConvId } from "./context.js";
 export type { ServeOptions } from "./context.js";
 
 import { createMcpServer, initMcpProxy, createMcpProxyServer } from "./mcp-server.js";
@@ -251,6 +251,25 @@ export async function serve(options: ServeOptions): Promise<void> {
       if (req.url === "/self/canvas" && req.method === "GET") {
         const entries = await loadRecentCanvasEntries(workdir, options.agentName, 10);
         res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(entries, null, 2));
+        return;
+      }
+      if (req.url === "/self/conversations" && req.method === "GET") {
+        const list = await listConversations(workdir, options.agentName);
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(list, null, 2));
+        return;
+      }
+      if (req.url?.startsWith("/self/conversation/") && req.method === "GET") {
+        const convId = decodeURIComponent(req.url.slice("/self/conversation/".length));
+        if (!convId) { res.writeHead(400).end("Missing conversation ID"); return; }
+        const conv = await loadConversation(workdir, options.agentName, convId);
+        const config = await loadAgentConfig(workdir, options.agentName);
+        const budget = config.context_budget ?? 4096;
+        const { recentStartIndex } = buildLLMContext(conv, budget);
+        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+          summary: conv.summary,
+          rounds: conv.rounds,
+          recentStartIndex,
+        }, null, 2));
         return;
       }
 

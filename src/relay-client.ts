@@ -9,6 +9,7 @@ interface RelayMessage {
   request_id?: string;
   session_id?: string;
   method?: string;
+  path?: string;
   headers?: Record<string, string>;
   body?: unknown;
   status_code?: number;
@@ -374,7 +375,7 @@ function handleMCPRequest(ws: WebSocket, msg: RelayMessage, localPort: number): 
     {
       hostname: "127.0.0.1",
       port: localPort,
-      path: "/mcp",
+      path: msg.path || "/mcp",
       method: msg.method || "POST",
       headers: {
         ...headers,

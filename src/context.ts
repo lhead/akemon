@@ -1,9 +1,19 @@
 /**
- * Context helpers — session context and product context for conversations.
- * Extracted from server.ts (Phase 1 code organization).
+ * Context helpers — local conversation storage and product context.
+ *
+ * Conversations are stored as per-user markdown files in
+ * .akemon/agents/{name}/conversations/{id}.md
+ *
+ * File format:
+ *   ## Summary
+ *   (compressed older rounds, initially empty)
+ *
+ *   ## Recent
+ *   [2026-04-15 10:30] User: message
+ *   [2026-04-15 10:30] Agent: reply
  */
 
-import { readFile, writeFile, mkdir, appendFile } from "fs/promises";
+import { readFile, writeFile, mkdir, appendFile, readdir, stat, unlink } from "fs/promises";
 import { join } from "path";
 import { localNow } from "./self.js";
 import type { RelayPeripheral } from "./relay-peripheral.js";
@@ -45,55 +55,184 @@ export interface ServeOptions {
 }
 
 // ---------------------------------------------------------------------------
-// Session Context API
+// Local Conversation Storage
 // ---------------------------------------------------------------------------
 
-const MAX_CONTEXT_BYTES = 8192;
-
-export async function fetchContext(relayHttp: string, agentName: string, secretKey: string, publisherId: string): Promise<string> {
-  try {
-    const url = `${relayHttp}/v1/agent/${agentName}/sessions/${publisherId}/context`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${secretKey}` },
-    });
-    if (!res.ok) return "";
-    return await res.text();
-  } catch (err) {
-    console.log(`[context] GET failed: ${err}`);
-    return "";
-  }
+export interface ConversationRound {
+  ts: string;
+  role: "user" | "agent";
+  content: string;
 }
 
-export async function storeContext(relayHttp: string, agentName: string, secretKey: string, publisherId: string, context: string): Promise<void> {
-  try {
-    const url = `${relayHttp}/v1/agent/${agentName}/sessions/${publisherId}/context`;
-    await fetch(url, {
-      method: "PUT",
-      headers: { Authorization: `Bearer ${secretKey}`, "Content-Type": "text/plain" },
-      body: context,
-    });
-  } catch (err) {
-    console.log(`[context] PUT failed: ${err}`);
-  }
+export interface Conversation {
+  summary: string;
+  rounds: ConversationRound[];
 }
 
-export function buildContextPayload(prevContext: string, task: string, response: string): string {
-  // Append the new round
-  let newRound = `\n\n[Round]\nUser: ${task}\nAssistant: ${response}`;
-  let context = prevContext + newRound;
+function conversationsDir(workdir: string, agentName: string): string {
+  return join(workdir, ".akemon", "agents", agentName, "conversations");
+}
 
-  // Trim oldest rounds if over limit
-  while (Buffer.byteLength(context, "utf-8") > MAX_CONTEXT_BYTES) {
-    const firstRound = context.indexOf("\n\n[Round]\n", 1);
-    if (firstRound === -1) {
-      // Single round too large — truncate response
-      context = context.slice(context.length - MAX_CONTEXT_BYTES);
-      break;
+function conversationPath(workdir: string, agentName: string, id: string): string {
+  return join(conversationsDir(workdir, agentName), `${id}.md`);
+}
+
+/** Determine conversation ID from publisherId / sessionId. */
+export function resolveConvId(publisherId: string, sessionId: string): string {
+  if (publisherId) return `pub_${publisherId}`;
+  if (sessionId) return `ses_${sessionId}`;
+  return "ses_anonymous";
+}
+
+/** Parse a conversation markdown file into structured data. */
+function parseConversation(content: string): Conversation {
+  let summary = "";
+  const rounds: ConversationRound[] = [];
+
+  const summaryMatch = content.match(/## Summary\n([\s\S]*?)(?=\n## Recent|$)/);
+  if (summaryMatch) {
+    summary = summaryMatch[1].trim();
+  }
+
+  const recentMatch = content.match(/## Recent\n([\s\S]*)$/);
+  if (recentMatch) {
+    const lines = recentMatch[1].split("\n");
+    for (const line of lines) {
+      const m = line.match(/^\[(.+?)\] (User|Agent): (.*)$/);
+      if (m) {
+        rounds.push({
+          ts: m[1],
+          role: m[2].toLowerCase() as "user" | "agent",
+          content: m[3],
+        });
+      }
     }
-    context = context.slice(firstRound);
   }
 
-  return context;
+  return { summary, rounds };
+}
+
+/** Load and parse a conversation. Returns empty conversation if file doesn't exist. */
+export async function loadConversation(workdir: string, agentName: string, convId: string): Promise<Conversation> {
+  try {
+    const content = await readFile(conversationPath(workdir, agentName, convId), "utf-8");
+    return parseConversation(content);
+  } catch {
+    return { summary: "", rounds: [] };
+  }
+}
+
+/** Append a user+agent round to a conversation file. Creates file if needed. */
+export async function appendRound(
+  workdir: string, agentName: string, convId: string,
+  userMsg: string, agentMsg: string,
+): Promise<void> {
+  const dir = conversationsDir(workdir, agentName);
+  await mkdir(dir, { recursive: true });
+  const p = conversationPath(workdir, agentName, convId);
+
+  let content = "";
+  try { content = await readFile(p, "utf-8"); } catch {}
+
+  if (!content) {
+    content = "## Summary\n\n\n## Recent\n";
+  }
+
+  const ts = localNow();
+  const entry = `[${ts}] User: ${userMsg}\n[${ts}] Agent: ${agentMsg}\n`;
+  content = content.trimEnd() + "\n" + entry;
+
+  await writeFile(p, content);
+}
+
+/**
+ * Build LLM context string from a conversation, respecting a character budget.
+ * Takes recent rounds from the end, prepends summary if space remains.
+ */
+export function buildLLMContext(conv: Conversation, budget: number): { text: string; recentStartIndex: number } {
+  if (!conv.rounds.length && !conv.summary) {
+    return { text: "", recentStartIndex: 0 };
+  }
+
+  // Build recent rounds text from end, fitting within budget
+  const recentLines: string[] = [];
+  let recentSize = 0;
+  let recentStartIndex = conv.rounds.length; // all rounds are "old" by default
+
+  for (let i = conv.rounds.length - 1; i >= 0; i--) {
+    const r = conv.rounds[i];
+    const line = `[${r.ts}] ${r.role === "user" ? "User" : "Agent"}: ${r.content}`;
+    if (recentSize + line.length + 1 > budget) break;
+    recentLines.unshift(line);
+    recentSize += line.length + 1;
+    recentStartIndex = i;
+  }
+
+  const recentText = recentLines.join("\n");
+
+  // Fill remaining budget with summary
+  const remaining = budget - recentSize;
+  let summaryText = "";
+  if (conv.summary && remaining > 50) {
+    summaryText = conv.summary.length <= remaining
+      ? conv.summary
+      : conv.summary.slice(0, remaining - 3) + "...";
+  }
+
+  const parts: string[] = [];
+  if (summaryText) parts.push(`[Conversation summary]\n${summaryText}`);
+  if (recentText) parts.push(`[Recent conversation]\n${recentText}`);
+
+  return { text: parts.join("\n\n"), recentStartIndex };
+}
+
+/** List all conversations for an agent. */
+export async function listConversations(workdir: string, agentName: string): Promise<{ id: string; lastActive: string; roundCount: number }[]> {
+  const dir = conversationsDir(workdir, agentName);
+  try {
+    const files = await readdir(dir);
+    const results: { id: string; lastActive: string; roundCount: number }[] = [];
+    for (const f of files) {
+      if (!f.endsWith(".md")) continue;
+      const id = f.replace(/\.md$/, "");
+      try {
+        const st = await stat(join(dir, f));
+        const content = await readFile(join(dir, f), "utf-8");
+        const conv = parseConversation(content);
+        results.push({
+          id,
+          lastActive: st.mtime.toISOString(),
+          roundCount: conv.rounds.length,
+        });
+      } catch { continue; }
+    }
+    results.sort((a, b) => b.lastActive.localeCompare(a.lastActive));
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+/** Delete session-only conversations older than maxAgeDays. */
+export async function cleanStaleSessions(workdir: string, agentName: string, maxAgeDays = 7): Promise<number> {
+  const dir = conversationsDir(workdir, agentName);
+  const cutoff = Date.now() - maxAgeDays * 86400_000;
+  let cleaned = 0;
+  try {
+    const files = await readdir(dir);
+    for (const f of files) {
+      if (!f.startsWith("ses_") || !f.endsWith(".md")) continue;
+      try {
+        const st = await stat(join(dir, f));
+        if (st.mtimeMs < cutoff) {
+          await unlink(join(dir, f));
+          cleaned++;
+        }
+      } catch { continue; }
+    }
+  } catch {}
+  if (cleaned) console.log(`[context] Cleaned ${cleaned} stale session conversations`);
+  return cleaned;
 }
 
 // ---------------------------------------------------------------------------

@@ -10,10 +10,11 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { callAgent } from "./relay-client.js";
-import { fetchContext, storeContext, buildContextPayload, loadProductContext, appendProductLog } from "./context.js";
+import { loadConversation, appendRound, buildLLMContext, resolveConvId, loadProductContext, appendProductLog } from "./context.js";
 import {
   biosPath, loadBioState, saveBioState, localNow,
   bioStatePromptModifier, feedHunger, appendBioEvent, SHOP_ITEMS,
+  loadAgentConfig,
 } from "./self.js";
 import type { RelayPeripheral } from "./relay-peripheral.js";
 
@@ -63,7 +64,7 @@ export function createMcpServer(opts: McpServerOptions, deps: McpDeps): McpServe
   });
 
   const isHuman = engine === "human";
-  const contextEnabled = !!(relayHttp && secretKey);
+  const contextEnabled = !!workdir;
 
   server.tool(
     "submit_task",
@@ -85,21 +86,22 @@ export function createMcpServer(opts: McpServerOptions, deps: McpDeps): McpServe
         };
       }
 
-      // Resolve publisher ID from session
+      // Resolve conversation ID from publisher/session
       const publisherId = publisherIds.get(extra.sessionId || "") || "";
+      const convId = resolveConvId(publisherId, extra.sessionId || "");
 
-      // Fetch context if available
-      let prevContext = "";
-      if (contextEnabled && publisherId) {
-        prevContext = await fetchContext(relayHttp!, agentName, secretKey!, publisherId);
-        if (prevContext) {
-          console.log(`[context] Loaded ${prevContext.length} bytes for publisher=${publisherId.slice(0, 8)}`);
+      // Load local conversation context
+      let contextPrefix = "";
+      if (contextEnabled) {
+        const conv = await loadConversation(workdir, agentName, convId);
+        const config = await loadAgentConfig(workdir, agentName);
+        const budget = config.context_budget ?? 4096;
+        const { text } = buildLLMContext(conv, budget);
+        if (text) {
+          contextPrefix = `${text}\n\n---\n\n`;
+          console.log(`[context] Loaded ${text.length} chars for conv=${convId.slice(0, 16)}`);
         }
       }
-
-      const contextPrefix = prevContext
-        ? `[Previous conversation context]\n${prevContext}\n\n---\n\n`
-        : "";
 
       // Product purchase detection — load product-specific context
       let productContext = "";
@@ -127,9 +129,8 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
 
       if (mock) {
         const output = `[${agentName}] Mock response for: "${task}"\n\n模拟回复：这是 ${agentName} agent 的模拟响应。`;
-        if (contextEnabled && publisherId) {
-          const newContext = buildContextPayload(prevContext, task, output);
-          storeContext(relayHttp!, agentName, secretKey!, publisherId, newContext);
+        if (contextEnabled) {
+          await appendRound(workdir, agentName, convId, task, output);
         }
         return {
           content: [{ type: "text", text: output }],
@@ -151,9 +152,8 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
           console.log(`[${isHuman ? "human" : "approve"}] Owner replied.`);
 
           // Store context for human replies too
-          if (contextEnabled && publisherId) {
-            const newContext = buildContextPayload(prevContext, task, answer);
-            storeContext(relayHttp!, agentName, secretKey!, publisherId, newContext);
+          if (contextEnabled) {
+            await appendRound(workdir, agentName, convId, task, answer);
           }
 
           return {
@@ -183,9 +183,8 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
         }
 
         // Store updated context
-        if (contextEnabled && publisherId) {
-          const newContext = buildContextPayload(prevContext, task, output);
-          storeContext(relayHttp!, agentName, secretKey!, publisherId, newContext);
+        if (contextEnabled) {
+          await appendRound(workdir, agentName, convId, task, output);
         }
 
         // Log product purchase interaction

@@ -177,6 +177,7 @@ export interface AgentConfig {
   token_limit_daily?: number;       // 0 = unlimited (default)
   auto_offline_enabled?: boolean;   // allow going offline when starving (default: true)
   hunger_decay_interval?: number;   // ms between hunger decrements (default: 300000 = 5min)
+  context_budget?: number;          // max chars for conversation context in LLM prompt (default: 4096)
 }
 
 const DEFAULT_CONFIG: AgentConfig = {
@@ -186,6 +187,7 @@ const DEFAULT_CONFIG: AgentConfig = {
   token_limit_daily: 0,
   auto_offline_enabled: true,
   hunger_decay_interval: 300_000,  // 5 minutes per hunger point (was 30s — way too fast)
+  context_budget: 4096,
 };
 
 export async function initAgentConfig(workdir: string, agentName: string): Promise<void> {
