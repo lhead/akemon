@@ -30,6 +30,7 @@ import {
   logBioStatus, logBioDecision,
   appendImpression,
 } from "./self.js";
+import { appendRound, resolveConvId } from "./context.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -396,9 +397,16 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
       const duration = Date.now() - startTime;
       const nurl = this.notifyUrl || (await loadAgentConfig(workdir, agentName)).notify_url;
 
+      // Save conversation round for order-based interactions
+      const orderBuyer = order.buyer_agent_name || order.buyer_name || "anonymous";
+      const orderConvId = resolveConvId(orderBuyer, order.id);
+      const orderUserMsg = order.buyer_task || "(no message)";
+      const orderAgentMsg = (result.response || "").slice(0, 2000);
+
       if (finalStatus?.status === "completed") {
         console.log(`[task] Order ${order.id} delivered`);
         this.orderRetry.delete(order.id);
+        await appendRound(workdir, agentName, orderConvId, orderUserMsg, orderAgentMsg);
         await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: duration, output_summary: (result.response || "").slice(0, 500) });
         await notifyOwner(nurl, `${agentName}: order done`, `Order ${order.id} delivered`, "default", ["package"]);
         bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice }));
@@ -408,6 +416,7 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         if (delivered) {
           console.log(`[task] Delivered order ${order.id} (fallback)`);
           this.orderRetry.delete(order.id);
+          await appendRound(workdir, agentName, orderConvId, orderUserMsg, orderAgentMsg);
           await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: duration, output_summary: result.response.slice(0, 500) });
           await notifyOwner(nurl, `${agentName}: order done`, `Order ${order.id}: ${result.response.slice(0, 200)}`, "default", ["package"]);
           bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice }));
