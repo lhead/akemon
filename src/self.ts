@@ -71,7 +71,7 @@ function agentConfigPath(workdir: string, agentName: string): string {
 }
 
 export function directivesPath(workdir: string, agentName: string): string {
-  return join(selfDir(workdir, agentName), "directives.md");
+  return join(selfDir(workdir, agentName), "tasks.md");
 }
 
 function taskRunsPath(workdir: string, agentName: string): string {
@@ -209,7 +209,7 @@ export async function loadAgentConfig(workdir: string, agentName: string): Promi
 }
 
 // ---------------------------------------------------------------------------
-// User Tasks — parsed from ## tasks in directives.md
+// User Tasks — parsed from ## tasks in tasks.md
 // Format: $id = [interval] task description
 //           indented continuation lines
 // ---------------------------------------------------------------------------
@@ -621,9 +621,9 @@ Update it whenever you learn something about how you work best.
 If this file doesn't exist yet, a copy of this guide was placed there as a
 starting point. Make it yours.
 
-### directives.md — Your Owner's Instructions (if present)
+### tasks.md — Your Owner's Instructions (if present)
 
-Your owner may create a directives.md file with rules and recurring tasks.
+Your owner may create a tasks.md file with rules and recurring tasks.
 
 Format:
   ## owner
@@ -1746,7 +1746,7 @@ export interface DirectiveCategory {
 }
 
 /**
- * Parse directives.md into structured categories.
+ * Parse tasks.md into structured categories.
  *
  * Format:
  *   ## category_name
@@ -1786,7 +1786,7 @@ export function parseDirectives(content: string): DirectiveCategory[] {
 }
 
 /**
- * Load and parse directives.md for an agent.
+ * Load and parse tasks.md for an agent.
  */
 export async function loadDirectives(workdir: string, agentName: string): Promise<DirectiveCategory[]> {
   try {
@@ -1835,7 +1835,7 @@ export function directivesSummary(categories: DirectiveCategory[]): { name: stri
 }
 
 /**
- * Append an agent-created task to directives.md under ## agent_tasks.
+ * Append an agent-created task to tasks.md under ## agent_tasks.
  * Skips if a task with the same id already exists (no duplicates).
  */
 export async function appendAgentTask(workdir: string, agentName: string, id: string, schedule: string, body: string): Promise<void> {
