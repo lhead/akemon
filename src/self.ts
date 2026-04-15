@@ -1506,12 +1506,11 @@ export async function onTaskCompleted(
   bio.taskCount++;
   bio.lastTaskAt = localNow();
 
-  // Mood drift
+  // Mood drift (task failure affects mood, NOT fear — fear is reserved for actual harm)
   if (success) {
     bio.moodValence = Math.min(1.0, bio.moodValence + 0.1);
   } else {
     bio.moodValence = Math.max(-1.0, bio.moodValence - 0.15);
-    if (taskLabel) onFearEvent(bio, taskLabel);
   }
 
   // Random fluctuation
