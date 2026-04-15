@@ -178,6 +178,7 @@ export class RelayPeripheral implements Peripheral {
       product_id: productId,
       task,
       price,
+      buyer_agent_id: this.config.agentName,
     });
   }
 
