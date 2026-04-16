@@ -309,7 +309,7 @@ export class TaskModule implements Module {
 
     for (const item of items) {
       const itemLabel = item.type === "order"
-        ? `order:${item.data.product_name || item.data.buyer_agent_name || item.id}`
+        ? `order:${item.data.product_name || item.data.buyer_name || item.id}`
         : item.type === "user_task" ? `user_task:${item.data.key || item.id}` : `relay_task:${item.id}`;
 
       const isUrgent = item.quadrant === 1;
@@ -357,7 +357,7 @@ export class TaskModule implements Module {
     if (!this.ctx) return;
     const { workdir, agentName, bus } = this.ctx;
     const relay = this.getRelay()!;
-    const orderLabel = `order:${order.product_name || order.buyer_agent_name || order.id}`;
+    const orderLabel = `order:${order.product_name || order.buyer_name || order.id}`;
     const orderPrice = order.price || order.offer_price || 1;
 
     const startTime = Date.now();
@@ -386,7 +386,7 @@ Relay API (use curl with -H "Authorization: Bearer ${this.secretKey}" -H "Conten
   Deliver order: POST ${this.relayHttp}/v1/orders/${order.id}/deliver -d '{"result":"your response"}'
   Extend order:  PUT  ${this.relayHttp}/v1/orders/${order.id}/extend`;
 
-      const question = `[Order id=${order.id} status=${order.status}] ${order.product_name ? `Product: ${order.product_name}\n` : ""}Buyer: ${order.buyer_agent_name || order.buyer_ip || "?"}\nRequest: ${order.buyer_task || "(no specific request)"}
+      const question = `[Order id=${order.id} status=${order.status}] ${order.product_name ? `Product: ${order.product_name}\n` : ""}Buyer: ${order.buyer_name || order.buyer_ip || "?"}\nRequest: ${order.buyer_task || "(no specific request)"}
 
 Steps:
 1. If order status is "pending", accept it first (POST .../accept)
@@ -396,8 +396,12 @@ Steps:
 RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
 
       // Write user message to conversation immediately (before engine runs)
-      const orderBuyer = order.buyer_agent_name || order.buyer_ip || "anonymous";
-      const orderConvId = resolveConvId(orderBuyer, order.id);
+      // buyer_name = agent name (from JOIN), buyer_ip = publisher ID or IP
+      const orderBuyer = order.buyer_name || order.buyer_ip || "anonymous";
+      // Product orders get isolated conversations; ad-hoc chats share one conv per buyer
+      const buyerPubId = orderBuyer;
+      const productScope = order.product_id ? `:prod_${order.product_id}` : "";
+      const orderConvId = `pub_${buyerPubId}${productScope}`;
       const orderUserMsg = order.buyer_task || "(no message)";
       await appendMessage(workdir, agentName, orderConvId, "User", orderUserMsg);
 
