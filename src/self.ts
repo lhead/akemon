@@ -58,6 +58,18 @@ export function pagesDir(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "pages");
 }
 
+export function rolesDir(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "roles");
+}
+
+export function playbooksDir(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "playbooks");
+}
+
+export function productsDir(workdir: string, agentName: string): string {
+  return join(selfDir(workdir, agentName), "products");
+}
+
 export function guidePath(workdir: string, agentName: string): string {
   return join(selfDir(workdir, agentName), "guide.md");
 }
@@ -195,6 +207,7 @@ export async function initAgentConfig(workdir: string, agentName: string): Promi
   try {
     await readFile(p, "utf-8");
   } catch {
+    await mkdir(join(workdir, ".akemon", "agents", agentName), { recursive: true });
     await writeFile(p, JSON.stringify(DEFAULT_CONFIG, null, 2) + "\n");
     console.log(`[self] Created config.json with defaults`);
   }

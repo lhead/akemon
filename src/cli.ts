@@ -46,6 +46,7 @@ program
   .option("--with <modules>", "Enable specific modules (comma-separated: biostate,memory)")
   .option("--without <modules>", "Disable specific modules (comma-separated: biostate,memory)")
   .option("--script <name>", "Script to load for ScriptModule (default: daily-life)", "daily-life")
+  .option("--terminal", "Enable remote terminal access (PTY)")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
     const port = parseInt(opts.port);
@@ -107,6 +108,7 @@ program
       price: parseInt(opts.price) || 1,
       avatar,
       onOrderNotify,
+      enableTerminal: opts.terminal,
     });
   });
 

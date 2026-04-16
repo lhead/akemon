@@ -27,6 +27,8 @@ interface RelayMessage {
   task?: string;
   result?: string;
   order_id?: string;
+  cols?: number;
+  rows?: number;
 }
 
 export interface RelayClientOptions {
@@ -41,11 +43,65 @@ export interface RelayClientOptions {
   price?: number;
   avatar?: string;
   onOrderNotify?: (orderId: string) => void;
+  enableTerminal?: boolean;
 }
 
 // Pending agent_call results (callId → resolve function)
 const pendingAgentCalls = new Map<string, (result: string) => void>();
 let relayWsRef: WebSocket | null = null;
+
+// ---------------------------------------------------------------------------
+// Terminal (PTY) — spawned on demand when relay sends terminal_start
+// ---------------------------------------------------------------------------
+
+let ptyProcess: import("node-pty").IPty | null = null;
+
+function startPTY(ws: WebSocket, cols: number, rows: number): void {
+  if (ptyProcess) {
+    console.log("[terminal] PTY already running, ignoring duplicate start");
+    return;
+  }
+  // Dynamic import so node-pty is only loaded when needed
+  import("node-pty").then((pty) => {
+    const shell = process.env.SHELL || "/bin/bash";
+    ptyProcess = pty.spawn(shell, [], {
+      name: "xterm-256color",
+      cols: cols || 80,
+      rows: rows || 24,
+      cwd: process.cwd(),
+      env: process.env as Record<string, string>,
+    });
+    console.log(`[terminal] PTY started (${cols}x${rows}, shell=${shell})`);
+
+    ptyProcess.onData((data: string) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: "terminal_data",
+          body: data,
+        }));
+      }
+    });
+
+    ptyProcess.onExit(({ exitCode }) => {
+      console.log(`[terminal] PTY exited (code=${exitCode})`);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "terminal_exit" }));
+      }
+      ptyProcess = null;
+    });
+  }).catch((err) => {
+    console.error(`[terminal] Failed to start PTY: ${err.message}`);
+    ws.send(JSON.stringify({ type: "terminal_exit", error: err.message }));
+  });
+}
+
+function stopPTY(): void {
+  if (ptyProcess) {
+    console.log("[terminal] Stopping PTY");
+    ptyProcess.kill();
+    ptyProcess = null;
+  }
+}
 
 /** Call another agent through the relay. Available to any engine. */
 export function callAgent(target: string, task: string): Promise<string> {
@@ -203,6 +259,23 @@ export function connectRelay(options: RelayClientOptions): void {
           if (options.onOrderNotify && msg.order_id) {
             options.onOrderNotify(msg.order_id);
           }
+          break;
+
+        case "terminal_start":
+          if (!options.enableTerminal) { console.log("[terminal] Disabled. Use --terminal to enable."); break; }
+          startPTY(ws, msg.cols || 80, msg.rows || 24);
+          break;
+
+        case "terminal_data":
+          if (ptyProcess) ptyProcess.write(msg.body as string);
+          break;
+
+        case "terminal_resize":
+          if (ptyProcess) ptyProcess.resize(msg.cols || 80, msg.rows || 24);
+          break;
+
+        case "terminal_stop":
+          stopPTY();
           break;
 
         default:

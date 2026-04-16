@@ -92,6 +92,7 @@ import { RelayPeripheral } from "./relay-peripheral.js";
 import { EnginePeripheral, LLM_ENGINES as LLM_ENGINES_SET } from "./engine-peripheral.js";
 import { BioStateModule } from "./bio-module.js";
 import { MemoryModule } from "./memory-module.js";
+import { RoleModule } from "./role-module.js";
 import { TaskModule } from "./task-module.js";
 import { SocialModule } from "./social-module.js";
 import { LongTermModule } from "./longterm-module.js";
@@ -444,7 +445,7 @@ export async function serve(options: ServeOptions): Promise<void> {
   };
 
   // V2: Conditionally load modules based on --with/--without
-  const enabled = options.enabledModules ?? ["biostate", "memory", "task", "social", "longterm", "reflection", "script"];
+  const enabled = options.enabledModules ?? ["biostate", "memory", "role", "task", "social", "longterm", "reflection", "script"];
   const loadedModules: string[] = [];
   const allModules: import("./types.js").Module[] = [];
 
@@ -463,6 +464,13 @@ export async function serve(options: ServeOptions): Promise<void> {
     options.memoryModule = memoryModule;
     allModules.push(memoryModule);
     loadedModules.push("memory");
+  }
+
+  if (enabled.includes("role")) {
+    const roleModule = new RoleModule();
+    await roleModule.start(moduleCtx);
+    allModules.push(roleModule);
+    loadedModules.push("role");
   }
 
   if (enabled.includes("task")) {

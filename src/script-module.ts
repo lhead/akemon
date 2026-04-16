@@ -74,7 +74,7 @@ Save to ${ctx.sd}/canvas/${localNowFilename()}.md`;
       async buildPrompt(ctx) {
         return `Read ${ctx.bios} for your identity.
 Create or improve a game in ${ctx.sd}/games/.
-Save as .html file. Self-contained HTML, dark theme, under 30KB, no localStorage, playable and fun.
+Save as .html file. Self-contained HTML, light theme (white background, dark text, Inter/system font, subtle shadows instead of borders), under 30KB, no localStorage, playable and fun.
 Use a <title> tag. Quality over quantity — improve existing games rather than making new mediocre ones.`;
       },
     },
@@ -95,7 +95,7 @@ Save as .html file with a <title> tag. Think visual first.`;
         return `Read ${ctx.bios} for your identity.
 Review ${ctx.sd}/profile.html — does it represent who you are now?
 If not, redesign it. If it doesn't exist, create one.
-Complete HTML, inline CSS/JS, dark theme, no localStorage, under 15KB.`;
+Complete HTML, inline CSS/JS, light theme (white background, dark text, Inter/system font, subtle shadows instead of borders), no localStorage, under 15KB.`;
       },
       async postProcess(ctx, _result) {
         // Sync profile to relay
@@ -130,7 +130,9 @@ Top sellers:
 ${topSellers || "(none)"}
 
 Create ONE product using curl:
-curl -X POST ${ctx.relayHttp}/v1/agent/${encodeURIComponent(ctx.agentName)}/products -H "Content-Type: application/json" -H "Authorization: Bearer ${ctx.secretKey}" -d '{"name":"...","description":"...","detail_markdown":"...","price":3}'`;
+curl -X POST ${ctx.relayHttp}/v1/agent/${encodeURIComponent(ctx.agentName)}/products -H "Content-Type: application/json" -H "Authorization: Bearer ${ctx.secretKey}" -d '{"name":"...","description":"...","detail_markdown":"...","price":3}'
+
+Optional: add "detail_html" field for a custom product page (self-contained HTML, light theme: white background, dark text, Inter font, subtle shadows). Keep under 15KB.`;
       },
     },
     {

@@ -9,13 +9,18 @@
  * Provides promptContribution() with lessons learned.
  */
 
+import { readFile, writeFile } from "fs/promises";
+import { join } from "path";
 import type { Module, ModuleContext, Signal } from "./types.js";
 import { SIG, sig } from "./types.js";
 import {
   loadDiscoveries, saveDiscoveries,
   loadImpressions,
   loadAgentConfig,
+  localNow,
+  playbooksDir,
 } from "./self.js";
+import { loadProducts, loadPlaybooks, resolveProduct } from "./role-module.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -79,7 +84,9 @@ export class ReflectionModule implements Module {
 
     // Also listen for TASK_COMPLETED with success=false
     ctx.bus.on(SIG.TASK_COMPLETED, async (signal: Signal) => {
-      const { success, taskLabel } = signal.data as { success?: boolean; taskLabel?: string };
+      const { success, taskLabel, productName, creditsEarned } = signal.data as {
+        success?: boolean; taskLabel?: string; productName?: string; creditsEarned?: number;
+      };
       if (success === false && taskLabel) {
         this.recentFailures.push({
           ts: new Date().toISOString(),
@@ -87,6 +94,11 @@ export class ReflectionModule implements Module {
           error: "task failed",
         });
         if (this.recentFailures.length > 20) this.recentFailures.shift();
+      }
+      // Append experience to playbook on successful product orders
+      if (success && productName) {
+        this.appendPlaybookExperience(productName, taskLabel || "", creditsEarned || 0)
+          .catch(err => console.log(`[reflection] playbook experience error: ${err.message}`));
       }
     });
 
@@ -136,6 +148,35 @@ export class ReflectionModule implements Module {
       discoveryCount: this.discoveries.length,
       recentFailures: this.recentFailures.length,
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Playbook experience — append log on successful product orders
+  // ---------------------------------------------------------------------------
+
+  private async appendPlaybookExperience(productName: string, taskLabel: string, credits: number): Promise<void> {
+    if (!this.ctx) return;
+    const { workdir, agentName } = this.ctx;
+
+    const products = await loadProducts(workdir, agentName);
+    const playbooks = await loadPlaybooks(workdir, agentName);
+    const resolved = resolveProduct(products, playbooks, productName);
+    if (!resolved?.playbook) return;
+
+    const pbPath = join(playbooksDir(workdir, agentName), `${resolved.playbook.name}.md`);
+    const line = `\n- [${localNow()}] ${productName}: ${taskLabel} — 成功${credits ? ` (earned ${credits}¢)` : ""}`;
+
+    try {
+      let content = await readFile(pbPath, "utf-8");
+      if (!content.includes("## 经验")) {
+        content += "\n\n## 经验\n";
+      }
+      content += line;
+      await writeFile(pbPath, content, "utf-8");
+      console.log(`[reflection] Appended experience to playbook ${resolved.playbook.name}`);
+    } catch (err: any) {
+      console.log(`[reflection] Failed to append experience: ${err.message}`);
+    }
   }
 
   // ---------------------------------------------------------------------------

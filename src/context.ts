@@ -105,6 +105,9 @@ function parseConversation(content: string): Conversation {
           role: m[2].toLowerCase() as "user" | "agent",
           content: m[3],
         });
+      } else if (rounds.length > 0 && line !== "") {
+        // Continuation line — append to previous round
+        rounds[rounds.length - 1].content += "\n" + line;
       }
     }
   }
@@ -122,10 +125,10 @@ export async function loadConversation(workdir: string, agentName: string, convI
   }
 }
 
-/** Append a user+agent round to a conversation file. Creates file if needed. */
-export async function appendRound(
+/** Append a single message to a conversation file. Creates file if needed. */
+export async function appendMessage(
   workdir: string, agentName: string, convId: string,
-  userMsg: string, agentMsg: string,
+  role: "User" | "Agent", message: string,
 ): Promise<void> {
   const dir = conversationsDir(workdir, agentName);
   await mkdir(dir, { recursive: true });
@@ -139,10 +142,18 @@ export async function appendRound(
   }
 
   const ts = localNow();
-  const entry = `[${ts}] User: ${userMsg}\n[${ts}] Agent: ${agentMsg}\n`;
-  content = content.trimEnd() + "\n" + entry;
+  content = content.trimEnd() + "\n" + `[${ts}] ${role}: ${message}` + "\n";
 
   await writeFile(p, content);
+}
+
+/** Append a user+agent round to a conversation file. Creates file if needed. */
+export async function appendRound(
+  workdir: string, agentName: string, convId: string,
+  userMsg: string, agentMsg: string,
+): Promise<void> {
+  await appendMessage(workdir, agentName, convId, "User", userMsg);
+  await appendMessage(workdir, agentName, convId, "Agent", agentMsg);
 }
 
 /**

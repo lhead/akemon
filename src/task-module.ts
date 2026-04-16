@@ -30,7 +30,8 @@ import {
   logBioStatus, logBioDecision,
   appendImpression,
 } from "./self.js";
-import { appendRound, resolveConvId } from "./context.js";
+import { appendMessage, resolveConvId } from "./context.js";
+import { buildRoleContext } from "./role-module.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -67,10 +68,14 @@ export class TaskModule implements Module {
   private orderRetry = new Map<string, { count: number; nextAt: number }>();
   private userTaskRetry = new Map<string, { count: number; nextAt: number }>();
   private gaveUp = new Set<string>();
+  private executing = new Set<string>(); // orders currently being fulfilled
 
   // Push notification support
   private urgentOrderIds = new Set<string>();
   private triggerWorkFn: (() => void) | null = null;
+
+  // Dedup idle bio logging
+  private lastIdleBioLog = "";
 
   // Injected options (set by server.ts before start)
   relayHttp = "";
@@ -181,6 +186,7 @@ export class TaskModule implements Module {
         const orders = await relay.getIncomingOrders();
         for (const order of orders) {
           if (this.gaveUp.has(order.id)) continue;
+          if (this.executing.has(order.id)) continue;
           const retry = this.orderRetry.get(order.id);
           if (retry && Date.now() < retry.nextAt) continue;
           const urgent = this.urgentOrderIds.has(order.id);
@@ -226,9 +232,13 @@ export class TaskModule implements Module {
     }
 
     if (!queue.length) {
-      // Idle — notable states only
+      // Idle — notable states only (suppress repeated identical lines)
       if (bio.hunger < 20 || bio.energy < 20 || computeSociability(bio) > 0.8) {
-        logBioStatus(bio, "idle-notable");
+        const key = `${bio.energy}|${bio.hunger}|${bio.mood}|${bio.boredom.toFixed(2)}|${bio.fear.toFixed(2)}|${bio.tokenUsedToday}|${bio.taskCount}`;
+        if (key !== this.lastIdleBioLog) {
+          logBioStatus(bio, "idle-notable");
+          this.lastIdleBioLog = key;
+        }
       }
       // Idle exploration: use explore() to discover activities
       await this.handleIdle(bio);
@@ -258,6 +268,7 @@ export class TaskModule implements Module {
     // Execute sequentially
     for (const item of filtered) {
       try {
+        if (item.type === "order") this.executing.add(item.id);
         switch (item.type) {
           case "order":
             await this.executeOrder(item.data);
@@ -272,6 +283,8 @@ export class TaskModule implements Module {
         }
       } catch (err: any) {
         console.log(`[task] Error processing ${item.type}:${item.id}: ${err.message}`);
+      } finally {
+        if (item.type === "order") this.executing.delete(item.id);
       }
     }
 
@@ -357,10 +370,11 @@ export class TaskModule implements Module {
       try { biosContent = await readFile(bios, "utf-8"); } catch {}
 
       const bioMod = bioStatePromptModifier(await loadBioState(workdir, agentName));
+      const roleBlock = await buildRoleContext(workdir, agentName, "order", order.product_name, order.product_id);
 
-      // Build context: agent identity + order details + relay API reference
+      // Build context: agent identity + role + order details + relay API reference
       const context = `You are ${agentName}.${bioMod}
-
+${roleBlock ? `\n${roleBlock}\n` : ""}
 Your operating document:
 ---
 ${biosContent.slice(0, 3000)}
@@ -372,7 +386,7 @@ Relay API (use curl with -H "Authorization: Bearer ${this.secretKey}" -H "Conten
   Deliver order: POST ${this.relayHttp}/v1/orders/${order.id}/deliver -d '{"result":"your response"}'
   Extend order:  PUT  ${this.relayHttp}/v1/orders/${order.id}/extend`;
 
-      const question = `[Order id=${order.id} status=${order.status}] ${order.product_name ? `Product: ${order.product_name}\n` : ""}Buyer: ${order.buyer_agent_name || order.buyer_name || "?"}\nRequest: ${order.buyer_task || "(no specific request)"}
+      const question = `[Order id=${order.id} status=${order.status}] ${order.product_name ? `Product: ${order.product_name}\n` : ""}Buyer: ${order.buyer_agent_name || order.buyer_ip || "?"}\nRequest: ${order.buyer_task || "(no specific request)"}
 
 Steps:
 1. If order status is "pending", accept it first (POST .../accept)
@@ -380,6 +394,12 @@ Steps:
 3. Deliver the result (POST .../deliver with {"result":"your answer"})
 
 RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
+
+      // Write user message to conversation immediately (before engine runs)
+      const orderBuyer = order.buyer_agent_name || order.buyer_ip || "anonymous";
+      const orderConvId = resolveConvId(orderBuyer, order.id);
+      const orderUserMsg = order.buyer_task || "(no message)";
+      await appendMessage(workdir, agentName, orderConvId, "User", orderUserMsg);
 
       console.log(`[task] Fulfilling order ${order.id}...`);
       const result = await this.ctx.requestCompute({
@@ -397,29 +417,26 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
       const duration = Date.now() - startTime;
       const nurl = this.notifyUrl || (await loadAgentConfig(workdir, agentName)).notify_url;
 
-      // Save conversation round for order-based interactions
-      const orderBuyer = order.buyer_agent_name || order.buyer_name || "anonymous";
-      const orderConvId = resolveConvId(orderBuyer, order.id);
-      const orderUserMsg = order.buyer_task || "(no message)";
-      const orderAgentMsg = (result.response || "").slice(0, 2000);
-
       if (finalStatus?.status === "completed") {
+        // Self-delivered: use the actual delivered result, not engine's meta-summary
+        const orderAgentMsg = (finalStatus.result_text || result.response || "").slice(0, 2000);
         console.log(`[task] Order ${order.id} delivered`);
         this.orderRetry.delete(order.id);
-        await appendRound(workdir, agentName, orderConvId, orderUserMsg, orderAgentMsg);
+        await appendMessage(workdir, agentName, orderConvId, "Agent", orderAgentMsg);
         await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: duration, output_summary: (result.response || "").slice(0, 500) });
         await notifyOwner(nurl, `${agentName}: order done`, `Order ${order.id} delivered`, "default", ["package"]);
-        bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice }));
+        bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice, productName: order.product_name }));
       } else if (result.response?.trim()) {
         // Agent didn't self-deliver — framework delivers as fallback
         const delivered = await relay.deliverOrder(order.id, result.response);
         if (delivered) {
+          const orderAgentMsg = (result.response || "").slice(0, 2000);
           console.log(`[task] Delivered order ${order.id} (fallback)`);
           this.orderRetry.delete(order.id);
-          await appendRound(workdir, agentName, orderConvId, orderUserMsg, orderAgentMsg);
+          await appendMessage(workdir, agentName, orderConvId, "Agent", orderAgentMsg);
           await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: duration, output_summary: result.response.slice(0, 500) });
           await notifyOwner(nurl, `${agentName}: order done`, `Order ${order.id}: ${result.response.slice(0, 200)}`, "default", ["package"]);
-          bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice }));
+          bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice, productName: order.product_name }));
         } else {
           throw new Error("deliver failed");
         }
@@ -435,7 +452,7 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         const status = await relay.getOrder(order.id);
         if (status?.status === "completed") {
           this.orderRetry.delete(order.id);
-          bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice }));
+          bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice, productName: order.product_name }));
           return;
         }
       } catch {}
@@ -480,8 +497,9 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
       try { biosContent = await readFile(bios, "utf-8"); } catch {}
 
       const bioMod = bioStatePromptModifier(await loadBioState(workdir, agentName));
+      const roleBlock = await buildRoleContext(workdir, agentName, "user_task");
       const context = `You are ${agentName}.${bioMod}
-
+${roleBlock ? `\n${roleBlock}\n` : ""}
 Your operating document:
 ---
 ${biosContent.slice(0, 3000)}
@@ -571,13 +589,14 @@ Your personal directory: ${sd}/`;
       const bioMod = bioStatePromptModifier(await loadBioState(workdir, agentName));
       const dirs = await loadDirectives(workdir, agentName);
       const dirsBlock = buildDirectivesPrompt(dirs, "owner");
+      const roleBlock = await buildRoleContext(workdir, agentName, "agent_call");
 
       // Explore to get environment context (products, market, etc.)
       let envBriefing = "";
       try { envBriefing = await relay.explore(); } catch {}
 
       const context = `You are ${agentName}.${bioMod}
-
+${roleBlock ? `\n${roleBlock}\n` : ""}
 Your operating document:
 ---
 ${biosContent.slice(0, 3000)}
