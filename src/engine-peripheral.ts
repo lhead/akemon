@@ -50,9 +50,6 @@ export class EnginePeripheral implements Peripheral {
   private config: EngineConfig;
   private bus: EventBus | null = null;
 
-  /** Engine mutual exclusion — only one engine process at a time */
-  busy = false;
-  busySince = 0;
   /** Last execution trace (for error reporting) */
   lastTrace: any[] = [];
 
@@ -111,32 +108,6 @@ export class EnginePeripheral implements Peripheral {
   }
 
   // ---------------------------------------------------------------------------
-  // Engine mutex helpers
-  // ---------------------------------------------------------------------------
-
-  acquire(): boolean {
-    if (this.busy) return false;
-    this.busy = true;
-    this.busySince = Date.now();
-    return true;
-  }
-
-  release(): void {
-    this.busy = false;
-    this.busySince = 0;
-  }
-
-  /** Watchdog: reset if stuck for > 10 min */
-  checkStuck(): boolean {
-    if (this.busy && this.busySince > 0 && Date.now() - this.busySince > 10 * 60 * 1000) {
-      console.log(`[watchdog] engine stuck for ${Math.round((Date.now() - this.busySince) / 1000)}s, force-resetting`);
-      this.release();
-      return true;
-    }
-    return false;
-  }
-
-  // ---------------------------------------------------------------------------
   // Unified engine runner
   // ---------------------------------------------------------------------------
 
@@ -144,13 +115,14 @@ export class EnginePeripheral implements Peripheral {
     task: string,
     allowAll?: boolean,
     extraAllowedTools?: string[],
+    signal?: AbortSignal,
   ): Promise<string> {
     const { engine, model, workdir } = this.config;
     if (engine === "raw") {
       return this.runRawEngine(task);
     }
     const cmd = buildEngineCommand(engine, model, allowAll ?? this.config.allowAll, extraAllowedTools);
-    return runCommand(cmd.cmd, cmd.args, task, workdir, cmd.stdinMode);
+    return runCommand(cmd.cmd, cmd.args, task, workdir, cmd.stdinMode, signal);
   }
 
   // ---------------------------------------------------------------------------
@@ -463,6 +435,7 @@ function runCommand(
   task: string,
   cwd: string,
   stdinMode: boolean = true,
+  signal?: AbortSignal,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const { CLAUDECODE, ...cleanEnv } = process.env;
@@ -472,8 +445,22 @@ function runCommand(
       cwd,
       env: cleanEnv,
       stdio: [stdinMode ? "pipe" : "ignore", "pipe", "pipe"],
-      timeout: 300_000,
     });
+
+    // Abort → SIGTERM, then SIGKILL after a grace period so a hung engine can't
+    // hold the slot past the caller's deadline.
+    let aborted = false;
+    const onAbort = () => {
+      if (aborted) return;
+      aborted = true;
+      console.log(`[${cmd}] aborted, killing pid=${child.pid}`);
+      try { child.kill("SIGTERM"); } catch {}
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 3000).unref();
+    };
+    if (signal) {
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
 
     if (stdinMode && child.stdin) {
       child.stdin.on("error", () => {});
@@ -492,10 +479,15 @@ function runCommand(
       stderr += chunk.toString();
     });
 
-    child.on("close", (code) => {
-      console.log(`[${cmd}] exit=${code} stdout=${stdout.length}b stderr=${stderr.length}b`);
+    child.on("close", (code, killSignal) => {
+      signal?.removeEventListener("abort", onAbort);
+      console.log(`[${cmd}] exit=${code}${killSignal ? ` signal=${killSignal}` : ""} stdout=${stdout.length}b stderr=${stderr.length}b`);
       if (stderr) console.log(`[${cmd}] stderr:\n${stderr}`);
       if (stdout) console.log(`[${cmd}] stdout:\n${stdout}`);
+      if (aborted) {
+        reject(new Error(`${cmd} aborted`));
+        return;
+      }
       const output = stdout.trim();
       if (output) {
         resolve(output);
@@ -504,6 +496,9 @@ function runCommand(
       }
     });
 
-    child.on("error", reject);
+    child.on("error", (err) => {
+      signal?.removeEventListener("abort", onAbort);
+      reject(err);
+    });
   });
 }

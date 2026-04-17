@@ -225,7 +225,7 @@ ${discText}`,
 - Lower confidence on disproven beliefs
 
 Reply ONLY JSON: {"discoveries":[{"capability":"skill or lesson","confidence":0.0-1.0,"evidence":"what supports this"}]}`,
-      priority: "low",
+      priority: "normal",
     });
 
     if (result.success && result.response) {

@@ -622,7 +622,7 @@ Complete this task. Use the environment info above and tools (curl, etc.) as nee
       const result = await this.ctx.requestCompute({
         context,
         question,
-        priority: "normal",
+        priority: "low",
         tools: ["Bash(curl *)"],
         relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,
       });

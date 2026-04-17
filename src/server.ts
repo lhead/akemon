@@ -16,10 +16,16 @@ import {
 let _engineP: EnginePeripheral | null = null;
 let _bus: import("./types.js").EventBus | null = null;
 
-// Engine mutual exclusion — module-level state (unified in Step 6)
-let engineBusy = false;
-let engineBusySince = 0;
+// Engine mutual exclusion — priority queue so modules can't starve each other
+const engineQueue = new EngineQueue();
 let lastEngineTrace: any[] = [];
+
+// How long a caller will wait for the engine slot before giving up.
+const ENGINE_WAIT_DEADLINE_MS = 5 * 60 * 1000;
+// Hard cap on a single engine run. Beyond this the subprocess is aborted so
+// the slot is returned to the queue. Shorter than the old 8 min — opencode
+// runs that take longer almost always hang forever.
+const ENGINE_EXEC_TIMEOUT_MS = 3 * 60 * 1000;
 
 
 // ---------------------------------------------------------------------------
@@ -90,6 +96,7 @@ function promptOwner(task: string, isHuman: boolean): Promise<string> {
 
 import { RelayPeripheral } from "./relay-peripheral.js";
 import { EnginePeripheral, LLM_ENGINES as LLM_ENGINES_SET } from "./engine-peripheral.js";
+import { EngineQueue } from "./engine-queue.js";
 import { BioStateModule } from "./bio-module.js";
 import { MemoryModule } from "./memory-module.js";
 import { RoleModule } from "./role-module.js";
@@ -115,11 +122,11 @@ const LLM_ENGINES = LLM_ENGINES_SET;
 // ---------------------------------------------------------------------------
 
 /** Unified engine runner — delegates to EnginePeripheral */
-function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[], relay?: { http: string; agentName: string }): Promise<string> {
+function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[], relay?: { http: string; agentName: string }, signal?: AbortSignal): Promise<string> {
   if (!_engineP) {
     throw new Error("Engine peripheral not initialized");
   }
-  const result = _engineP.runEngine(task, allowAll, extraAllowedTools);
+  const result = _engineP.runEngine(task, allowAll, extraAllowedTools, signal);
   // Sync trace back to module-level for reporting
   result.then(() => { lastEngineTrace = _engineP!.lastTrace; }).catch(() => { lastEngineTrace = _engineP!.lastTrace; });
   return result;
@@ -175,8 +182,11 @@ export async function serve(options: ServeOptions): Promise<void> {
     runCollaborativeQuery: (task, selfName, relayHttp, engine, model, allowAll, workdir, relay?) =>
       runCollaborativeQuery(task, selfName, relayHttp, engine, model, allowAll, workdir, runEngine, relay),
     autoRoute,
-    isEngineBusy: () => engineBusy,
-    setEngineBusy: (busy: boolean) => { engineBusy = busy; engineBusySince = busy ? Date.now() : 0; },
+    isEngineBusy: () => engineQueue.isBusy(),
+    setEngineBusy: (busy: boolean) => {
+      if (busy) engineQueue.tryAcquire();
+      else engineQueue.release();
+    },
     emitTaskCompleted,
   };
 
@@ -371,53 +381,44 @@ export async function serve(options: ServeOptions): Promise<void> {
   // Peripheral registry — Core routes by capability
   const peripherals: Peripheral[] = [relay, engineP];
 
-  // requestCompute: queue for engine, execute, return result
+  // requestCompute: acquire the engine slot (priority-aware), execute with a
+  // hard timeout, and release. The slot release and subprocess kill are both
+  // driven by the same AbortController so a stuck engine can't hold the lock.
   async function requestCompute(req: ComputeRequest): Promise<ComputeResult> {
-    // Wait for engine to become free (poll with backoff, max 5 min)
-    const deadline = Date.now() + 5 * 60 * 1000;
-    while (engineBusy) {
-      // If engine has been busy for >10 min, it's stuck — force release
-      if (engineBusySince && Date.now() - engineBusySince > 10 * 60 * 1000) {
-        console.log(`[engine] Force-releasing stuck engine lock (busy for ${Math.round((Date.now() - engineBusySince) / 60000)}min)`);
-        engineBusy = false;
-        engineBusySince = 0;
-        break;
-      }
-      if (Date.now() > deadline) {
-        return { success: false, error: "Engine busy timeout (5 min)" };
-      }
-      await new Promise(r => setTimeout(r, 2000));
+    try {
+      await engineQueue.acquire(req.priority, ENGINE_WAIT_DEADLINE_MS);
+    } catch (err: any) {
+      return { success: false, error: err.message || "Engine busy timeout" };
     }
 
-    engineBusy = true;
-    engineBusySince = Date.now();
+    const prompt = req.context
+      ? `${req.context}\n\n---\n\n${req.question}`
+      : req.question;
+
+    const abortController = new AbortController();
+    const timer = setTimeout(() => abortController.abort(), ENGINE_EXEC_TIMEOUT_MS);
+
     try {
-      const prompt = req.context
-        ? `${req.context}\n\n---\n\n${req.question}`
-        : req.question;
-      // Hard timeout: if engine doesn't respond in 8 min, give up
-      const engineTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Engine execution timeout (8 min)")), 8 * 60 * 1000));
-      const response = await Promise.race([
-        runEngine(
-          options.engine || "claude",
-          options.model,
-          options.allowAll,
-          prompt,
-          workdir,
-          req.tools,
-          req.relay,
-        ),
-        engineTimeout,
-      ]);
-      // Track token usage via EventBus
+      const response = await runEngine(
+        options.engine || "claude",
+        options.model,
+        options.allowAll,
+        prompt,
+        workdir,
+        req.tools,
+        req.relay,
+        abortController.signal,
+      );
       emitTokenUsage(prompt.length, response.length);
       return { success: true, response };
     } catch (err: any) {
-      return { success: false, error: err.message || String(err) };
+      const msg = abortController.signal.aborted
+        ? `Engine execution timeout (${Math.round(ENGINE_EXEC_TIMEOUT_MS / 60000)} min)`
+        : (err.message || String(err));
+      return { success: false, error: msg };
     } finally {
-      engineBusy = false;
-      engineBusySince = 0;
+      clearTimeout(timer);
+      engineQueue.release();
     }
   }
 
@@ -559,8 +560,11 @@ export async function serveStdio(agentName: string, workdir?: string): Promise<v
     runCollaborativeQuery: (task, selfName, relayHttp, engine, model, allowAll, workdir, relay?) =>
       runCollaborativeQuery(task, selfName, relayHttp, engine, model, allowAll, workdir, runEngine, relay),
     autoRoute,
-    isEngineBusy: () => engineBusy,
-    setEngineBusy: (busy: boolean) => { engineBusy = busy; engineBusySince = busy ? Date.now() : 0; },
+    isEngineBusy: () => engineQueue.isBusy(),
+    setEngineBusy: (busy: boolean) => {
+      if (busy) engineQueue.tryAcquire();
+      else engineQueue.release();
+    },
     emitTaskCompleted,
   };
   const mcpServer = createMcpServer({ workdir: dir, agentName, publisherIds: new Map() }, stdioMcpDeps);
