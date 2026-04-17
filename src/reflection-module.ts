@@ -31,6 +31,38 @@ const REFLECT_INTERVAL = 12 * 60 * 60 * 1000; // every 12h
 const MIN_FAILURES_TO_REFLECT = 2; // need at least 2 failures to trigger
 
 // ---------------------------------------------------------------------------
+// Playbook experience — exported for direct testing and reuse
+// ---------------------------------------------------------------------------
+
+export async function appendPlaybookExperience(
+  workdir: string,
+  agentName: string,
+  productName: string,
+  taskLabel: string,
+  credits: number,
+): Promise<void> {
+  const products = await loadProducts(workdir, agentName);
+  const playbooks = await loadPlaybooks(workdir, agentName);
+  const resolved = resolveProduct(products, playbooks, productName);
+  if (!resolved?.product.playbook) return;
+
+  const pbPath = join(playbooksDir(workdir, agentName), `${resolved.product.playbook}.md`);
+  const line = `\n- [${localNow()}] ${productName}: ${taskLabel} — 成功${credits ? ` (earned ${credits}¢)` : ""}`;
+
+  try {
+    let content = await readFile(pbPath, "utf-8");
+    if (!content.includes("## 经验")) {
+      content += "\n\n## 经验\n";
+    }
+    content += line;
+    await writeFile(pbPath, content, "utf-8");
+    console.log(`[reflection] Appended experience to playbook ${resolved.product.playbook}`);
+  } catch (err: any) {
+    console.log(`[reflection] Failed to append experience: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
@@ -97,7 +129,7 @@ export class ReflectionModule implements Module {
       }
       // Append experience to playbook on successful product orders
       if (success && productName) {
-        this.appendPlaybookExperience(productName, taskLabel || "", creditsEarned || 0)
+        appendPlaybookExperience(ctx.workdir, ctx.agentName, productName, taskLabel || "", creditsEarned || 0)
           .catch(err => console.log(`[reflection] playbook experience error: ${err.message}`));
       }
     });
@@ -148,35 +180,6 @@ export class ReflectionModule implements Module {
       discoveryCount: this.discoveries.length,
       recentFailures: this.recentFailures.length,
     };
-  }
-
-  // ---------------------------------------------------------------------------
-  // Playbook experience — append log on successful product orders
-  // ---------------------------------------------------------------------------
-
-  private async appendPlaybookExperience(productName: string, taskLabel: string, credits: number): Promise<void> {
-    if (!this.ctx) return;
-    const { workdir, agentName } = this.ctx;
-
-    const products = await loadProducts(workdir, agentName);
-    const playbooks = await loadPlaybooks(workdir, agentName);
-    const resolved = resolveProduct(products, playbooks, productName);
-    if (!resolved?.playbook) return;
-
-    const pbPath = join(playbooksDir(workdir, agentName), `${resolved.playbook.name}.md`);
-    const line = `\n- [${localNow()}] ${productName}: ${taskLabel} — 成功${credits ? ` (earned ${credits}¢)` : ""}`;
-
-    try {
-      let content = await readFile(pbPath, "utf-8");
-      if (!content.includes("## 经验")) {
-        content += "\n\n## 经验\n";
-      }
-      content += line;
-      await writeFile(pbPath, content, "utf-8");
-      console.log(`[reflection] Appended experience to playbook ${resolved.playbook.name}`);
-    } catch (err: any) {
-      console.log(`[reflection] Failed to append experience: ${err.message}`);
-    }
   }
 
   // ---------------------------------------------------------------------------
