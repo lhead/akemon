@@ -44,7 +44,7 @@ export interface ProductDef {
 // Parsing
 // ---------------------------------------------------------------------------
 
-function parseRole(name: string, raw: string): RoleDef {
+export function parseRole(name: string, raw: string): RoleDef {
   const lines = raw.split("\n");
   let description = "";
   const triggers: string[] = [];
@@ -103,7 +103,7 @@ function parseRole(name: string, raw: string): RoleDef {
   return { name, description, triggers, include, exclude, customRules: customLines.join("\n").trim(), raw };
 }
 
-function parseProduct(name: string, raw: string): ProductDef {
+export function parseProduct(name: string, raw: string): ProductDef {
   let playbook = "";
   const productIds: string[] = [];
   const lines = raw.split("\n");
