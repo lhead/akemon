@@ -28,7 +28,8 @@
     "build": "tsc && cp src/live.html dist/live.html",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "tsc -p tsconfig.test.json && node --test test-dist/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
