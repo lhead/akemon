@@ -229,6 +229,7 @@ ${discText}`,
 
 Reply ONLY JSON: {"discoveries":[{"capability":"skill or lesson","confidence":0.0-1.0,"evidence":"what supports this"}]}`,
       priority: "normal",
+      origin: "reflection",
     });
 
     if (result.success && result.response) {

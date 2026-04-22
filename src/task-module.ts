@@ -32,6 +32,9 @@ import {
 } from "./self.js";
 import { appendMessage, resolveConvId } from "./context.js";
 import { buildRoleContext } from "./role-module.js";
+import { sortByQuadrant, dedupeWorkItems, computeRetryDelay } from "./task-helpers.js";
+import { updateMetrics } from "./metrics.js";
+import { type Origin, downgradeForRetry } from "./engine-routing.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -39,7 +42,6 @@ import { buildRoleContext } from "./role-module.js";
 
 const INITIAL_DELAY = 60_000;  // 1 min after startup
 const POLL_INTERVAL = 30_000;  // 30s between polls
-const RETRY_INTERVALS = [0, 30_000, 5 * 60_000, 30 * 60_000, 2 * 3600_000];
 const USER_TASK_MAX_RETRIES = 2;
 const USER_TASK_RETRY_DELAY = 2 * 60_000;
 
@@ -52,6 +54,8 @@ interface WorkItem {
   id: string;
   /** Eisenhower quadrant: 1=urgent+important, 2=important, 3=urgent, 4=neither */
   quadrant: 1 | 2 | 3 | 4;
+  /** Task origin: drives engine routing and concurrency controls */
+  origin: Origin;
   data: any;
 }
 
@@ -127,6 +131,7 @@ export class TaskModule implements Module {
       module: "task",
       pendingRetries: this.orderRetry.size + this.userTaskRetry.size,
       gaveUp: this.gaveUp.size,
+      executing: this.executing.size,
     };
   }
 
@@ -190,9 +195,12 @@ export class TaskModule implements Module {
           const retry = this.orderRetry.get(order.id);
           if (retry && Date.now() < retry.nextAt) continue;
           const urgent = this.urgentOrderIds.has(order.id);
+          const isRetry = this.orderRetry.has(order.id);
+          const rawOrigin: Origin = order.human_origin ? "user_manual" : "platform";
           queue.push({
             type: "order", id: order.id,
             quadrant: urgent ? 1 : 2, // orders are important (paid work)
+            origin: isRetry ? downgradeForRetry(rawOrigin) : rawOrigin,
             data: order,
           });
         }
@@ -211,6 +219,7 @@ export class TaskModule implements Module {
           queue.push({
             type: "user_task", id: taskKey,
             quadrant: rt ? 1 : 2, // retries are urgent+important
+            origin: rt ? downgradeForRetry("user_manual") : "user_manual",
             data: task,
           });
         }
@@ -225,6 +234,7 @@ export class TaskModule implements Module {
           queue.push({
             type: "relay_task", id: task.id,
             quadrant: 3, // urgent but less important
+            origin: "platform",
             data: task,
           });
         }
@@ -248,16 +258,10 @@ export class TaskModule implements Module {
     logBioStatus(bio, "work-active");
 
     // --- Eisenhower sort: Q1 > Q2 > Q3 > Q4 ---
-    queue.sort((a, b) => a.quadrant - b.quadrant);
+    const sorted = sortByQuadrant(queue);
 
     // Dedup
-    const seen = new Set<string>();
-    const deduped = queue.filter(item => {
-      const key = `${item.type}:${item.id}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
+    const deduped = dedupeWorkItems(sorted);
 
     // Bio filtering (fear & boredom)
     const filtered = await this.applyBioFilter(deduped, bio);
@@ -268,23 +272,32 @@ export class TaskModule implements Module {
     // Execute sequentially
     for (const item of filtered) {
       try {
-        if (item.type === "order") this.executing.add(item.id);
+        if (item.type === "order") {
+          this.executing.add(item.id);
+          updateMetrics({ task_executing: this.executing.size });
+        }
         switch (item.type) {
           case "order":
-            await this.executeOrder(item.data);
+            await this.executeOrder(item.data, item.origin);
             this.urgentOrderIds.delete(item.id);
             break;
           case "user_task":
-            await this.executeUserTask(item.data);
+            await this.executeUserTask(item.data, item.origin);
             break;
           case "relay_task":
-            await this.executeRelayTask(item.data);
+            await this.executeRelayTask(item.data, item.origin);
             break;
         }
       } catch (err: any) {
         console.log(`[task] Error processing ${item.type}:${item.id}: ${err.message}`);
       } finally {
-        if (item.type === "order") this.executing.delete(item.id);
+        if (item.type === "order") {
+          this.executing.delete(item.id);
+          updateMetrics({
+            task_executing: this.executing.size,
+            task_pending_retries: this.orderRetry.size + this.userTaskRetry.size,
+          });
+        }
       }
     }
 
@@ -353,7 +366,7 @@ export class TaskModule implements Module {
   // Execute order
   // ---------------------------------------------------------------------------
 
-  private async executeOrder(order: any): Promise<void> {
+  private async executeOrder(order: any, origin: Origin = "platform"): Promise<void> {
     if (!this.ctx) return;
     const { workdir, agentName, bus } = this.ctx;
     const relay = this.getRelay()!;
@@ -405,13 +418,14 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
       const orderUserMsg = order.buyer_task || "(no message)";
       await appendMessage(workdir, agentName, orderConvId, "User", orderUserMsg);
 
-      console.log(`[task] Fulfilling order ${order.id}...`);
+      console.log(`[task] Fulfilling order ${order.id}... (origin=${origin})`);
       const result = await this.ctx.requestCompute({
         context,
         question,
         priority: "high",
         tools: ["Bash(curl *)"],
         relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,
+        origin,
       });
 
       if (!result.success) throw new Error(result.error || "compute failed");
@@ -464,10 +478,11 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
       // Retry logic
       const current = this.orderRetry.get(order.id) || { count: 0, nextAt: 0 };
       current.count++;
-      if (current.count < RETRY_INTERVALS.length) {
-        current.nextAt = Date.now() + RETRY_INTERVALS[current.count];
+      const delay = computeRetryDelay(current.count);
+      if (delay !== null) {
+        current.nextAt = Date.now() + delay;
         this.orderRetry.set(order.id, current);
-        console.log(`[task] Retry ${order.id} in ${RETRY_INTERVALS[current.count] / 1000}s`);
+        console.log(`[task] Retry ${order.id} in ${delay / 1000}s`);
         try { await relay.extendOrder(order.id); } catch {}
       } else {
         this.orderRetry.delete(order.id);
@@ -482,7 +497,7 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
   // Execute user task
   // ---------------------------------------------------------------------------
 
-  private async executeUserTask(task: UserTask): Promise<void> {
+  private async executeUserTask(task: UserTask, origin: Origin = "user_manual"): Promise<void> {
     if (!this.ctx) return;
     const { workdir, agentName, bus } = this.ctx;
     const relay = this.getRelay();
@@ -519,6 +534,7 @@ Your personal directory: ${sd}/`;
         priority: "high",
         tools: ["Bash(curl *)"],
         relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,
+        origin,
       });
 
       if (!result.success) throw new Error(result.error || "compute failed");
@@ -550,8 +566,9 @@ Your personal directory: ${sd}/`;
 
       const retry = this.userTaskRetry.get(taskKey) || { count: 0, nextAt: 0 };
       retry.count++;
-      if (retry.count <= USER_TASK_MAX_RETRIES) {
-        retry.nextAt = Date.now() + USER_TASK_RETRY_DELAY;
+      const retryDelay = computeRetryDelay(retry.count);
+      if (retryDelay !== null) {
+        retry.nextAt = Date.now() + retryDelay;
         this.userTaskRetry.set(taskKey, retry);
         await appendTaskHistory(workdir, agentName, {
           ts: localNow(), id: taskKey, type: "user_task", status: "retry",
@@ -576,7 +593,7 @@ Your personal directory: ${sd}/`;
   // Execute relay platform task
   // ---------------------------------------------------------------------------
 
-  private async executeRelayTask(task: any): Promise<void> {
+  private async executeRelayTask(task: any, origin: Origin = "platform"): Promise<void> {
     if (!this.ctx) return;
     const { workdir, agentName, bus } = this.ctx;
     const relay = this.getRelay()!;
@@ -625,6 +642,7 @@ Complete this task. Use the environment info above and tools (curl, etc.) as nee
         priority: "low",
         tools: ["Bash(curl *)"],
         relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,
+        origin,
       });
 
       if (!result.success) throw new Error(result.error || "compute failed");

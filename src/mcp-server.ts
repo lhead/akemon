@@ -34,6 +34,27 @@ export interface McpDeps {
 }
 
 // ---------------------------------------------------------------------------
+// Shared call_agent handler — used by both createMcpServer and createMcpProxyServer
+// ---------------------------------------------------------------------------
+
+async function handleCallAgent(
+  agentName: string,
+  target: string,
+  task: string,
+): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
+  console.log(`[call_agent] ${agentName} → ${target}: ${task.slice(0, 80)}`);
+  try {
+    const result = await callAgent(target, task);
+    return { content: [{ type: "text", text: result }] };
+  } catch (err: any) {
+    return {
+      content: [{ type: "text", text: `[error] Failed to call agent "${target}": ${err.message}` }],
+      isError: true,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server Options
 // ---------------------------------------------------------------------------
 
@@ -219,20 +240,7 @@ ${productPrefix}${contextPrefix}Current task: ${task}`;
       agent: z.string().describe("Name of the target agent to call"),
       task: z.string().describe("Task to send to the target agent"),
     },
-    async ({ agent: target, task }) => {
-      console.log(`[call_agent] ${agentName} → ${target}: ${task.slice(0, 80)}`);
-      try {
-        const result = await callAgent(target, task);
-        return {
-          content: [{ type: "text", text: result }],
-        };
-      } catch (err: any) {
-        return {
-          content: [{ type: "text", text: `[error] Failed to call agent "${target}": ${err.message}` }],
-          isError: true,
-        };
-      }
-    }
+    ({ agent: target, task }) => handleCallAgent(agentName, target, task),
   );
 
   // Discovery tool
@@ -494,13 +502,7 @@ export function createMcpProxyServer(proxy: McpProxyState, agentName: string): S
     const { name, arguments: toolArgs } = request.params;
 
     if (name === "call_agent") {
-      console.log(`[call_agent] ${agentName} → ${toolArgs?.agent}: ${String(toolArgs?.task).slice(0, 80)}`);
-      try {
-        const result = await callAgent(toolArgs?.agent as string, toolArgs?.task as string);
-        return { content: [{ type: "text" as const, text: result }] };
-      } catch (err: any) {
-        return { content: [{ type: "text" as const, text: `[error] ${err.message}` }], isError: true };
-      }
+      return handleCallAgent(agentName, toolArgs?.agent as string, toolArgs?.task as string);
     }
 
     // Forward to child MCP server

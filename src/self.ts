@@ -190,6 +190,7 @@ export interface AgentConfig {
   auto_offline_enabled?: boolean;   // allow going offline when starving (default: true)
   hunger_decay_interval?: number;   // ms between hunger decrements (default: 300000 = 5min)
   context_budget?: number;          // max chars for conversation context in LLM prompt (default: 4096)
+  engine_routing?: import("./engine-routing.js").EngineRouting;
 }
 
 const DEFAULT_CONFIG: AgentConfig = {

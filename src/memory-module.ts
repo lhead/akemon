@@ -199,6 +199,7 @@ Output ONLY a JSON object:`;
         context,
         question,
         priority: "normal",
+        origin: "self_cycle",
       });
 
       if (!result.success) {
@@ -268,6 +269,7 @@ ${unsummarized.map(i => `- [${i.ts}] who: ${i.who}, doing: ${i.doing}`).join("\n
           question: `Write a personality summary (2-4 paragraphs) that captures who you are.
 Reply ONLY with the summary text, no JSON, no markdown headers.`,
           priority: "low",
+          origin: "self_cycle",
         });
 
         if (compressResult.success && compressResult.response?.trim()) {

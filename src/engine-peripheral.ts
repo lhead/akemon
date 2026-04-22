@@ -9,12 +9,20 @@
  *   - Raw engine: OpenAI-compatible API with tool call loop (Ollama, llama.cpp, etc)
  */
 
-import { spawn, exec } from "child_process";
+import { spawn, exec, type ChildProcess } from "child_process";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import { join, dirname, isAbsolute } from "path";
 import { callAgent } from "./relay-client.js";
 import type { Peripheral, Signal, EventBus } from "./types.js";
 import { SIG, sig } from "./types.js";
+import { updateMetrics, pushExecMs } from "./metrics.js";
+import { sendFailureEvent } from "./relay-client.js";
+import {
+  type Origin,
+  type EngineRouting,
+  type EngineRoutingEntry,
+  resolveEngineConfig,
+} from "./engine-routing.js";
 
 // ---------------------------------------------------------------------------
 // Config
@@ -52,6 +60,25 @@ export class EnginePeripheral implements Peripheral {
 
   /** Last execution trace (for error reporting) */
   lastTrace: any[] = [];
+
+  /** Active CLI child processes — tracked so SIGTERM handler can kill them. */
+  private activeChildren = new Set<ChildProcess>();
+
+  /**
+   * Send SIGKILL to all active child process groups. Called during daemon shutdown.
+   *
+   * NOTE: sends SIGKILL directly (no SIGTERM grace) — safe for stateless
+   * request/response CLIs. Must change to SIGTERM+3s+SIGKILL when Batch 5.1
+   * persistent-session mode lands (sessions need graceful teardown).
+   */
+  killAllChildren(): void {
+    for (const child of this.activeChildren) {
+      if (!child.pid) continue;
+      console.log(`[engine] shutdown: killing pgid=-${child.pid}`);
+      try { process.kill(-child.pid, "SIGKILL"); } catch {}
+    }
+    this.activeChildren.clear();
+  }
 
   constructor(config: EngineConfig) {
     this.config = config;
@@ -116,24 +143,35 @@ export class EnginePeripheral implements Peripheral {
     allowAll?: boolean,
     extraAllowedTools?: string[],
     signal?: AbortSignal,
+    origin?: Origin,
+    routing?: EngineRouting,
   ): Promise<string> {
-    const { engine, model, workdir } = this.config;
-    if (engine === "raw") {
-      return this.runRawEngine(task);
+    const entry = resolveEngineConfig(routing, origin);
+    const cfg = entry ? applyRoutingEntry(this.config, entry) : this.config;
+    if (origin && entry) {
+      console.log(`[engine] using ${cfg.engine}${cfg.model ? `/${cfg.model}` : ""} (origin=${origin})`);
     }
-    const cmd = buildEngineCommand(engine, model, allowAll ?? this.config.allowAll, extraAllowedTools);
-    return runCommand(cmd.cmd, cmd.args, task, workdir, cmd.stdinMode, signal);
+    const t0 = Date.now();
+    try {
+      if (cfg.engine === "raw") {
+        return await this.runRawEngine(task, cfg);
+      }
+      const cmd = buildEngineCommand(cfg.engine, cfg.model, allowAll ?? cfg.allowAll, extraAllowedTools);
+      return await runCommand(cmd.cmd, cmd.args, task, cfg.workdir, cmd.stdinMode, signal, this.activeChildren);
+    } finally {
+      pushExecMs(Date.now() - t0);
+    }
   }
 
   // ---------------------------------------------------------------------------
   // Raw engine: OpenAI-compatible API with tool call loop
   // ---------------------------------------------------------------------------
 
-  private async runRawEngine(task: string): Promise<string> {
-    const apiUrl = (this.config.rawApiUrl || "http://localhost:11434/v1") + "/chat/completions";
-    const modelName = this.config.model || "gemma4:4b";
-    const maxRounds = this.config.rawMaxRounds || 20;
-    const apiKey = this.config.rawApiKey || "";
+  private async runRawEngine(task: string, cfg: EngineConfig = this.config): Promise<string> {
+    const apiUrl = (cfg.rawApiUrl || "http://localhost:11434/v1") + "/chat/completions";
+    const modelName = cfg.model || "gemma4:4b";
+    const maxRounds = cfg.rawMaxRounds || 20;
+    const apiKey = cfg.rawApiKey || "";
 
     console.log(`[raw] Task:\n${task}`);
 
@@ -392,6 +430,21 @@ export const RAW_TOOLS = [
 // CLI engine helpers (shared, non-class)
 // ---------------------------------------------------------------------------
 
+/**
+ * Build a local EngineConfig copy that merges in a routing entry's overrides.
+ * Resolves rawApiKeyEnv → rawApiKey from environment at call time.
+ * Never mutates the base config.
+ */
+function applyRoutingEntry(base: EngineConfig, entry: EngineRoutingEntry): EngineConfig {
+  const override: Partial<EngineConfig> = { engine: entry.engine };
+  if (entry.model !== undefined) override.model = entry.model ?? undefined;
+  if (entry.rawApiUrl !== undefined) override.rawApiUrl = entry.rawApiUrl;
+  if (entry.rawMaxRounds !== undefined) override.rawMaxRounds = entry.rawMaxRounds;
+  if (entry.allowAll !== undefined) override.allowAll = entry.allowAll;
+  if (entry.rawApiKeyEnv) override.rawApiKey = process.env[entry.rawApiKeyEnv] ?? "";
+  return { ...base, ...override };
+}
+
 function buildEngineCommand(
   engine: string,
   model?: string,
@@ -436,6 +489,7 @@ function runCommand(
   cwd: string,
   stdinMode: boolean = true,
   signal?: AbortSignal,
+  activeChildren?: Set<ChildProcess>,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const { CLAUDECODE, ...cleanEnv } = process.env;
@@ -445,17 +499,26 @@ function runCommand(
       cwd,
       env: cleanEnv,
       stdio: [stdinMode ? "pipe" : "ignore", "pipe", "pipe"],
+      detached: true,  // child becomes process-group leader; enables pgid kill
     });
+    if (activeChildren) {
+      activeChildren.add(child);
+      updateMetrics({ engine_children_active: activeChildren.size });
+    }
 
-    // Abort → SIGTERM, then SIGKILL after a grace period so a hung engine can't
-    // hold the slot past the caller's deadline.
+    // Abort → SIGTERM to process group, then SIGKILL after grace period.
+    // Using -pid (negative) sends the signal to the entire process group,
+    // so any sub-forks spawned by the CLI are also terminated.
     let aborted = false;
     const onAbort = () => {
-      if (aborted) return;
+      if (aborted || !child.pid) return;
       aborted = true;
-      console.log(`[${cmd}] aborted, killing pid=${child.pid}`);
-      try { child.kill("SIGTERM"); } catch {}
-      setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 3000).unref();
+      console.log(`[${cmd}] aborted, killing pgid=-${child.pid}`);
+      sendFailureEvent("engine_abort", cmd, "engine subprocess aborted via signal");
+      try { process.kill(-child.pid, "SIGTERM"); } catch {}
+      setTimeout(() => {
+        try { process.kill(-child.pid!, "SIGKILL"); } catch {}
+      }, 3000).unref();
     };
     if (signal) {
       if (signal.aborted) onAbort();
@@ -481,6 +544,11 @@ function runCommand(
 
     child.on("close", (code, killSignal) => {
       signal?.removeEventListener("abort", onAbort);
+      if (activeChildren) {
+        activeChildren.delete(child);
+        updateMetrics({ engine_children_active: activeChildren.size });
+      }
+      child.unref();
       console.log(`[${cmd}] exit=${code}${killSignal ? ` signal=${killSignal}` : ""} stdout=${stdout.length}b stderr=${stderr.length}b`);
       if (stderr) console.log(`[${cmd}] stderr:\n${stderr}`);
       if (stdout) console.log(`[${cmd}] stdout:\n${stdout}`);
@@ -498,6 +566,11 @@ function runCommand(
 
     child.on("error", (err) => {
       signal?.removeEventListener("abort", onAbort);
+      if (activeChildren) {
+        activeChildren.delete(child);
+        updateMetrics({ engine_children_active: activeChildren.size });
+      }
+      child.unref();
       reject(err);
     });
   });

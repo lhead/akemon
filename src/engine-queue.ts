@@ -20,6 +20,8 @@
  *              long-term, identity compression)
  */
 
+import { updateMetrics } from "./metrics.js";
+
 export type Priority = "high" | "normal" | "low";
 
 const PRIORITY_RANK: Record<Priority, number> = { high: 3, normal: 2, low: 1 };
@@ -32,10 +34,61 @@ interface Waiter {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** Max simultaneous user_manual tasks allowed to hold or wait for a slot.
+ *  Prevents more than this many claude CLI processes from queuing up. */
+const DEFAULT_MAX_USER_MANUAL = 2;
+
+interface UserManualWaiter {
+  resolve: () => void;
+  reject: (err: Error) => void;
+}
+
 export class EngineQueue {
   private busy = false;
   private busySince = 0;
   private waiters: Waiter[] = [];
+
+  // User-manual concurrency gate
+  private maxUserManualSlots: number;
+  private userManualActive = 0;
+  private userManualQueue: UserManualWaiter[] = [];
+
+  constructor(maxUserManualSlots = DEFAULT_MAX_USER_MANUAL) {
+    this.maxUserManualSlots = maxUserManualSlots;
+  }
+
+  /** Acquire a user_manual slot before joining the engine queue.
+   *  Callers MUST call releaseUserManualSlot() in a finally block. */
+  acquireUserManualSlot(deadlineMs: number): Promise<void> {
+    if (this.userManualActive < this.maxUserManualSlots) {
+      this.userManualActive++;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      let timerRef: ReturnType<typeof setTimeout>;
+      const entry: UserManualWaiter = {
+        resolve: () => { clearTimeout(timerRef); resolve(); },
+        reject: (err: Error) => { clearTimeout(timerRef); reject(err); },
+      };
+      timerRef = setTimeout(() => {
+        const idx = this.userManualQueue.indexOf(entry);
+        if (idx >= 0) this.userManualQueue.splice(idx, 1);
+        entry.reject(new Error("User manual slot timeout"));
+      }, deadlineMs);
+      this.userManualQueue.push(entry);
+    });
+  }
+
+  /** Release a user_manual slot and wake the next waiter. */
+  releaseUserManualSlot(): void {
+    const next = this.userManualQueue.shift();
+    if (next) {
+      // Transfer slot to the next waiter (active count unchanged)
+      next.resolve();
+    } else {
+      this.userManualActive = Math.max(0, this.userManualActive - 1);
+    }
+  }
 
   /** Wait up to `deadlineMs` for the slot, then take it. */
   acquire(priority: Priority, deadlineMs: number): Promise<void> {
@@ -52,11 +105,15 @@ export class EngineQueue {
         reject,
         timer: setTimeout(() => {
           const idx = this.waiters.indexOf(waiter);
-          if (idx >= 0) this.waiters.splice(idx, 1);
+          if (idx >= 0) {
+            this.waiters.splice(idx, 1);
+            updateMetrics({ engine_queue_depth: this.waiters.length });
+          }
           reject(new Error(`Engine busy timeout (${Math.round(deadlineMs / 60000)} min)`));
         }, deadlineMs),
       };
       this.waiters.push(waiter);
+      updateMetrics({ engine_queue_depth: this.waiters.length });
     });
   }
 
@@ -71,6 +128,7 @@ export class EngineQueue {
     this.waiters.splice(this.waiters.indexOf(next), 1);
     clearTimeout(next.timer);
     this.busySince = Date.now();
+    updateMetrics({ engine_queue_depth: this.waiters.length });
     next.resolve();
   }
 

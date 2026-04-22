@@ -1,6 +1,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { exec } from "child_process";
+import { scanAndKillOrphans } from "./orphan-scan.js";
 import { createServer } from "http";
 import { createInterface } from "readline";
 import {
@@ -122,11 +123,22 @@ const LLM_ENGINES = LLM_ENGINES_SET;
 // ---------------------------------------------------------------------------
 
 /** Unified engine runner — delegates to EnginePeripheral */
-function runEngine(engine: string, model: string | undefined, allowAll: boolean | undefined, task: string, workdir: string, extraAllowedTools?: string[], relay?: { http: string; agentName: string }, signal?: AbortSignal): Promise<string> {
+function runEngine(
+  engine: string,
+  model: string | undefined,
+  allowAll: boolean | undefined,
+  task: string,
+  workdir: string,
+  extraAllowedTools?: string[],
+  relay?: { http: string; agentName: string },
+  signal?: AbortSignal,
+  origin?: import("./engine-routing.js").Origin,
+  routing?: import("./engine-routing.js").EngineRouting,
+): Promise<string> {
   if (!_engineP) {
     throw new Error("Engine peripheral not initialized");
   }
-  const result = _engineP.runEngine(task, allowAll, extraAllowedTools, signal);
+  const result = _engineP.runEngine(task, allowAll, extraAllowedTools, signal, origin, routing);
   // Sync trace back to module-level for reporting
   result.then(() => { lastEngineTrace = _engineP!.lastTrace; }).catch(() => { lastEngineTrace = _engineP!.lastTrace; });
   return result;
@@ -136,6 +148,9 @@ function runEngine(engine: string, model: string | undefined, allowAll: boolean 
 // pullFromRelay → see relay-peripheral.ts
 export async function serve(options: ServeOptions): Promise<void> {
   const workdir = options.workdir || process.cwd();
+
+  // Reclaim stale CLI children from any previous daemon crash before starting.
+  await scanAndKillOrphans();
 
   // V2: Relay peripheral — unified relay API access
   const relay = new RelayPeripheral({
@@ -385,9 +400,24 @@ export async function serve(options: ServeOptions): Promise<void> {
   // hard timeout, and release. The slot release and subprocess kill are both
   // driven by the same AbortController so a stuck engine can't hold the lock.
   async function requestCompute(req: ComputeRequest): Promise<ComputeResult> {
+    // Load latest agent config for routing table (fast file read, changes rarely)
+    const agentCfg = await loadAgentConfig(workdir, options.agentName);
+    const routing = agentCfg.engine_routing;
+
+    // user_manual tasks also hold a subscription-CLI semaphore to cap claude CLI concurrency
+    const isUserManual = req.origin === "user_manual";
+    if (isUserManual) {
+      try {
+        await engineQueue.acquireUserManualSlot(ENGINE_WAIT_DEADLINE_MS);
+      } catch (err: any) {
+        return { success: false, error: err.message || "User manual slot timeout" };
+      }
+    }
+
     try {
       await engineQueue.acquire(req.priority, ENGINE_WAIT_DEADLINE_MS);
     } catch (err: any) {
+      if (isUserManual) engineQueue.releaseUserManualSlot();
       return { success: false, error: err.message || "Engine busy timeout" };
     }
 
@@ -408,6 +438,8 @@ export async function serve(options: ServeOptions): Promise<void> {
         req.tools,
         req.relay,
         abortController.signal,
+        req.origin,
+        routing,
       );
       emitTokenUsage(prompt.length, response.length);
       return { success: true, response };
@@ -419,6 +451,7 @@ export async function serve(options: ServeOptions): Promise<void> {
     } finally {
       clearTimeout(timer);
       engineQueue.release();
+      if (isUserManual) engineQueue.releaseUserManualSlot();
     }
   }
 
@@ -534,9 +567,12 @@ export async function serve(options: ServeOptions): Promise<void> {
     modules: loadedModules,
   }));
 
-  // Graceful shutdown
+  // Graceful shutdown — kill engine children first, then stop modules.
+  // Engine children are killed via process group signal so any sub-forks
+  // (e.g. opencode's internal Node workers) are also terminated.
   const shutdown = async () => {
     console.log("[v2] Shutting down...");
+    if (_engineP) _engineP.killAllChildren();
     bus.emit(SIG.AGENT_STOP, sig(SIG.AGENT_STOP, {}));
     for (const m of allModules) {
       try { await m.stop(); } catch {}

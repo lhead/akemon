@@ -321,6 +321,7 @@ export class ScriptModule implements Module {
           priority: "low",
           tools: ["Bash(curl *)"],
           relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,
+          origin: "self_cycle",
         });
 
         if (result.success) {

@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 import http from "http";
 import { RelayCredentials } from "./config.js";
+import { getMetrics, updateMetrics } from "./metrics.js";
 
 const DEFAULT_RELAY_URL = "wss://relay.akemon.dev";
 
@@ -176,8 +177,11 @@ export function connectRelay(options: RelayClientOptions): void {
         alive = false;
         try {
           ws.ping();
+          // Piggyback metrics update on every heartbeat cycle
+          const metrics = getMetrics();
+          ws.send(JSON.stringify({ type: "metrics", metrics }));
         } catch {
-          // ping write failed — connection dead
+          // ping or send write failed — connection dead
           clearHeartbeat();
           ws.terminate();
         }
@@ -188,6 +192,7 @@ export function connectRelay(options: RelayClientOptions): void {
       console.log(`[relay-ws] Connected. Registering agent "${options.agentName}"...`);
       reconnectDelay = 1000; // reset backoff
       relayWsRef = ws;
+      updateMetrics({ agentName: options.agentName });
 
       // Send registration message
       const reg: Record<string, any> = {
@@ -532,4 +537,14 @@ function extractSSEData(sse: string): unknown {
     return tryParseJSON(lastData);
   }
   return null;
+}
+
+/** Send a failure event to the relay for observability storage. Fire-and-forget. */
+export function sendFailureEvent(kind: string, label: string, message: string): void {
+  if (!relayWsRef || relayWsRef.readyState !== WebSocket.OPEN) return;
+  try {
+    relayWsRef.send(JSON.stringify({ type: "failure_event", kind, label, message }));
+  } catch {
+    // best-effort
+  }
 }

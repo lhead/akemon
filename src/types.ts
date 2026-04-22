@@ -95,6 +95,8 @@ export interface ComputeRequest {
   tools?: string[];
   /** Relay info for engine (needed for relay-aware tools) */
   relay?: { http: string; agentName: string };
+  /** Task origin for engine routing and concurrency control */
+  origin?: import("./engine-routing.js").Origin;
 }
 
 /** Core → Module: compute result */
