@@ -441,7 +441,9 @@ function applyRoutingEntry(base: EngineConfig, entry: EngineRoutingEntry): Engin
   if (entry.rawApiUrl !== undefined) override.rawApiUrl = entry.rawApiUrl;
   if (entry.rawMaxRounds !== undefined) override.rawMaxRounds = entry.rawMaxRounds;
   if (entry.allowAll !== undefined) override.allowAll = entry.allowAll;
+  // rawApiKeyEnv takes precedence over rawApiKey (env vars preferred for secrets)
   if (entry.rawApiKeyEnv) override.rawApiKey = process.env[entry.rawApiKeyEnv] ?? "";
+  else if (entry.rawApiKey !== undefined) override.rawApiKey = entry.rawApiKey;
   return { ...base, ...override };
 }
 

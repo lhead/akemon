@@ -62,6 +62,7 @@ export interface ConversationRound {
   ts: string;
   role: "user" | "agent";
   content: string;
+  kind: "chat" | "order";
 }
 
 export interface Conversation {
@@ -98,12 +99,14 @@ function parseConversation(content: string): Conversation {
   if (recentMatch) {
     const lines = recentMatch[1].split("\n");
     for (const line of lines) {
-      const m = line.match(/^\[(.+?)\] (User|Agent): (.*)$/);
+      // Format: [ts] [kind] Role: text  OR (legacy)  [ts] Role: text
+      const m = line.match(/^\[(.+?)\] (?:\[(order)\] )?(User|Agent): (.*)$/);
       if (m) {
         rounds.push({
           ts: m[1],
-          role: m[2].toLowerCase() as "user" | "agent",
-          content: m[3],
+          kind: (m[2] as "order" | undefined) ?? "chat",
+          role: m[3].toLowerCase() as "user" | "agent",
+          content: m[4],
         });
       } else if (rounds.length > 0 && line !== "") {
         // Continuation line — append to previous round
@@ -125,10 +128,13 @@ export async function loadConversation(workdir: string, agentName: string, convI
   }
 }
 
-/** Append a single message to a conversation file. Creates file if needed. */
+/** Append a single message to a conversation file. Creates file if needed.
+ *  kind="order" writes an explicit [order] tag so the UI can filter/style it.
+ *  kind="chat" (default) omits the tag for backward-compatibility with old files. */
 export async function appendMessage(
   workdir: string, agentName: string, convId: string,
   role: "User" | "Agent", message: string,
+  kind: "chat" | "order" = "chat",
 ): Promise<void> {
   const dir = conversationsDir(workdir, agentName);
   await mkdir(dir, { recursive: true });
@@ -142,7 +148,8 @@ export async function appendMessage(
   }
 
   const ts = localNow();
-  content = content.trimEnd() + "\n" + `[${ts}] ${role}: ${message}` + "\n";
+  const kindTag = kind === "order" ? "[order] " : "";
+  content = content.trimEnd() + "\n" + `[${ts}] ${kindTag}${role}: ${message}` + "\n";
 
   await writeFile(p, content);
 }

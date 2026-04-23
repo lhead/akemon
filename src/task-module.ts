@@ -73,6 +73,8 @@ export class TaskModule implements Module {
   private userTaskRetry = new Map<string, { count: number; nextAt: number }>();
   private gaveUp = new Set<string>();
   private executing = new Set<string>(); // orders currently being fulfilled
+  // Dedup guard: track which orders already had their User message written
+  private orderUserWritten = new Set<string>();
 
   // Push notification support
   private urgentOrderIds = new Set<string>();
@@ -409,14 +411,17 @@ Steps:
 RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
 
       // Write user message to conversation immediately (before engine runs)
-      // buyer_name = agent name (from JOIN), buyer_ip = publisher ID or IP
-      const orderBuyer = order.buyer_name || order.buyer_ip || "anonymous";
-      // Product orders get isolated conversations; ad-hoc chats share one conv per buyer
-      const buyerPubId = orderBuyer;
+      // Bug 1 fix: buyer_ip = actual publisherId (despite the name); buyer_name = display name only.
+      // Must use buyer_ip to match the MCP chat path convId (pub_<publisherId>).
+      const buyerPubId = order.buyer_ip || order.buyer_name || "anonymous";
       const productScope = order.product_id ? `:prod_${order.product_id}` : "";
       const orderConvId = `pub_${buyerPubId}${productScope}`;
       const orderUserMsg = order.buyer_task || "(no message)";
-      await appendMessage(workdir, agentName, orderConvId, "User", orderUserMsg);
+      // Bug 3 fix: only write User message once per order (retries must not duplicate it)
+      if (!this.orderUserWritten.has(order.id)) {
+        this.orderUserWritten.add(order.id);
+        await appendMessage(workdir, agentName, orderConvId, "User", orderUserMsg, "order");
+      }
 
       console.log(`[task] Fulfilling order ${order.id}... (origin=${origin})`);
       const result = await this.ctx.requestCompute({
@@ -440,7 +445,8 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         const orderAgentMsg = (finalStatus.result_text || result.response || "").slice(0, 2000);
         console.log(`[task] Order ${order.id} delivered`);
         this.orderRetry.delete(order.id);
-        await appendMessage(workdir, agentName, orderConvId, "Agent", orderAgentMsg);
+        this.orderUserWritten.delete(order.id);
+        await appendMessage(workdir, agentName, orderConvId, "Agent", orderAgentMsg, "order");
         await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: duration, output_summary: (result.response || "").slice(0, 500) });
         await notifyOwner(nurl, `${agentName}: order done`, `Order ${order.id} delivered`, "default", ["package"]);
         bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice, productName: order.product_name }));
@@ -451,7 +457,8 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
           const orderAgentMsg = (result.response || "").slice(0, 2000);
           console.log(`[task] Delivered order ${order.id} (fallback)`);
           this.orderRetry.delete(order.id);
-          await appendMessage(workdir, agentName, orderConvId, "Agent", orderAgentMsg);
+          this.orderUserWritten.delete(order.id);
+          await appendMessage(workdir, agentName, orderConvId, "Agent", orderAgentMsg, "order");
           await appendTaskHistory(workdir, agentName, { ts: localNow(), id: order.id, type: "order", status: "success", duration_ms: duration, output_summary: result.response.slice(0, 500) });
           await notifyOwner(nurl, `${agentName}: order done`, `Order ${order.id}: ${result.response.slice(0, 200)}`, "default", ["package"]);
           bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: true, taskLabel: orderLabel, creditsEarned: orderPrice, productName: order.product_name }));
@@ -486,6 +493,7 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
         try { await relay.extendOrder(order.id); } catch {}
       } else {
         this.orderRetry.delete(order.id);
+        this.orderUserWritten.delete(order.id);
         this.gaveUp.add(order.id);
         bus.emit(SIG.TASK_COMPLETED, sig(SIG.TASK_COMPLETED, { success: false, taskLabel: orderLabel }));
         try { await relay.cancelOrder(order.id); } catch {}

@@ -20,7 +20,8 @@ export interface EngineRoutingEntry {
   engine: string;             // e.g. "claude" | "raw" | "codex"
   model?: string | null;
   rawApiUrl?: string;
-  rawApiKeyEnv?: string;      // env var name → resolved to rawApiKey at call time
+  rawApiKey?: string;         // plaintext key (convenient, but avoid committing to git)
+  rawApiKeyEnv?: string;      // env var name — takes precedence over rawApiKey
   rawMaxRounds?: number;
   allowAll?: boolean;
 }
