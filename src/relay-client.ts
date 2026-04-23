@@ -267,7 +267,14 @@ export function connectRelay(options: RelayClientOptions): void {
           break;
 
         case "terminal_start":
-          if (!options.enableTerminal) { console.log("[terminal] Disabled. Use --terminal to enable."); break; }
+          if (!options.enableTerminal) {
+            console.log("[terminal] Disabled. Use --terminal to enable.");
+            ws.send(JSON.stringify({
+              type: "terminal_exit",
+              error: "Terminal disabled on this agent. Restart with --terminal flag to enable.",
+            }));
+            break;
+          }
           startPTY(ws, msg.cols || 80, msg.rows || 24);
           break;
 

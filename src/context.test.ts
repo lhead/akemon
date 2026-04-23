@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { describe, it, before, after } from "node:test";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // We import the functions we need to test. appendMessage and loadConversation
 // need a workdir on disk; parseConversation is internal — tested via loadConversation.
-import { appendMessage, loadConversation, type ConversationRound } from "./context.js";
+import { appendMessage, loadConversation } from "./context.js";
 
 const agentName = "test-agent";
 

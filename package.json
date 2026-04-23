@@ -1,6 +1,6 @@
 {
   "name": "akemon",
-  "version": "0.2.26",
+  "version": "0.2.27",
   "description": "Agent work marketplace — train your agent, let it work for others",
   "type": "module",
   "license": "MIT",
@@ -22,12 +22,14 @@
   },
   "files": [
     "dist",
+    "scripts",
     "README.md"
   ],
   "scripts": {
     "build": "tsc && cp src/live.html dist/live.html",
     "dev": "tsc --watch",
     "start": "node dist/cli.js",
+    "postinstall": "node scripts/fix-node-pty.cjs",
     "prepublishOnly": "npm run build",
     "test": "tsc -p tsconfig.test.json && node --test test-dist/*.test.js"
   },

@@ -31,6 +31,12 @@
 - 追加：直接 `echo >> .claude/inbox.md` 或 Edit
 - 清空：`./.claude/reset-inbox.sh` 会重建三个 section 骨架；不要 `> inbox.md` 截断（会丢骨架）
 
+## File Safety
+
+- 测试/脚本的临时产物一律用 `mkdtemp` 写到 `/tmp`，不要用 cwd-relative 路径落在仓库里
+- 工作目录下 `.gitignore` 的目录 = 真·运行数据（不是测试产物），没有 git 兜底，丢了找不回
+- **不使用 `rm`/`rm -rf`** 删除工作目录下任何文件或目录。需要删除时改用 `trash <path>`（macOS 回收站，可从 Finder 找回）或 `mv <path> /tmp/`。精准删除，不一刀切
+
 ## General Guidelines
 
 - 在修改代码前**必须先读取**相关文件，理解现有实现
