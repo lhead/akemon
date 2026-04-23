@@ -198,6 +198,7 @@ Output ONLY a JSON object:`;
       const result = await this.ctx.requestCompute({
         context,
         question,
+        taskId: `digestion:${Date.now()}`,
         priority: "normal",
         origin: "self_cycle",
       });
@@ -268,6 +269,7 @@ ${oldSummary ? `Previous summary (up to ${oldSummary.summarized_through}):\n${ol
 ${unsummarized.map(i => `- [${i.ts}] who: ${i.who}, doing: ${i.doing}`).join("\n")}`,
           question: `Write a personality summary (2-4 paragraphs) that captures who you are.
 Reply ONLY with the summary text, no JSON, no markdown headers.`,
+          taskId: `identity-compress:${Date.now()}`,
           priority: "low",
           origin: "self_cycle",
         });

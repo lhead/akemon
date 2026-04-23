@@ -9,10 +9,12 @@
  *   - Raw engine: OpenAI-compatible API with tool call loop (Ollama, llama.cpp, etc)
  */
 
+import { randomUUID } from "crypto";
 import { spawn, exec, type ChildProcess } from "child_process";
+import { StringDecoder } from "string_decoder";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import { join, dirname, isAbsolute } from "path";
-import { callAgent } from "./relay-client.js";
+import { callAgent, sendTaskEnd, sendTaskStart, sendTaskStream } from "./relay-client.js";
 import type { Peripheral, Signal, EventBus } from "./types.js";
 import { SIG, sig } from "./types.js";
 import { updateMetrics, pushExecMs } from "./metrics.js";
@@ -33,6 +35,12 @@ export interface EngineConfig {
   model?: string;
   workdir: string;
   allowAll?: boolean;
+  spawnImpl?: typeof spawn;
+  taskRelay?: {
+    sendTaskStart(taskId: string, origin: string | undefined, cmd: string): void;
+    sendTaskStream(taskId: string, stream: "stdout" | "stderr", chunk: string): void;
+    sendTaskEnd(taskId: string, exitCode: number | null, durationMs: number): void;
+  };
 
   // Raw engine settings
   rawApiUrl?: string;           // default: http://localhost:11434/v1
@@ -44,6 +52,12 @@ export interface EngineConfig {
 }
 
 export const LLM_ENGINES = new Set(["claude", "codex", "opencode", "gemini", "raw"]);
+
+const defaultTaskRelay = {
+  sendTaskStart,
+  sendTaskStream,
+  sendTaskEnd,
+};
 
 // ---------------------------------------------------------------------------
 // EnginePeripheral
@@ -145,6 +159,7 @@ export class EnginePeripheral implements Peripheral {
     signal?: AbortSignal,
     origin?: Origin,
     routing?: EngineRouting,
+    taskId?: string,
   ): Promise<string> {
     const entry = resolveEngineConfig(routing, origin);
     const cfg = entry ? applyRoutingEntry(this.config, entry) : this.config;
@@ -157,7 +172,19 @@ export class EnginePeripheral implements Peripheral {
         return await this.runRawEngine(task, cfg);
       }
       const cmd = buildEngineCommand(cfg.engine, cfg.model, allowAll ?? cfg.allowAll, extraAllowedTools);
-      return await runCommand(cmd.cmd, cmd.args, task, cfg.workdir, cmd.stdinMode, signal, this.activeChildren);
+      return await runCommand(
+        cmd.cmd,
+        cmd.args,
+        task,
+        cfg.workdir,
+        cmd.stdinMode,
+        signal,
+        this.activeChildren,
+        origin,
+        taskId,
+        cfg.taskRelay ?? defaultTaskRelay,
+        cfg.spawnImpl ?? spawn,
+      );
     } finally {
       pushExecMs(Date.now() - t0);
     }
@@ -492,17 +519,38 @@ function runCommand(
   stdinMode: boolean = true,
   signal?: AbortSignal,
   activeChildren?: Set<ChildProcess>,
+  origin?: Origin,
+  taskId?: string,
+  taskRelay: EngineConfig["taskRelay"] = defaultTaskRelay,
+  spawnImpl: typeof spawn = spawn,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const { CLAUDECODE, ...cleanEnv } = process.env;
     const finalArgs = stdinMode ? args : [...args, task];
+    const effectiveTaskId = taskId || `task_${Date.now()}_${randomUUID().slice(0, 8)}`;
+    const commandLine = [cmd, ...finalArgs].join(" ");
+    const startedAt = Date.now();
+    let endPublished = false;
     console.log(`[engine] Running: ${cmd} ${finalArgs.join(" ")}`);
-    const child = spawn(cmd, finalArgs, {
-      cwd,
-      env: cleanEnv,
-      stdio: [stdinMode ? "pipe" : "ignore", "pipe", "pipe"],
-      detached: true,  // child becomes process-group leader; enables pgid kill
-    });
+    taskRelay?.sendTaskStart(effectiveTaskId, origin, commandLine);
+    const publishEnd = (code: number | null) => {
+      if (endPublished) return;
+      endPublished = true;
+      taskRelay?.sendTaskEnd(effectiveTaskId, code, Date.now() - startedAt);
+    };
+    let child: ChildProcess;
+    try {
+      child = spawnImpl(cmd, finalArgs, {
+        cwd,
+        env: cleanEnv,
+        stdio: [stdinMode ? "pipe" : "ignore", "pipe", "pipe"],
+        detached: true,  // child becomes process-group leader; enables pgid kill
+      });
+    } catch (err) {
+      publishEnd(null);
+      reject(err);
+      return;
+    }
     if (activeChildren) {
       activeChildren.add(child);
       updateMetrics({ engine_children_active: activeChildren.size });
@@ -535,17 +583,36 @@ function runCommand(
 
     let stdout = "";
     let stderr = "";
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
 
     child.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
+      const text = outDecoder.write(chunk);
+      if (!text) return;
+      stdout += text;
+      taskRelay?.sendTaskStream(effectiveTaskId, "stdout", text);
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
+      const text = errDecoder.write(chunk);
+      if (!text) return;
+      stderr += text;
+      taskRelay?.sendTaskStream(effectiveTaskId, "stderr", text);
     });
 
     child.on("close", (code, killSignal) => {
       signal?.removeEventListener("abort", onAbort);
+      const tailOut = outDecoder.end();
+      const tailErr = errDecoder.end();
+      if (tailOut) {
+        stdout += tailOut;
+        taskRelay?.sendTaskStream(effectiveTaskId, "stdout", tailOut);
+      }
+      if (tailErr) {
+        stderr += tailErr;
+        taskRelay?.sendTaskStream(effectiveTaskId, "stderr", tailErr);
+      }
+      publishEnd(code);
       if (activeChildren) {
         activeChildren.delete(child);
         updateMetrics({ engine_children_active: activeChildren.size });
@@ -568,6 +635,7 @@ function runCommand(
 
     child.on("error", (err) => {
       signal?.removeEventListener("abort", onAbort);
+      publishEnd(null);
       if (activeChildren) {
         activeChildren.delete(child);
         updateMetrics({ engine_children_active: activeChildren.size });

@@ -89,6 +89,8 @@ export interface ComputeRequest {
   context: string;
   /** The question or task to compute */
   question: string;
+  /** Stable task identifier for observability stream publishing */
+  taskId?: string;
   /** Priority for queue ordering */
   priority: "high" | "normal" | "low";
   /** Extra tools to allow (e.g. ["Bash(curl *)"]) */

@@ -139,6 +139,7 @@ Tasks completed since last review: ${completionsText}`,
       question: `Evaluate each project's progress. Update status and progress notes.
 Consider: Are any goals achieved? Stalled? Need new approach?
 Reply ONLY JSON: {"projects":[{"name":"...","status":"active|completed|paused","goal":"...","progress":"updated note"}]}`,
+      taskId: `longterm:${Date.now()}`,
       priority: "low",
     });
 

@@ -427,6 +427,7 @@ RESPOND IN THE SAME LANGUAGE AS THE REQUEST.`;
       const result = await this.ctx.requestCompute({
         context,
         question,
+        taskId: order.id,
         priority: "high",
         tools: ["Bash(curl *)"],
         relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,
@@ -539,6 +540,7 @@ Your personal directory: ${sd}/`;
       const result = await this.ctx.requestCompute({
         context,
         question,
+        taskId: taskKey,
         priority: "high",
         tools: ["Bash(curl *)"],
         relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,
@@ -647,6 +649,7 @@ Complete this task. Use the environment info above and tools (curl, etc.) as nee
       const result = await this.ctx.requestCompute({
         context,
         question,
+        taskId: task.id,
         priority: "low",
         tools: ["Bash(curl *)"],
         relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,

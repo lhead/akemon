@@ -134,11 +134,12 @@ function runEngine(
   signal?: AbortSignal,
   origin?: import("./engine-routing.js").Origin,
   routing?: import("./engine-routing.js").EngineRouting,
+  taskId?: string,
 ): Promise<string> {
   if (!_engineP) {
     throw new Error("Engine peripheral not initialized");
   }
-  const result = _engineP.runEngine(task, allowAll, extraAllowedTools, signal, origin, routing);
+  const result = _engineP.runEngine(task, allowAll, extraAllowedTools, signal, origin, routing, taskId);
   // Sync trace back to module-level for reporting
   result.then(() => { lastEngineTrace = _engineP!.lastTrace; }).catch(() => { lastEngineTrace = _engineP!.lastTrace; });
   return result;
@@ -440,6 +441,7 @@ export async function serve(options: ServeOptions): Promise<void> {
         abortController.signal,
         req.origin,
         routing,
+        req.taskId,
       );
       emitTokenUsage(prompt.length, response.length);
       return { success: true, response };

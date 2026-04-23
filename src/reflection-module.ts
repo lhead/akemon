@@ -228,6 +228,7 @@ ${discText}`,
 - Lower confidence on disproven beliefs
 
 Reply ONLY JSON: {"discoveries":[{"capability":"skill or lesson","confidence":0.0-1.0,"evidence":"what supports this"}]}`,
+      taskId: `reflection:${Date.now()}`,
       priority: "normal",
       origin: "reflection",
     });

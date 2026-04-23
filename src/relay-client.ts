@@ -30,6 +30,16 @@ interface RelayMessage {
   order_id?: string;
   cols?: number;
   rows?: number;
+  kind?: string;
+  label?: string;
+  message?: string;
+  task_id?: string;
+  origin?: string;
+  cmd?: string;
+  stream?: string;
+  chunk?: string;
+  exit_code?: number | null;
+  duration_ms?: number;
 }
 
 export interface RelayClientOptions {
@@ -50,6 +60,15 @@ export interface RelayClientOptions {
 // Pending agent_call results (callId → resolve function)
 const pendingAgentCalls = new Map<string, (result: string) => void>();
 let relayWsRef: WebSocket | null = null;
+
+function sendRelayMessage(msg: RelayMessage): void {
+  if (!relayWsRef || relayWsRef.readyState !== WebSocket.OPEN) return;
+  try {
+    relayWsRef.send(JSON.stringify(msg));
+  } catch {
+    // best-effort
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Terminal (PTY) — spawned on demand when relay sends terminal_start
@@ -128,6 +147,33 @@ export function callAgent(target: string, task: string): Promise<string> {
         reject(new Error(`agent_call to ${target} timed out`));
       }
     }, 300_000);
+  });
+}
+
+export function sendTaskStart(taskId: string, origin: string | undefined, cmd: string): void {
+  sendRelayMessage({
+    type: "task_start",
+    task_id: taskId,
+    origin,
+    cmd,
+  });
+}
+
+export function sendTaskStream(taskId: string, stream: "stdout" | "stderr", chunk: string): void {
+  sendRelayMessage({
+    type: "task_stream",
+    task_id: taskId,
+    stream,
+    chunk,
+  });
+}
+
+export function sendTaskEnd(taskId: string, exitCode: number | null, durationMs: number): void {
+  sendRelayMessage({
+    type: "task_end",
+    task_id: taskId,
+    exit_code: exitCode,
+    duration_ms: durationMs,
   });
 }
 
@@ -548,10 +594,5 @@ function extractSSEData(sse: string): unknown {
 
 /** Send a failure event to the relay for observability storage. Fire-and-forget. */
 export function sendFailureEvent(kind: string, label: string, message: string): void {
-  if (!relayWsRef || relayWsRef.readyState !== WebSocket.OPEN) return;
-  try {
-    relayWsRef.send(JSON.stringify({ type: "failure_event", kind, label, message }));
-  } catch {
-    // best-effort
-  }
+  sendRelayMessage({ type: "failure_event", kind, label, message });
 }

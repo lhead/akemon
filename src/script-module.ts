@@ -318,6 +318,7 @@ export class ScriptModule implements Module {
         const result = await this.ctx.requestCompute({
           context: prompt,
           question: "Execute this activity.",
+          taskId: `activity:${activityId}:${Date.now()}`,
           priority: "low",
           tools: ["Bash(curl *)"],
           relay: this.relayHttp ? { http: this.relayHttp, agentName } : undefined,
