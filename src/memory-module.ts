@@ -191,6 +191,12 @@ ${discText}`;
 
       const question = `Write a JSON object reflecting on your day. Example:
 {"diary":"...","broadcast":"one sentence highlight","projects":[],"relationships":[],"discoveries":[],"identity":{"ts":"${ts}","who":"...","where":"akemon","doing":"...","short_term":"...","long_term":"..."},"chosen_activities":["activity_id_1","activity_id_2"]}
+
+Diary guidance:
+- Write it as a private note to yourself — narrative, first-person, with real mood / confusion / small discoveries, not a flat list of events.
+- Don't use "today" or similar time pointers; the filename already carries the date.
+- Aim for around 200-500 Chinese characters, or ~100-250 English words — whatever feels natural for one day's reflection.
+- If this day truly had nothing worth recording, set "diary" to null instead of padding a generic entry.
 ${contribText}
 Output ONLY a JSON object:`;
 
@@ -229,7 +235,10 @@ Output ONLY a JSON object:`;
       if (digest.diary) {
         const today = localNow().slice(0, 10);
         try {
-          await writeFile(join(sd, "notes", `${today}.md`), `# ${today}\n\n${digest.diary}`);
+          await writeFile(
+            join(sd, "notes", `${today}.md`),
+            `# ${today}\n<!-- journal -->\n\n${digest.diary}`,
+          );
         } catch {}
       }
       if (Array.isArray(digest.projects)) await saveProjects(workdir, agentName, digest.projects);
