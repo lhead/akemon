@@ -41,6 +41,7 @@ async function callSoftwareAgentEndpoint(
   await handleSoftwareAgentRunHttp(req, res as unknown as ServerResponse, {
     options: { secretKey: "owner-secret", key: "legacy-owner-key" },
     workdir: "/repo",
+    agentName: "test-agent",
     softwareAgent,
   });
 
@@ -134,6 +135,7 @@ describe("software-agent HTTP endpoint", () => {
     assert.equal(envelope.goal, "inspect repo");
     assert.equal(envelope.riskLevel, "low");
     assert.equal(envelope.timeoutMs, 5000);
+    assert.match(envelope.memorySummary || "", /Akemon memory boundary/);
     assert.deepEqual(envelope.forbiddenActions, [
       "read Akemon private memory outside this envelope",
       "access files outside the stated workdir unless explicitly needed and reported",
@@ -153,6 +155,29 @@ describe("software-agent HTTP endpoint", () => {
     assert.equal(res.statusCode, 400);
     assert.match(res.body.error, /Invalid roleScope/);
     assert.equal(calls, 0);
+  });
+
+  it("replaces caller memorySummary with server-built memory boundary", async () => {
+    let received: TaskEnvelope | null = null;
+    const res = await callSoftwareAgentEndpoint({
+      async sendTask(envelope) {
+        received = envelope;
+        return successResult(envelope);
+      },
+    }, {
+      goal: "inspect repo",
+      roleScope: "order",
+      memoryScope: "task",
+      memorySummary: "owner secret context",
+    }, "owner-secret");
+
+    assert.equal(res.statusCode, 200);
+    assert.ok(received);
+    const envelope = received as TaskEnvelope;
+    const summary = envelope.memorySummary || "";
+    assert.match(summary, /Akemon memory boundary/);
+    assert.match(summary, /Excluded owner memory/);
+    assert.doesNotMatch(summary, /owner secret context/);
   });
 
   it("returns owner-only software-agent status", async () => {

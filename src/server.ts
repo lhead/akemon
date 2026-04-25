@@ -140,6 +140,7 @@ export async function handleSoftwareAgentRunHttp(
   deps: {
     options: Pick<ServeOptions, "secretKey" | "key">;
     workdir: string;
+    agentName: string;
     softwareAgent: Pick<CodexSoftwareAgentPeripheral, "sendTask"> | null;
   },
 ): Promise<void> {
@@ -166,6 +167,12 @@ export async function handleSoftwareAgentRunHttp(
   let envelope;
   try {
     envelope = createOwnerTaskEnvelope(body, deps.workdir);
+    envelope.memorySummary = await buildSoftwareAgentMemorySummary({
+      workdir: deps.workdir,
+      agentName: deps.agentName,
+      envelope,
+      request: body,
+    });
   } catch (err: any) {
     res.writeHead(400, { "Content-Type": "application/json" })
       .end(JSON.stringify({ error: err.message || "Invalid software-agent envelope" }));
@@ -248,6 +255,7 @@ import { ReflectionModule } from "./reflection-module.js";
 import { ScriptModule } from "./script-module.js";
 import { FileEventLog, PersistentEventBus } from "./event-bus.js";
 import { CodexSoftwareAgentPeripheral, createOwnerTaskEnvelope } from "./software-agent-peripheral.js";
+import { buildSoftwareAgentMemorySummary } from "./software-agent-memory.js";
 import { SIG, sig } from "./types.js";
 import type { ComputeRequest, ComputeResult, Peripheral } from "./types.js";
 import { ServeOptions, loadConversation, listConversations, buildLLMContext, resolveConvId } from "./context.js";
@@ -360,6 +368,7 @@ export async function serve(options: ServeOptions): Promise<void> {
         await handleSoftwareAgentRunHttp(req, res, {
           options,
           workdir,
+          agentName: options.agentName,
           softwareAgent: codexSoftwareAgent,
         });
         return;
