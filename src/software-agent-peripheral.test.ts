@@ -174,6 +174,7 @@ describe("createOwnerTaskEnvelope", () => {
 describe("CodexSoftwareAgentPeripheral", () => {
   it("runs codex exec with an envelope over stdin and streams lifecycle events", async () => {
     const streamEvents: StreamEvent[] = [];
+    const observerEvents: string[] = [];
     const busEvents: string[] = [];
     let writtenPrompt = "";
     let spawnedChild: ChildProcess | null = null;
@@ -230,7 +231,19 @@ describe("CodexSoftwareAgentPeripheral", () => {
     });
     await peripheral.start(bus);
 
-    const result = await peripheral.sendTask(baseEnvelope());
+    const result = await peripheral.sendTask(baseEnvelope(), {
+      observer: {
+        onStart(event) {
+          observerEvents.push(`start:${event.taskId}:${event.commandLine}`);
+        },
+        onStream(event) {
+          observerEvents.push(`${event.stream}:${event.chunk}`);
+        },
+        onEnd(event) {
+          observerEvents.push(`end:${event.taskId}:${event.result.success}`);
+        },
+      },
+    });
 
     assert.ok(spawnedChild, "spawn should be called");
     assert.equal(result.success, true);
@@ -260,6 +273,13 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.equal(end.exitCode, 0);
       assert.ok(end.durationMs >= 0);
     }
+    assert.deepEqual(observerEvents, [
+      "start:sw-test-1:codex exec --skip-git-repo-check --color never -s workspace-write -C /tmp/akemon -",
+      "stdout:result ",
+      "stderr:note",
+      "stdout:ok",
+      "end:sw-test-1:true",
+    ]);
 
     assert.deepEqual(busEvents, [
       "task:started:sw-test-1",

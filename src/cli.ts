@@ -54,6 +54,21 @@ function truncateOneLine(value: string, max: number): string {
 }
 
 async function callLocalOwnerEndpoint(path: string, opts: { port?: string }, init: RequestInit = {}): Promise<any> {
+  const res = await fetchLocalOwnerEndpoint(path, opts, init);
+
+  const text = await res.text();
+  let data: any;
+  try { data = text ? JSON.parse(text) : {}; }
+  catch { data = { output: text }; }
+
+  if (!res.ok || data.success === false) {
+    console.error(data.error || text || `Request failed with HTTP ${res.status}`);
+    process.exit(1);
+  }
+  return data;
+}
+
+async function fetchLocalOwnerEndpoint(path: string, opts: { port?: string }, init: RequestInit = {}): Promise<Response> {
   const credentials = await getOrCreateRelayCredentials();
   const port = parsePortOption(opts.port);
   const headers: Record<string, string> = {
@@ -83,16 +98,83 @@ async function callLocalOwnerEndpoint(path: string, opts: { port?: string }, ini
     throw error;
   }
 
-  const text = await res.text();
-  let data: any;
-  try { data = text ? JSON.parse(text) : {}; }
-  catch { data = { output: text }; }
+  return res;
+}
 
-  if (!res.ok || data.success === false) {
+async function streamLocalOwnerEndpoint(path: string, opts: { port?: string }, body: Record<string, unknown>): Promise<void> {
+  const res = await fetchLocalOwnerEndpoint(path, opts, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    let data: any;
+    try { data = text ? JSON.parse(text) : {}; }
+    catch { data = { error: text }; }
     console.error(data.error || text || `Request failed with HTTP ${res.status}`);
     process.exit(1);
   }
-  return data;
+
+  if (!res.body) return;
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let failed = false;
+  const reader = res.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (handleSoftwareAgentStreamLine(line)) failed = true;
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim() && handleSoftwareAgentStreamLine(buffer)) failed = true;
+  if (failed) process.exit(1);
+}
+
+function handleSoftwareAgentStreamLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+
+  let event: any;
+  try {
+    event = JSON.parse(trimmed);
+  } catch {
+    process.stderr.write(`${trimmed}\n`);
+    return true;
+  }
+
+  if (event.type === "start" && event.taskId) {
+    process.stderr.write(`[software-agent] started ${event.taskId}\n`);
+    return false;
+  }
+  if (event.type === "stdout" && typeof event.chunk === "string") {
+    process.stdout.write(event.chunk);
+    return false;
+  }
+  if (event.type === "stderr" && typeof event.chunk === "string") {
+    process.stderr.write(event.chunk);
+    return false;
+  }
+  if (event.type === "end") {
+    const result = event.result;
+    if (result?.success === false && result.error) {
+      process.stderr.write(`${result.error}\n`);
+      return true;
+    }
+    return false;
+  }
+  if (event.type === "error") {
+    process.stderr.write(`${event.error || "Software-agent stream failed"}\n`);
+    return true;
+  }
+
+  return false;
 }
 
 program
@@ -236,6 +318,7 @@ program
   .option("--memory-summary <text>", "Pre-filtered memory/context text to include")
   .option("--deliverable <text>", "Expected output shape")
   .option("--timeout-ms <ms>", "Task timeout in milliseconds")
+  .option("--no-stream", "Disable local streaming and wait for the final response")
   .action(async (goalParts: string[], opts) => {
     const body: Record<string, unknown> = {
       goal: goalParts.join(" "),
@@ -254,6 +337,11 @@ program
         process.exit(1);
       }
       body.timeoutMs = timeoutMs;
+    }
+
+    if (opts.stream !== false) {
+      await streamLocalOwnerEndpoint("/self/software-agent/run-stream", opts, body);
+      return;
     }
 
     const data = await callLocalOwnerEndpoint("/self/software-agent/run", opts, {

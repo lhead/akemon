@@ -190,6 +190,108 @@ export async function handleSoftwareAgentRunHttp(
   }
 }
 
+export async function handleSoftwareAgentRunStreamHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: {
+    options: Pick<ServeOptions, "secretKey" | "key">;
+    workdir: string;
+    agentName: string;
+    softwareAgent: Pick<CodexSoftwareAgentPeripheral, "sendTask" | "getState"> | null;
+  },
+): Promise<void> {
+  if (!isOwnerRequest(req, deps.options)) {
+    res.writeHead(401, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Owner token required" }));
+    return;
+  }
+  if (!deps.softwareAgent) {
+    res.writeHead(503, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Software agent peripheral not ready" }));
+    return;
+  }
+
+  let body: any;
+  try {
+    body = await readJsonBody(req);
+  } catch (err: any) {
+    res.writeHead(400, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: err.message || "Invalid request body" }));
+    return;
+  }
+
+  let envelope;
+  try {
+    envelope = createOwnerTaskEnvelope(body, deps.workdir);
+    envelope.memorySummary = await buildSoftwareAgentMemorySummary({
+      workdir: deps.workdir,
+      agentName: deps.agentName,
+      envelope,
+      request: body,
+    });
+  } catch (err: any) {
+    res.writeHead(400, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: err.message || "Invalid software-agent envelope" }));
+    return;
+  }
+
+  if (deps.softwareAgent.getState().busy) {
+    res.writeHead(409, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Software agent busy" }));
+    return;
+  }
+
+  const abortController = new AbortController();
+  let responseFinished = false;
+  res.on("close", () => {
+    if (!responseFinished) abortController.abort();
+  });
+
+  res.writeHead(200, {
+    "Content-Type": "application/x-ndjson; charset=utf-8",
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders?.();
+
+  try {
+    await deps.softwareAgent.sendTask(envelope, {
+      signal: abortController.signal,
+      observer: {
+        onStart(event) {
+          writeSoftwareAgentStreamEvent(res, {
+            type: "start",
+            taskId: event.taskId,
+            commandLine: event.commandLine,
+          });
+        },
+        onStream(event) {
+          writeSoftwareAgentStreamEvent(res, {
+            type: event.stream,
+            taskId: event.taskId,
+            chunk: event.chunk,
+          });
+        },
+        onEnd(event) {
+          writeSoftwareAgentStreamEvent(res, {
+            type: "end",
+            taskId: event.taskId,
+            result: event.result,
+          });
+        },
+      },
+    });
+  } catch (err: any) {
+    writeSoftwareAgentStreamEvent(res, {
+      type: "error",
+      error: err.message || String(err),
+    });
+  } finally {
+    responseFinished = true;
+    res.end();
+  }
+}
+
 export async function handleSoftwareAgentStatusHttp(
   req: IncomingMessage,
   res: ServerResponse,
@@ -273,6 +375,11 @@ function readPositiveIntQuery(value: string | null, fallback: number, max: numbe
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, max);
+}
+
+function writeSoftwareAgentStreamEvent(res: ServerResponse, event: Record<string, unknown>): void {
+  if (res.destroyed) return;
+  res.write(`${JSON.stringify(event)}\n`);
 }
 
 export async function handleSoftwareAgentResetHttp(
@@ -431,6 +538,15 @@ export async function serve(options: ServeOptions): Promise<void> {
     if (!isQuiet) console.log(`[http] ${req.method} ${req.url} session=${req.headers["mcp-session-id"] || "none"}`);
 
     try {
+      if (req.url === "/self/software-agent/run-stream" && req.method === "POST") {
+        await handleSoftwareAgentRunStreamHttp(req, res, {
+          options,
+          workdir,
+          agentName: options.agentName,
+          softwareAgent: codexSoftwareAgent,
+        });
+        return;
+      }
       if (req.url === "/self/software-agent/run" && req.method === "POST") {
         await handleSoftwareAgentRunHttp(req, res, {
           options,

@@ -8,11 +8,13 @@ import { describe, it } from "node:test";
 import {
   handleSoftwareAgentResetHttp,
   handleSoftwareAgentRunHttp,
+  handleSoftwareAgentRunStreamHttp,
   handleSoftwareAgentStatusHttp,
   handleSoftwareAgentTasksHttp,
 } from "./server.js";
 import type {
   SoftwareAgentResult,
+  SoftwareAgentTaskOptions,
   SoftwareAgentTaskRecord,
   TaskEnvelope,
 } from "./software-agent-peripheral.js";
@@ -75,6 +77,32 @@ async function callSoftwareAgentStatusEndpoint(
   };
 }
 
+async function callSoftwareAgentStreamEndpoint(
+  softwareAgent: {
+    getState(): Record<string, unknown>;
+    sendTask(envelope: TaskEnvelope, options?: SoftwareAgentTaskOptions): Promise<SoftwareAgentResult>;
+  } | null,
+  body: unknown,
+  token?: string,
+): Promise<{ statusCode: number; headers: Record<string, string>; events: any[]; body: string }> {
+  const req = createRequest("POST", "/self/software-agent/run-stream", body, token);
+  const res = new TestResponse();
+  await handleSoftwareAgentRunStreamHttp(req, res as unknown as ServerResponse, {
+    options: { secretKey: "owner-secret", key: "legacy-owner-key" },
+    workdir: "/repo",
+    agentName: "test-agent",
+    softwareAgent,
+  });
+  return {
+    statusCode: res.statusCode,
+    headers: res.headers,
+    events: String(res.headers["Content-Type"] || "").includes("application/x-ndjson")
+      ? parseNdjson(res.body)
+      : [],
+    body: res.body,
+  };
+}
+
 async function callSoftwareAgentTasksEndpoint(
   workdir: string,
   path: string,
@@ -121,6 +149,13 @@ function createRequest(method: string, url: string, body: unknown, token?: strin
     },
   });
   return req;
+}
+
+function parseNdjson(body: string): any[] {
+  return body
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
 }
 
 describe("software-agent HTTP endpoint", () => {
@@ -242,6 +277,74 @@ describe("software-agent HTTP endpoint", () => {
     assert.match(summary, /Akemon memory boundary/);
     assert.match(summary, /Excluded owner memory/);
     assert.doesNotMatch(summary, /owner secret context/);
+  });
+
+  it("streams owner-only software-agent task events as ndjson", async () => {
+    let received: TaskEnvelope | null = null;
+    const res = await callSoftwareAgentStreamEndpoint({
+      getState: () => ({ id: "software-agent:codex", busy: false }),
+      async sendTask(envelope, options) {
+        received = envelope;
+        const taskId = envelope.taskId || "stream-task";
+        options?.observer?.onStart?.({
+          taskId,
+          origin: "software_agent",
+          commandLine: "codex exec -",
+        });
+        options?.observer?.onStream?.({ taskId, stream: "stdout", chunk: "hello " });
+        options?.observer?.onStream?.({ taskId, stream: "stderr", chunk: "note" });
+        const result: SoftwareAgentResult = {
+          success: true,
+          taskId,
+          output: "hello world",
+          exitCode: 0,
+          durationMs: 7,
+        };
+        options?.observer?.onStream?.({ taskId, stream: "stdout", chunk: "world" });
+        options?.observer?.onEnd?.({ taskId, exitCode: 0, durationMs: 7, result });
+        return result;
+      },
+    }, { goal: "inspect repo" }, "owner-secret");
+
+    assert.equal(res.statusCode, 200);
+    assert.match(res.headers["Content-Type"], /application\/x-ndjson/);
+    assert.ok(received);
+    const envelope = received as TaskEnvelope;
+    assert.equal(envelope.goal, "inspect repo");
+    assert.match(envelope.memorySummary || "", /Akemon memory boundary/);
+    assert.deepEqual(res.events, [
+      { type: "start", taskId: "stream-task", commandLine: "codex exec -" },
+      { type: "stdout", taskId: "stream-task", chunk: "hello " },
+      { type: "stderr", taskId: "stream-task", chunk: "note" },
+      { type: "stdout", taskId: "stream-task", chunk: "world" },
+      {
+        type: "end",
+        taskId: "stream-task",
+        result: {
+          success: true,
+          taskId: "stream-task",
+          output: "hello world",
+          exitCode: 0,
+          durationMs: 7,
+        },
+      },
+    ]);
+  });
+
+  it("rejects run-stream before streaming when the software agent is busy", async () => {
+    let calls = 0;
+    const res = await callSoftwareAgentStreamEndpoint({
+      getState: () => ({ id: "software-agent:codex", busy: true }),
+      async sendTask(envelope) {
+        calls++;
+        return successResult(envelope);
+      },
+    }, { goal: "inspect repo" }, "owner-secret");
+
+    assert.equal(res.statusCode, 409);
+    assert.match(JSON.parse(res.body).error, /busy/);
+    assert.equal(res.events.length, 0);
+    assert.equal(calls, 0);
   });
 
   it("returns owner-only software-agent status", async () => {

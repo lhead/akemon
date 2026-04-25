@@ -113,9 +113,39 @@ export interface SoftwareAgentTaskRecord {
 
 export interface SoftwareAgentPeripheral extends Peripheral {
   startSession(): Promise<void>;
-  sendTask(envelope: TaskEnvelope, signal?: AbortSignal): Promise<SoftwareAgentResult>;
+  sendTask(envelope: TaskEnvelope, options?: AbortSignal | SoftwareAgentTaskOptions): Promise<SoftwareAgentResult>;
   resetSession(): Promise<void>;
   getState(): Record<string, unknown>;
+}
+
+export interface SoftwareAgentTaskOptions {
+  signal?: AbortSignal;
+  observer?: SoftwareAgentTaskObserver;
+}
+
+export interface SoftwareAgentTaskObserver {
+  onStart?(event: SoftwareAgentTaskStartEvent): void;
+  onStream?(event: SoftwareAgentTaskStreamChunkEvent): void;
+  onEnd?(event: SoftwareAgentTaskEndEvent): void;
+}
+
+export interface SoftwareAgentTaskStartEvent {
+  taskId: string;
+  origin: string | undefined;
+  commandLine: string;
+}
+
+export interface SoftwareAgentTaskStreamChunkEvent {
+  taskId: string;
+  stream: "stdout" | "stderr";
+  chunk: string;
+}
+
+export interface SoftwareAgentTaskEndEvent {
+  taskId: string;
+  exitCode: number | null;
+  durationMs: number;
+  result: SoftwareAgentResult;
 }
 
 export interface SoftwareTaskRelay {
@@ -233,10 +263,14 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     return sig(SIG.SOFTWARE_AGENT_RESPONSE, { ...result }, this.id);
   }
 
-  async sendTask(envelope: TaskEnvelope, signal?: AbortSignal): Promise<SoftwareAgentResult> {
+  async sendTask(
+    envelope: TaskEnvelope,
+    taskOptions?: AbortSignal | SoftwareAgentTaskOptions,
+  ): Promise<SoftwareAgentResult> {
     if (this.activeChild) {
       throw new Error(`Software agent busy (task=${this.activeTaskId})`);
     }
+    const { signal, observer } = normalizeSoftwareAgentTaskOptions(taskOptions);
 
     const taskId = envelope.taskId || `sw_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const workdirSafety = resolveWorkdirSafety(
@@ -282,7 +316,9 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         status: "running",
         updatedAt: startedAtIso,
       });
-      relay.sendTaskStart(taskId, "software_agent", commandLine);
+      const origin = "software_agent";
+      relay.sendTaskStart(taskId, origin, commandLine);
+      observer?.onStart?.({ taskId, origin, commandLine });
       this.bus?.emit(SIG.TASK_STARTED, sig(SIG.TASK_STARTED, {
         taskId,
         taskType: "software_agent",
@@ -304,7 +340,6 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         this.activeTaskId = null;
         this.activeWorkdir = null;
         const durationMs = Date.now() - startedAt;
-        relay.sendTaskEnd(taskId, null, durationMs);
         const result = {
           success: false,
           taskId,
@@ -313,6 +348,8 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           exitCode: null,
           durationMs,
         };
+        relay.sendTaskEnd(taskId, null, durationMs);
+        observer?.onEnd?.({ taskId, exitCode: null, durationMs, result });
         const completedAt = new Date().toISOString();
         this.writeTaskRecord({
           ...baseTaskRecord(),
@@ -348,13 +385,14 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         if (tailOut) {
           stdout += tailOut;
           relay.sendTaskStream(taskId, "stdout", tailOut);
+          observer?.onStream?.({ taskId, stream: "stdout", chunk: tailOut });
         }
         if (tailErr) {
           stderr += tailErr;
           relay.sendTaskStream(taskId, "stderr", tailErr);
+          observer?.onStream?.({ taskId, stream: "stderr", chunk: tailErr });
         }
         const durationMs = Date.now() - startedAt;
-        relay.sendTaskEnd(taskId, exitCode, durationMs);
         this.activeChild = null;
         this.activeTaskId = null;
         this.activeWorkdir = null;
@@ -369,6 +407,8 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           exitCode,
           durationMs,
         };
+        relay.sendTaskEnd(taskId, exitCode, durationMs);
+        observer?.onEnd?.({ taskId, exitCode, durationMs, result });
         const completedAt = new Date().toISOString();
         this.writeTaskRecord({
           ...baseTaskRecord(),
@@ -420,6 +460,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         if (!text) return;
         stdout += text;
         relay.sendTaskStream(taskId, "stdout", text);
+        observer?.onStream?.({ taskId, stream: "stdout", chunk: text });
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
@@ -427,6 +468,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         if (!text) return;
         stderr += text;
         relay.sendTaskStream(taskId, "stderr", text);
+        observer?.onStream?.({ taskId, stream: "stderr", chunk: text });
       });
 
       child.on("close", (code) => {
@@ -688,6 +730,22 @@ function readOptionalString(value: unknown, field: string): string | undefined {
   if (typeof value !== "string") throw new Error(`Invalid ${field}: expected string`);
   const trimmed = value.trim();
   return trimmed || undefined;
+}
+
+function normalizeSoftwareAgentTaskOptions(
+  options: AbortSignal | SoftwareAgentTaskOptions | undefined,
+): SoftwareAgentTaskOptions {
+  if (!options) return {};
+  if (isAbortSignal(options)) {
+    return { signal: options };
+  }
+  return options;
+}
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return !!value
+    && typeof (value as AbortSignal).aborted === "boolean"
+    && typeof (value as AbortSignal).addEventListener === "function";
 }
 
 function readOptionalStringArray(value: unknown, field: string): string[] {
