@@ -13,7 +13,7 @@
 
 import { randomUUID } from "crypto";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
-import { mkdirSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { isAbsolute, join, relative, resolve as resolvePath } from "path";
 import { StringDecoder } from "string_decoder";
 import type { EventBus, Peripheral, Signal } from "./types.js";
@@ -660,6 +660,29 @@ export function readGitWorktreeStatus(workdir: string): GitWorktreeStatus {
   }
 }
 
+export function listSoftwareAgentTaskRecords(taskLedgerDir: string, limit = 20): SoftwareAgentTaskRecord[] {
+  const safeLimit = normalizeTaskRecordLimit(limit);
+  try {
+    if (!existsSync(taskLedgerDir)) return [];
+    return readdirSync(taskLedgerDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => readSoftwareAgentTaskRecordFile(join(taskLedgerDir, entry.name)))
+      .filter((record): record is SoftwareAgentTaskRecord => !!record)
+      .sort(compareSoftwareAgentTaskRecords)
+      .slice(0, safeLimit);
+  } catch {
+    return [];
+  }
+}
+
+export function readSoftwareAgentTaskRecord(
+  taskLedgerDir: string,
+  taskId: string,
+): SoftwareAgentTaskRecord | null {
+  const file = join(taskLedgerDir, `${safeTaskFilename(taskId)}.json`);
+  return readSoftwareAgentTaskRecordFile(file);
+}
+
 function readOptionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "string") throw new Error(`Invalid ${field}: expected string`);
@@ -714,6 +737,40 @@ function summarizeGitError(stderr: unknown, error?: Error): string | undefined {
   if (error) return error.message;
   const text = typeof stderr === "string" ? stderr.trim() : "";
   return text || undefined;
+}
+
+function normalizeTaskRecordLimit(limit: number): number {
+  if (!Number.isInteger(limit) || limit <= 0) return 20;
+  return Math.min(limit, 100);
+}
+
+function readSoftwareAgentTaskRecordFile(file: string): SoftwareAgentTaskRecord | null {
+  try {
+    if (!existsSync(file)) return null;
+    const parsed = JSON.parse(readFileSync(file, "utf8"));
+    if (!isSoftwareAgentTaskRecord(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function isSoftwareAgentTaskRecord(value: any): value is SoftwareAgentTaskRecord {
+  return value
+    && value.schemaVersion === 1
+    && typeof value.taskId === "string"
+    && (value.status === "running" || value.status === "completed" || value.status === "failed")
+    && typeof value.startedAt === "string"
+    && typeof value.updatedAt === "string"
+    && value.envelope
+    && typeof value.envelope.goal === "string";
+}
+
+function compareSoftwareAgentTaskRecords(a: SoftwareAgentTaskRecord, b: SoftwareAgentTaskRecord): number {
+  const bTime = Date.parse(b.updatedAt || b.startedAt) || 0;
+  const aTime = Date.parse(a.updatedAt || a.startedAt) || 0;
+  if (bTime !== aTime) return bTime - aTime;
+  return b.taskId.localeCompare(a.taskId);
 }
 
 function buildCodexExecCommand(opts: {

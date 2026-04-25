@@ -213,6 +213,68 @@ export async function handleSoftwareAgentStatusHttp(
     .end(JSON.stringify(deps.softwareAgent.getState(), null, 2));
 }
 
+export async function handleSoftwareAgentTasksHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: {
+    options: Pick<ServeOptions, "secretKey" | "key">;
+    workdir: string;
+    agentName: string;
+  },
+): Promise<void> {
+  if (!isOwnerRequest(req, deps.options)) {
+    res.writeHead(401, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Owner token required" }));
+    return;
+  }
+
+  const url = new URL(req.url || "/", "http://127.0.0.1");
+  const basePath = "/self/software-agent/tasks";
+  const taskLedgerDir = softwareAgentTaskLedgerDir(deps.workdir, deps.agentName);
+
+  if (url.pathname === basePath) {
+    const limit = readPositiveIntQuery(url.searchParams.get("limit"), 20, 100);
+    const tasks = listSoftwareAgentTaskRecords(taskLedgerDir, limit);
+    res.writeHead(200, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ tasks }, null, 2));
+    return;
+  }
+
+  if (url.pathname.startsWith(`${basePath}/`)) {
+    const taskId = decodeURIComponent(url.pathname.slice(basePath.length + 1));
+    if (!taskId || taskId.includes("/")) {
+      res.writeHead(400, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ error: "Invalid software-agent task id" }));
+      return;
+    }
+
+    const task = readSoftwareAgentTaskRecord(taskLedgerDir, taskId);
+    if (!task) {
+      res.writeHead(404, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ error: "Software-agent task not found" }));
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ task }, null, 2));
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "application/json" })
+    .end(JSON.stringify({ error: "Software-agent task endpoint not found" }));
+}
+
+function softwareAgentTaskLedgerDir(workdir: string, agentName: string): string {
+  return join(workdir, ".akemon", "agents", agentName, "software-agent", "tasks");
+}
+
+function readPositiveIntQuery(value: string | null, fallback: number, max: number): number {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
 export async function handleSoftwareAgentResetHttp(
   req: IncomingMessage,
   res: ServerResponse,
@@ -254,7 +316,12 @@ import { LongTermModule } from "./longterm-module.js";
 import { ReflectionModule } from "./reflection-module.js";
 import { ScriptModule } from "./script-module.js";
 import { FileEventLog, PersistentEventBus } from "./event-bus.js";
-import { CodexSoftwareAgentPeripheral, createOwnerTaskEnvelope } from "./software-agent-peripheral.js";
+import {
+  CodexSoftwareAgentPeripheral,
+  createOwnerTaskEnvelope,
+  listSoftwareAgentTaskRecords,
+  readSoftwareAgentTaskRecord,
+} from "./software-agent-peripheral.js";
 import { buildSoftwareAgentMemorySummary } from "./software-agent-memory.js";
 import { SIG, sig } from "./types.js";
 import type { ComputeRequest, ComputeResult, Peripheral } from "./types.js";
@@ -377,6 +444,18 @@ export async function serve(options: ServeOptions): Promise<void> {
         await handleSoftwareAgentStatusHttp(req, res, {
           options,
           softwareAgent: codexSoftwareAgent,
+        });
+        return;
+      }
+      const requestPath = req.url?.split("?")[0] || "";
+      if (
+        req.method === "GET"
+        && (requestPath === "/self/software-agent/tasks" || requestPath.startsWith("/self/software-agent/tasks/"))
+      ) {
+        await handleSoftwareAgentTasksHttp(req, res, {
+          options,
+          workdir,
+          agentName: options.agentName,
         });
         return;
       }
@@ -578,7 +657,7 @@ export async function serve(options: ServeOptions): Promise<void> {
     workdir,
     model: process.env.AKEMON_CODEX_MODEL,
     sandbox: "workspace-write",
-    taskLedgerDir: join(workdir, ".akemon", "agents", options.agentName, "software-agent", "tasks"),
+    taskLedgerDir: softwareAgentTaskLedgerDir(workdir, options.agentName),
   });
   await codexSoftwareAgent.start(bus);
 

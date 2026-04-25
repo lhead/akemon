@@ -23,6 +23,36 @@ function parsePortOption(port: string | number | undefined): number {
   return Number.isInteger(value) && value > 0 ? value : 3000;
 }
 
+function clampPositiveInt(value: string | number | undefined, fallback: number, max: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function printSoftwareAgentTaskList(tasks: any[]): void {
+  if (!tasks.length) {
+    console.log("No software-agent tasks found.");
+    return;
+  }
+
+  for (const task of tasks) {
+    const result = task.result?.success === true ? "ok" : task.result?.success === false ? "error" : "pending";
+    const duration = typeof task.durationMs === "number" ? `${task.durationMs}ms` : "-";
+    const git = task.workdirStatus?.isRepo
+      ? (task.workdirStatus.dirty ? `dirty:${task.workdirStatus.changedFiles?.length || 0}` : "clean")
+      : "no-git";
+    const goal = truncateOneLine(task.envelope?.goal || "", 90);
+    console.log(`${task.taskId}  ${task.status}/${result}  ${duration}  ${git}  ${task.updatedAt || task.startedAt}`);
+    if (goal) console.log(`  ${goal}`);
+  }
+}
+
+function truncateOneLine(value: string, max: number): string {
+  const oneLine = value.replace(/\s+/g, " ").trim();
+  if (oneLine.length <= max) return oneLine;
+  return `${oneLine.slice(0, Math.max(0, max - 3))}...`;
+}
+
 async function callLocalOwnerEndpoint(path: string, opts: { port?: string }, init: RequestInit = {}): Promise<any> {
   const credentials = await getOrCreateRelayCredentials();
   const port = parsePortOption(opts.port);
@@ -230,6 +260,29 @@ program
       method: "GET",
     });
     console.log(JSON.stringify(data, null, 2));
+  });
+
+program
+  .command("software-agent-tasks")
+  .description("List recent owner-only software-agent task ledger records")
+  .argument("[taskId]", "Task id to inspect")
+  .option("-p, --port <port>", "Local akemon serve port", "3000")
+  .option("-l, --limit <n>", "Maximum recent tasks to list", "20")
+  .option("--json", "Print raw JSON")
+  .action(async (taskId: string | undefined, opts) => {
+    const path = taskId
+      ? `/self/software-agent/tasks/${encodeURIComponent(taskId)}`
+      : `/self/software-agent/tasks?limit=${clampPositiveInt(opts.limit, 20, 100)}`;
+    const data = await callLocalOwnerEndpoint(path, opts, {
+      method: "GET",
+    });
+
+    if (opts.json || taskId) {
+      console.log(JSON.stringify(taskId ? data.task : data, null, 2));
+      return;
+    }
+
+    printSoftwareAgentTaskList(Array.isArray(data.tasks) ? data.tasks : []);
   });
 
 program

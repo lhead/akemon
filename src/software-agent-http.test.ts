@@ -1,13 +1,21 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { describe, it } from "node:test";
 import {
   handleSoftwareAgentResetHttp,
   handleSoftwareAgentRunHttp,
   handleSoftwareAgentStatusHttp,
+  handleSoftwareAgentTasksHttp,
 } from "./server.js";
-import type { SoftwareAgentResult, TaskEnvelope } from "./software-agent-peripheral.js";
+import type {
+  SoftwareAgentResult,
+  SoftwareAgentTaskRecord,
+  TaskEnvelope,
+} from "./software-agent-peripheral.js";
 
 class TestResponse extends Writable {
   statusCode = 200;
@@ -60,6 +68,24 @@ async function callSoftwareAgentStatusEndpoint(
   await handleSoftwareAgentStatusHttp(req, res as unknown as ServerResponse, {
     options: { secretKey: "owner-secret", key: "legacy-owner-key" },
     softwareAgent,
+  });
+  return {
+    statusCode: res.statusCode,
+    body: res.body ? JSON.parse(res.body) : {},
+  };
+}
+
+async function callSoftwareAgentTasksEndpoint(
+  workdir: string,
+  path: string,
+  token?: string,
+): Promise<{ statusCode: number; body: any }> {
+  const req = createRequest("GET", path, undefined, token);
+  const res = new TestResponse();
+  await handleSoftwareAgentTasksHttp(req, res as unknown as ServerResponse, {
+    options: { secretKey: "owner-secret", key: "legacy-owner-key" },
+    workdir,
+    agentName: "test-agent",
   });
   return {
     statusCode: res.statusCode,
@@ -239,6 +265,43 @@ describe("software-agent HTTP endpoint", () => {
     assert.equal(res.body.transport, "codex-exec");
   });
 
+  it("returns owner-only software-agent task ledger records", async () => {
+    const workdir = await mkdtemp(join(tmpdir(), "akemon-software-agent-http-"));
+    try {
+      const ledgerDir = join(workdir, ".akemon", "agents", "test-agent", "software-agent", "tasks");
+      await mkdir(ledgerDir, { recursive: true });
+      await writeSoftwareAgentTaskRecord(ledgerDir, taskRecord({
+        taskId: "older",
+        updatedAt: "2026-04-25T01:00:00.000Z",
+        goal: "older task",
+      }));
+      await writeSoftwareAgentTaskRecord(ledgerDir, taskRecord({
+        taskId: "newer",
+        updatedAt: "2026-04-25T02:00:00.000Z",
+        goal: "newer task",
+      }));
+
+      const unauth = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks");
+      assert.equal(unauth.statusCode, 401);
+
+      const list = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks?limit=1", "owner-secret");
+      assert.equal(list.statusCode, 200);
+      assert.equal(list.body.tasks.length, 1);
+      assert.equal(list.body.tasks[0].taskId, "newer");
+      assert.equal(list.body.tasks[0].envelope.goal, "newer task");
+
+      const detail = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks/older", "owner-secret");
+      assert.equal(detail.statusCode, 200);
+      assert.equal(detail.body.task.taskId, "older");
+      assert.equal(detail.body.task.envelope.goal, "older task");
+
+      const missing = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks/missing", "owner-secret");
+      assert.equal(missing.statusCode, 404);
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
   it("resets the owner-only software-agent session", async () => {
     let resets = 0;
     const res = await callSoftwareAgentResetEndpoint({
@@ -263,4 +326,45 @@ function successResult(envelope: TaskEnvelope): SoftwareAgentResult {
     exitCode: 0,
     durationMs: 1,
   };
+}
+
+function taskRecord(overrides: {
+  taskId: string;
+  updatedAt: string;
+  goal: string;
+}): SoftwareAgentTaskRecord {
+  return {
+    schemaVersion: 1,
+    taskId: overrides.taskId,
+    status: "completed",
+    agentId: "software-agent:codex",
+    sessionId: "session-test",
+    transport: "codex-exec",
+    commandLine: "codex exec -",
+    envelope: {
+      taskId: overrides.taskId,
+      sourceModule: "owner-http",
+      purpose: "test task",
+      goal: overrides.goal,
+      workdir: "/repo",
+      roleScope: "owner",
+      memoryScope: "owner",
+      riskLevel: "medium",
+    },
+    startedAt: "2026-04-25T00:00:00.000Z",
+    updatedAt: overrides.updatedAt,
+    completedAt: overrides.updatedAt,
+    durationMs: 12,
+    result: {
+      success: true,
+      taskId: overrides.taskId,
+      output: "ok",
+      exitCode: 0,
+      durationMs: 12,
+    },
+  };
+}
+
+async function writeSoftwareAgentTaskRecord(dir: string, record: SoftwareAgentTaskRecord): Promise<void> {
+  await writeFile(join(dir, `${record.taskId}.json`), `${JSON.stringify(record, null, 2)}\n`);
 }
