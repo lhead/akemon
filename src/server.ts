@@ -569,6 +569,7 @@ export async function serve(options: ServeOptions): Promise<void> {
     workdir,
     model: process.env.AKEMON_CODEX_MODEL,
     sandbox: "workspace-write",
+    taskLedgerDir: join(workdir, ".akemon", "agents", options.agentName, "software-agent", "tasks"),
   });
   await codexSoftwareAgent.start(bus);
 

@@ -13,6 +13,8 @@
 
 import { randomUUID } from "crypto";
 import { spawn, type ChildProcess } from "child_process";
+import { mkdirSync, writeFileSync } from "fs";
+import { join } from "path";
 import { StringDecoder } from "string_decoder";
 import type { EventBus, Peripheral, Signal } from "./types.js";
 import { SIG, sig } from "./types.js";
@@ -60,6 +62,35 @@ export interface SoftwareAgentResult {
   durationMs: number;
 }
 
+export type SoftwareAgentTaskStatus = "running" | "completed" | "failed";
+
+export interface TextSummary {
+  chars: number;
+  bytes: number;
+  lines: number;
+  text: string;
+  truncated: boolean;
+  omittedChars?: number;
+}
+
+export interface SoftwareAgentTaskRecord {
+  schemaVersion: 1;
+  taskId: string;
+  status: SoftwareAgentTaskStatus;
+  agentId: string;
+  sessionId: string;
+  transport: "codex-exec";
+  commandLine: string;
+  envelope: TaskEnvelope;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  durationMs?: number;
+  result?: SoftwareAgentResult;
+  stdoutSummary?: TextSummary;
+  stderrSummary?: TextSummary;
+}
+
 export interface SoftwareAgentPeripheral extends Peripheral {
   startSession(): Promise<void>;
   sendTask(envelope: TaskEnvelope, signal?: AbortSignal): Promise<SoftwareAgentResult>;
@@ -83,6 +114,7 @@ export interface CodexSoftwareAgentConfig {
   spawnImpl?: typeof spawn;
   taskRelay?: SoftwareTaskRelay;
   defaultTimeoutMs?: number;
+  taskLedgerDir?: string;
 }
 
 const defaultTaskRelay: SoftwareTaskRelay = {
@@ -101,6 +133,9 @@ const DEFAULT_OWNER_FORBIDDEN_ACTIONS = [
 const ROLE_SCOPES: RoleScope[] = ["owner", "public", "order", "agent", "system"];
 const MEMORY_SCOPES: MemoryScope[] = ["none", "public", "task", "owner"];
 const RISK_LEVELS: RiskLevel[] = ["low", "medium", "high"];
+const MAX_STREAM_SUMMARY_CHARS = 12_000;
+const STREAM_SUMMARY_HEAD_CHARS = 4_000;
+const STREAM_SUMMARY_TAIL_CHARS = 8_000;
 
 export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
   id: string;
@@ -154,6 +189,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       activeTaskId: this.activeTaskId,
       busy: !!this.activeChild,
       transport: "codex-exec",
+      taskLedgerDir: this.config.taskLedgerDir,
     };
   }
 
@@ -177,7 +213,8 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
 
     const taskId = envelope.taskId || `sw_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const workdir = envelope.workdir || this.config.workdir;
-    const prompt = buildTaskEnvelopePrompt({ ...envelope, taskId, workdir });
+    const effectiveEnvelope = { ...envelope, taskId, workdir };
+    const prompt = buildTaskEnvelopePrompt(effectiveEnvelope);
     const { cmd, args } = buildCodexExecCommand({
       command: this.config.command || "codex",
       workdir,
@@ -186,18 +223,35 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     });
 
     const startedAt = Date.now();
+    const startedAtIso = new Date(startedAt).toISOString();
     const relay = this.config.taskRelay || defaultTaskRelay;
     const commandLine = [cmd, ...args].join(" ");
     const spawnImpl = this.config.spawnImpl || spawn;
     const timeoutMs = envelope.timeoutMs || this.config.defaultTimeoutMs || DEFAULT_TIMEOUT_MS;
 
+    const baseTaskRecord = (): Omit<SoftwareAgentTaskRecord, "status" | "updatedAt"> => ({
+      schemaVersion: 1,
+      taskId,
+      agentId: this.id,
+      sessionId: this.sessionId,
+      transport: "codex-exec",
+      commandLine,
+      envelope: effectiveEnvelope,
+      startedAt: startedAtIso,
+    });
+
     return new Promise<SoftwareAgentResult>((resolve) => {
       this.activeTaskId = taskId;
+      this.writeTaskRecord({
+        ...baseTaskRecord(),
+        status: "running",
+        updatedAt: startedAtIso,
+      });
       relay.sendTaskStart(taskId, "software_agent", commandLine);
       this.bus?.emit(SIG.TASK_STARTED, sig(SIG.TASK_STARTED, {
         taskId,
         taskType: "software_agent",
-        description: envelope.goal,
+        description: effectiveEnvelope.goal,
         peripheral: this.id,
         sessionId: this.sessionId,
       }, this.id));
@@ -223,6 +277,17 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           exitCode: null,
           durationMs,
         };
+        const completedAt = new Date().toISOString();
+        this.writeTaskRecord({
+          ...baseTaskRecord(),
+          status: "failed",
+          updatedAt: completedAt,
+          completedAt,
+          durationMs,
+          result,
+          stdoutSummary: summarizeText(""),
+          stderrSummary: summarizeText(result.error || ""),
+        });
         this.bus?.emit(SIG.TASK_FAILED, sig(SIG.TASK_FAILED, result, this.id));
         resolve(result);
         return;
@@ -267,6 +332,17 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           exitCode,
           durationMs,
         };
+        const completedAt = new Date().toISOString();
+        this.writeTaskRecord({
+          ...baseTaskRecord(),
+          status: success ? "completed" : "failed",
+          updatedAt: completedAt,
+          completedAt,
+          durationMs,
+          result,
+          stdoutSummary: summarizeText(stdout),
+          stderrSummary: summarizeText(stderr),
+        });
 
         this.bus?.emit(success ? SIG.TASK_COMPLETED : SIG.TASK_FAILED, sig(success ? SIG.TASK_COMPLETED : SIG.TASK_FAILED, {
           ...result,
@@ -327,6 +403,44 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       });
     });
   }
+
+  private writeTaskRecord(record: SoftwareAgentTaskRecord): void {
+    const dir = this.config.taskLedgerDir;
+    if (!dir) return;
+    try {
+      mkdirSync(dir, { recursive: true });
+      const safeTaskId = safeTaskFilename(record.taskId);
+      writeFileSync(join(dir, `${safeTaskId}.json`), `${JSON.stringify(record, null, 2)}\n`);
+    } catch (err: any) {
+      console.error(`[software-agent] Failed to write task ledger: ${err.message || String(err)}`);
+    }
+  }
+}
+
+export function summarizeText(text: string, maxChars = MAX_STREAM_SUMMARY_CHARS): TextSummary {
+  const normalized = text || "";
+  const chars = normalized.length;
+  const bytes = Buffer.byteLength(normalized, "utf8");
+  const lines = normalized ? normalized.split(/\r\n|\r|\n/).length : 0;
+  if (chars <= maxChars) {
+    return { chars, bytes, lines, text: normalized, truncated: false };
+  }
+
+  const headChars = Math.min(STREAM_SUMMARY_HEAD_CHARS, maxChars);
+  const tailChars = Math.max(0, maxChars - headChars);
+  const omittedChars = chars - headChars - tailChars;
+  return {
+    chars,
+    bytes,
+    lines,
+    text: [
+      normalized.slice(0, headChars),
+      `[truncated ${omittedChars} chars]`,
+      normalized.slice(-tailChars),
+    ].join("\n"),
+    truncated: true,
+    omittedChars,
+  };
 }
 
 export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
@@ -442,6 +556,11 @@ function readTimeoutMs(value: unknown): number | undefined {
     throw new Error(`Invalid timeoutMs: expected integer between 1 and ${MAX_OWNER_TIMEOUT_MS}`);
   }
   return value;
+}
+
+function safeTaskFilename(taskId: string): string {
+  const safe = taskId.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 200);
+  return safe || "task";
 }
 
 function buildCodexExecCommand(opts: {

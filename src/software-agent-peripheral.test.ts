@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
@@ -7,6 +10,7 @@ import {
   CodexSoftwareAgentPeripheral,
   buildTaskEnvelopePrompt,
   createOwnerTaskEnvelope,
+  summarizeText,
   type TaskEnvelope,
 } from "./software-agent-peripheral.js";
 import { SimpleEventBus } from "./event-bus.js";
@@ -236,5 +240,69 @@ describe("CodexSoftwareAgentPeripheral", () => {
     );
 
     await first;
+  });
+
+  it("records task ledger state from running to completed", async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), "akemon-software-agent-ledger-"));
+    try {
+      const spawnedChild = createFakeChild();
+      const ledgerDir = join(tmpDir, "tasks");
+      const peripheral = new CodexSoftwareAgentPeripheral({
+        workdir: "/tmp/akemon",
+        spawnImpl: (() => {
+          return spawnedChild;
+        }) as typeof import("node:child_process").spawn,
+        taskRelay: {
+          sendTaskStart() {},
+          sendTaskStream() {},
+          sendTaskEnd() {},
+        },
+        taskLedgerDir: ledgerDir,
+      });
+
+      const run = peripheral.sendTask(baseEnvelope({ taskId: "ledger-running" }));
+      const path = join(ledgerDir, "ledger-running.json");
+      const running = JSON.parse(await readFile(path, "utf-8"));
+
+      assert.equal(running.schemaVersion, 1);
+      assert.equal(running.status, "running");
+      assert.equal(running.taskId, "ledger-running");
+      assert.equal(running.envelope.goal, "Inspect the repo and summarize the event bus implementation.");
+      assert.equal(running.transport, "codex-exec");
+
+      spawnedChild.stdout?.emit("data", Buffer.from("ledger result"));
+      spawnedChild.stderr?.emit("data", Buffer.from("ledger note"));
+      spawnedChild.emit("close", 0);
+
+      const result = await run;
+      const completed = JSON.parse(await readFile(path, "utf-8"));
+
+      assert.equal(result.success, true);
+      assert.equal(completed.status, "completed");
+      assert.equal(completed.result.success, true);
+      assert.equal(completed.result.exitCode, 0);
+      assert.equal(completed.stdoutSummary.text, "ledger result");
+      assert.equal(completed.stderrSummary.text, "ledger note");
+      assert.equal(completed.stdoutSummary.truncated, false);
+      assert.ok(completed.completedAt);
+      assert.ok(completed.durationMs >= 0);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("summarizeText", () => {
+  it("keeps short text and truncates long text with size metadata", () => {
+    const short = summarizeText("hello\nworld", 20);
+    assert.equal(short.text, "hello\nworld");
+    assert.equal(short.truncated, false);
+    assert.equal(short.lines, 2);
+
+    const long = summarizeText("x".repeat(30), 10);
+    assert.equal(long.truncated, true);
+    assert.equal(long.chars, 30);
+    assert.equal(long.bytes, 30);
+    assert.match(long.text, /\[truncated /);
   });
 });
