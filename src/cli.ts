@@ -185,6 +185,7 @@ program
   .argument("<goal...>", "Task goal to send to the software agent")
   .option("-p, --port <port>", "Local akemon serve port", "3000")
   .option("-w, --workdir <path>", "Workdir for the software agent (default: serve workdir)")
+  .option("--allow-outside-workdir", "Allow the software agent workdir to be outside the serve workdir")
   .option("--role-scope <scope>", "Role scope: owner|public|order|agent|system", "owner")
   .option("--memory-scope <scope>", "Memory scope: none|public|task|owner", "owner")
   .option("--risk <level>", "Risk level: low|medium|high", "medium")
@@ -199,6 +200,7 @@ program
       riskLevel: opts.risk,
     };
     if (opts.workdir) body.workdir = opts.workdir;
+    if (opts.allowOutsideWorkdir) body.allowOutsideWorkdir = true;
     if (opts.memorySummary) body.memorySummary = opts.memorySummary;
     if (opts.deliverable) body.deliverable = opts.deliverable;
     if (opts.timeoutMs) {

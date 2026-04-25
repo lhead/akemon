@@ -12,9 +12,9 @@
  */
 
 import { randomUUID } from "crypto";
-import { spawn, type ChildProcess } from "child_process";
+import { spawn, spawnSync, type ChildProcess } from "child_process";
 import { mkdirSync, writeFileSync } from "fs";
-import { join } from "path";
+import { isAbsolute, join, relative, resolve as resolvePath } from "path";
 import { StringDecoder } from "string_decoder";
 import type { EventBus, Peripheral, Signal } from "./types.js";
 import { SIG, sig } from "./types.js";
@@ -35,6 +35,8 @@ export interface TaskEnvelope {
   goal: string;
   /** Working directory the software agent is allowed to treat as primary root */
   workdir: string;
+  /** Server-side workdir boundary decision for auditing and prompt clarity */
+  workdirSafety?: WorkdirSafety;
   /** Relationship/privacy scope that selected the visible context */
   roleScope: RoleScope;
   /** Memory selection level after Akemon-side filtering */
@@ -51,6 +53,14 @@ export interface TaskEnvelope {
   deliverable?: string;
   /** Optional hard timeout for this run */
   timeoutMs?: number;
+}
+
+export interface WorkdirSafety {
+  baseWorkdir: string;
+  requestedWorkdir: string;
+  effectiveWorkdir: string;
+  allowOutsideWorkdir: boolean;
+  outsideBaseWorkdir: boolean;
 }
 
 export interface SoftwareAgentResult {
@@ -73,6 +83,15 @@ export interface TextSummary {
   omittedChars?: number;
 }
 
+export interface GitWorktreeStatus {
+  workdir: string;
+  isRepo: boolean;
+  dirty: boolean;
+  changedFiles: string[];
+  root?: string;
+  error?: string;
+}
+
 export interface SoftwareAgentTaskRecord {
   schemaVersion: 1;
   taskId: string;
@@ -83,6 +102,7 @@ export interface SoftwareAgentTaskRecord {
   commandLine: string;
   envelope: TaskEnvelope;
   startedAt: string;
+  workdirStatus?: GitWorktreeStatus;
   updatedAt: string;
   completedAt?: string;
   durationMs?: number;
@@ -115,6 +135,7 @@ export interface CodexSoftwareAgentConfig {
   taskRelay?: SoftwareTaskRelay;
   defaultTimeoutMs?: number;
   taskLedgerDir?: string;
+  gitStatusImpl?: (workdir: string) => GitWorktreeStatus;
 }
 
 const defaultTaskRelay: SoftwareTaskRelay = {
@@ -147,6 +168,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
   private bus: EventBus | null = null;
   private activeChild: ChildProcess | null = null;
   private activeTaskId: string | null = null;
+  private activeWorkdir: string | null = null;
   private sessionId = randomUUID();
 
   constructor(config: CodexSoftwareAgentConfig) {
@@ -179,16 +201,21 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     }
     this.activeChild = null;
     this.activeTaskId = null;
+    this.activeWorkdir = null;
     this.sessionId = randomUUID();
   }
 
   getState(): Record<string, unknown> {
+    const currentWorkdir = this.activeWorkdir || resolvePath(this.config.workdir);
     return {
       id: this.id,
       sessionId: this.sessionId,
       activeTaskId: this.activeTaskId,
+      activeWorkdir: this.activeWorkdir,
       busy: !!this.activeChild,
       transport: "codex-exec",
+      baseWorkdir: resolvePath(this.config.workdir),
+      workdirStatus: this.collectWorkdirStatus(currentWorkdir),
       taskLedgerDir: this.config.taskLedgerDir,
     };
   }
@@ -212,8 +239,13 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     }
 
     const taskId = envelope.taskId || `sw_${Date.now()}_${randomUUID().slice(0, 8)}`;
-    const workdir = envelope.workdir || this.config.workdir;
-    const effectiveEnvelope = { ...envelope, taskId, workdir };
+    const workdirSafety = resolveWorkdirSafety(
+      this.config.workdir,
+      envelope.workdir || this.config.workdir,
+      envelope.workdirSafety?.allowOutsideWorkdir || false,
+    );
+    const workdir = workdirSafety.effectiveWorkdir;
+    const effectiveEnvelope = { ...envelope, taskId, workdir, workdirSafety };
     const prompt = buildTaskEnvelopePrompt(effectiveEnvelope);
     const { cmd, args } = buildCodexExecCommand({
       command: this.config.command || "codex",
@@ -228,6 +260,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     const commandLine = [cmd, ...args].join(" ");
     const spawnImpl = this.config.spawnImpl || spawn;
     const timeoutMs = envelope.timeoutMs || this.config.defaultTimeoutMs || DEFAULT_TIMEOUT_MS;
+    const workdirStatus = this.collectWorkdirStatus(workdir);
 
     const baseTaskRecord = (): Omit<SoftwareAgentTaskRecord, "status" | "updatedAt"> => ({
       schemaVersion: 1,
@@ -238,10 +271,12 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       commandLine,
       envelope: effectiveEnvelope,
       startedAt: startedAtIso,
+      workdirStatus,
     });
 
     return new Promise<SoftwareAgentResult>((resolve) => {
       this.activeTaskId = taskId;
+      this.activeWorkdir = workdir;
       this.writeTaskRecord({
         ...baseTaskRecord(),
         status: "running",
@@ -267,6 +302,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       } catch (err: any) {
         this.activeChild = null;
         this.activeTaskId = null;
+        this.activeWorkdir = null;
         const durationMs = Date.now() - startedAt;
         relay.sendTaskEnd(taskId, null, durationMs);
         const result = {
@@ -321,6 +357,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         relay.sendTaskEnd(taskId, exitCode, durationMs);
         this.activeChild = null;
         this.activeTaskId = null;
+        this.activeWorkdir = null;
 
         const output = stdout.trim() || stderr.trim();
         const success = !error && !aborted && exitCode === 0;
@@ -415,6 +452,11 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       console.error(`[software-agent] Failed to write task ledger: ${err.message || String(err)}`);
     }
   }
+
+  private collectWorkdirStatus(workdir: string): GitWorktreeStatus {
+    const impl = this.config.gitStatusImpl || readGitWorktreeStatus;
+    return impl(workdir);
+  }
 }
 
 export function summarizeText(text: string, maxChars = MAX_STREAM_SUMMARY_CHARS): TextSummary {
@@ -454,11 +496,17 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
     `Memory scope: ${envelope.memoryScope}`,
     `Risk level: ${envelope.riskLevel}`,
     `Workdir: ${envelope.workdir}`,
-    "",
-    "Goal:",
-    envelope.goal,
-    "",
   ];
+
+  if (envelope.workdirSafety) {
+    lines.push(`Base workdir: ${envelope.workdirSafety.baseWorkdir}`);
+    lines.push(`Requested workdir: ${envelope.workdirSafety.requestedWorkdir}`);
+    lines.push(`Effective workdir: ${envelope.workdirSafety.effectiveWorkdir}`);
+    lines.push(`Outside base workdir: ${envelope.workdirSafety.outsideBaseWorkdir ? "yes" : "no"}`);
+    lines.push(`Outside workdir explicitly allowed: ${envelope.workdirSafety.allowOutsideWorkdir ? "yes" : "no"}`);
+  }
+
+  lines.push("", "Goal:", envelope.goal, "");
 
   if (envelope.memorySummary?.trim()) {
     lines.push("Visible Akemon memory/context:");
@@ -496,27 +544,120 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
 export function createOwnerTaskEnvelope(body: any, defaultWorkdir: string): TaskEnvelope {
   const goal = typeof body?.goal === "string" ? body.goal.trim() : "";
   if (!goal) throw new Error("Missing required string field: goal");
-  const callerForbiddenActions = readOptionalStringArray(body.forbiddenActions, "forbiddenActions");
+  const callerForbiddenActions = readOptionalStringArray(body?.forbiddenActions, "forbiddenActions");
+  const requestedWorkdir = readOptionalString(body?.workdir, "workdir") || defaultWorkdir;
+  const workdirSafety = resolveWorkdirSafety(
+    defaultWorkdir,
+    requestedWorkdir,
+    readOptionalBoolean(body?.allowOutsideWorkdir, "allowOutsideWorkdir") || false,
+  );
 
   return {
-    taskId: readOptionalString(body.taskId, "taskId"),
+    taskId: readOptionalString(body?.taskId, "taskId"),
     sourceModule: "owner-http",
-    purpose: readOptionalString(body.purpose, "purpose") || "owner software-agent task",
+    purpose: readOptionalString(body?.purpose, "purpose") || "owner software-agent task",
     goal,
-    workdir: readOptionalString(body.workdir, "workdir") || defaultWorkdir,
-    roleScope: readEnum(body.roleScope, "roleScope", ROLE_SCOPES, "owner"),
-    memoryScope: readEnum(body.memoryScope, "memoryScope", MEMORY_SCOPES, "owner"),
-    riskLevel: readEnum(body.riskLevel, "riskLevel", RISK_LEVELS, "medium"),
-    allowedActions: body.allowedActions !== undefined
-      ? readOptionalStringArray(body.allowedActions, "allowedActions")
+    workdir: workdirSafety.effectiveWorkdir,
+    workdirSafety,
+    roleScope: readEnum(body?.roleScope, "roleScope", ROLE_SCOPES, "owner"),
+    memoryScope: readEnum(body?.memoryScope, "memoryScope", MEMORY_SCOPES, "owner"),
+    riskLevel: readEnum(body?.riskLevel, "riskLevel", RISK_LEVELS, "medium"),
+    allowedActions: body?.allowedActions !== undefined
+      ? readOptionalStringArray(body?.allowedActions, "allowedActions")
       : [...DEFAULT_OWNER_ALLOWED_ACTIONS],
     forbiddenActions: [...new Set([...DEFAULT_OWNER_FORBIDDEN_ACTIONS, ...callerForbiddenActions])],
-    memorySummary: typeof body.memorySummary === "string" ? body.memorySummary : "",
-    deliverable: typeof body.deliverable === "string"
+    memorySummary: typeof body?.memorySummary === "string" ? body.memorySummary : "",
+    deliverable: typeof body?.deliverable === "string"
       ? body.deliverable
       : "Return a concise engineering summary with changes, verification, and remaining risks.",
-    timeoutMs: readTimeoutMs(body.timeoutMs),
+    timeoutMs: readTimeoutMs(body?.timeoutMs),
   };
+}
+
+export function resolveWorkdirSafety(
+  baseWorkdir: string,
+  requestedWorkdir: string,
+  allowOutsideWorkdir = false,
+): WorkdirSafety {
+  const base = resolvePath(baseWorkdir);
+  const requested = isAbsolute(requestedWorkdir)
+    ? resolvePath(requestedWorkdir)
+    : resolvePath(base, requestedWorkdir);
+  const rel = relative(base, requested);
+  const outsideBaseWorkdir = !!rel && (rel.startsWith("..") || isAbsolute(rel));
+
+  if (outsideBaseWorkdir && !allowOutsideWorkdir) {
+    throw new Error(`Invalid workdir: ${requested} is outside base workdir ${base}`);
+  }
+
+  return {
+    baseWorkdir: base,
+    requestedWorkdir,
+    effectiveWorkdir: requested,
+    allowOutsideWorkdir,
+    outsideBaseWorkdir,
+  };
+}
+
+export function readGitWorktreeStatus(workdir: string): GitWorktreeStatus {
+  const resolvedWorkdir = resolvePath(workdir);
+
+  try {
+    const rootResult = spawnSync("git", ["-C", resolvedWorkdir, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    if (rootResult.status !== 0) {
+      return {
+        workdir: resolvedWorkdir,
+        isRepo: false,
+        dirty: false,
+        changedFiles: [],
+        error: summarizeGitError(rootResult.stderr, rootResult.error),
+      };
+    }
+
+    const root = String(rootResult.stdout || "").trim();
+    const statusResult = spawnSync("git", ["-C", resolvedWorkdir, "status", "--short"], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    if (statusResult.status !== 0) {
+      return {
+        workdir: resolvedWorkdir,
+        isRepo: true,
+        dirty: false,
+        changedFiles: [],
+        root,
+        error: summarizeGitError(statusResult.stderr, statusResult.error),
+      };
+    }
+
+    const changedFiles = String(statusResult.stdout || "")
+      .split(/\r?\n/)
+      .map((line) => line.trimEnd())
+      .filter(Boolean)
+      .map((line) => line.slice(3).trim())
+      .filter(Boolean);
+
+    return {
+      workdir: resolvedWorkdir,
+      isRepo: true,
+      dirty: changedFiles.length > 0,
+      changedFiles,
+      root,
+    };
+  } catch (err: any) {
+    return {
+      workdir: resolvedWorkdir,
+      isRepo: false,
+      dirty: false,
+      changedFiles: [],
+      error: err.message || String(err),
+    };
+  }
 }
 
 function readOptionalString(value: unknown, field: string): string | undefined {
@@ -535,6 +676,12 @@ function readOptionalStringArray(value: unknown, field: string): string[] {
     }
     return item.trim();
   });
+}
+
+function readOptionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "boolean") throw new Error(`Invalid ${field}: expected boolean`);
+  return value;
 }
 
 function readEnum<T extends string>(value: unknown, field: string, allowed: readonly T[], fallback: T): T {
@@ -561,6 +708,12 @@ function readTimeoutMs(value: unknown): number | undefined {
 function safeTaskFilename(taskId: string): string {
   const safe = taskId.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 200);
   return safe || "task";
+}
+
+function summarizeGitError(stderr: unknown, error?: Error): string | undefined {
+  if (error) return error.message;
+  const text = typeof stderr === "string" ? stderr.trim() : "";
+  return text || undefined;
 }
 
 function buildCodexExecCommand(opts: {

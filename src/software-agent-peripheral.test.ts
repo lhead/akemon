@@ -10,7 +10,9 @@ import {
   CodexSoftwareAgentPeripheral,
   buildTaskEnvelopePrompt,
   createOwnerTaskEnvelope,
+  resolveWorkdirSafety,
   summarizeText,
+  type GitWorktreeStatus,
   type TaskEnvelope,
 } from "./software-agent-peripheral.js";
 import { SimpleEventBus } from "./event-bus.js";
@@ -51,7 +53,15 @@ function baseEnvelope(overrides: Partial<TaskEnvelope> = {}): TaskEnvelope {
 
 describe("buildTaskEnvelopePrompt", () => {
   it("renders envelope fields, visible memory, boundaries, and deliverable", () => {
-    const prompt = buildTaskEnvelopePrompt(baseEnvelope());
+    const prompt = buildTaskEnvelopePrompt(baseEnvelope({
+      workdirSafety: {
+        baseWorkdir: "/tmp",
+        requestedWorkdir: "/tmp/akemon",
+        effectiveWorkdir: "/tmp/akemon",
+        allowOutsideWorkdir: false,
+        outsideBaseWorkdir: false,
+      },
+    }));
 
     assert.match(prompt, /Task ID: sw-test-1/);
     assert.match(prompt, /Source module: task/);
@@ -59,6 +69,8 @@ describe("buildTaskEnvelopePrompt", () => {
     assert.match(prompt, /Memory scope: owner/);
     assert.match(prompt, /Risk level: medium/);
     assert.match(prompt, /Workdir: \/tmp\/akemon/);
+    assert.match(prompt, /Base workdir: \/tmp/);
+    assert.match(prompt, /Outside base workdir: no/);
     assert.match(prompt, /Visible context only\./);
     assert.match(prompt, /- read repository files/);
     assert.match(prompt, /- read owner private notes outside this envelope/);
@@ -74,11 +86,47 @@ describe("createOwnerTaskEnvelope", () => {
     assert.equal(envelope.sourceModule, "owner-http");
     assert.equal(envelope.goal, "inspect repo");
     assert.equal(envelope.workdir, "/repo");
+    assert.deepEqual(envelope.workdirSafety, {
+      baseWorkdir: "/repo",
+      requestedWorkdir: "/repo",
+      effectiveWorkdir: "/repo",
+      allowOutsideWorkdir: false,
+      outsideBaseWorkdir: false,
+    });
     assert.equal(envelope.roleScope, "owner");
     assert.equal(envelope.memoryScope, "owner");
     assert.equal(envelope.riskLevel, "medium");
     assert.deepEqual(envelope.allowedActions, ["read repository files", "edit files in workdir", "run project tests"]);
     assert.ok(envelope.forbiddenActions?.some((item) => item.includes("private memory")));
+  });
+
+  it("keeps software-agent workdirs inside the default workdir unless explicitly allowed", () => {
+    assert.equal(resolveWorkdirSafety("/repo", "src").effectiveWorkdir, "/repo/src");
+
+    const inside = createOwnerTaskEnvelope({ goal: "inspect repo", workdir: "packages/app" }, "/repo");
+    assert.equal(inside.workdir, "/repo/packages/app");
+    assert.equal(inside.workdirSafety?.baseWorkdir, "/repo");
+    assert.equal(inside.workdirSafety?.requestedWorkdir, "packages/app");
+    assert.equal(inside.workdirSafety?.outsideBaseWorkdir, false);
+
+    assert.throws(
+      () => createOwnerTaskEnvelope({ goal: "inspect repo", workdir: "/outside" }, "/repo"),
+      /outside base workdir/,
+    );
+
+    const outside = createOwnerTaskEnvelope({
+      goal: "inspect repo",
+      workdir: "/outside",
+      allowOutsideWorkdir: true,
+    }, "/repo");
+    assert.equal(outside.workdir, "/outside");
+    assert.equal(outside.workdirSafety?.outsideBaseWorkdir, true);
+    assert.equal(outside.workdirSafety?.allowOutsideWorkdir, true);
+
+    assert.throws(
+      () => createOwnerTaskEnvelope({ goal: "inspect repo", allowOutsideWorkdir: "yes" }, "/repo"),
+      /Invalid allowOutsideWorkdir/,
+    );
   });
 
   it("keeps baseline forbidden boundaries when caller adds restrictions", () => {
@@ -242,11 +290,39 @@ describe("CodexSoftwareAgentPeripheral", () => {
     await first;
   });
 
+  it("reports git workdir status in peripheral state", () => {
+    const status: GitWorktreeStatus = {
+      workdir: "/tmp/akemon",
+      isRepo: true,
+      dirty: true,
+      changedFiles: ["src/software-agent-peripheral.ts"],
+      root: "/tmp/akemon",
+    };
+    const peripheral = new CodexSoftwareAgentPeripheral({
+      workdir: "/tmp/akemon",
+      gitStatusImpl: () => status,
+    });
+
+    const state = peripheral.getState();
+
+    assert.equal(state.baseWorkdir, "/tmp/akemon");
+    assert.equal(state.activeWorkdir, null);
+    assert.equal(state.busy, false);
+    assert.deepEqual(state.workdirStatus, status);
+  });
+
   it("records task ledger state from running to completed", async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), "akemon-software-agent-ledger-"));
     try {
       const spawnedChild = createFakeChild();
       const ledgerDir = join(tmpDir, "tasks");
+      const workdirStatus: GitWorktreeStatus = {
+        workdir: "/tmp/akemon",
+        isRepo: true,
+        dirty: true,
+        changedFiles: ["src/software-agent-peripheral.ts"],
+        root: "/tmp/akemon",
+      };
       const peripheral = new CodexSoftwareAgentPeripheral({
         workdir: "/tmp/akemon",
         spawnImpl: (() => {
@@ -258,6 +334,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
           sendTaskEnd() {},
         },
         taskLedgerDir: ledgerDir,
+        gitStatusImpl: () => workdirStatus,
       });
 
       const run = peripheral.sendTask(baseEnvelope({ taskId: "ledger-running" }));
@@ -269,6 +346,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.equal(running.taskId, "ledger-running");
       assert.equal(running.envelope.goal, "Inspect the repo and summarize the event bus implementation.");
       assert.equal(running.transport, "codex-exec");
+      assert.deepEqual(running.workdirStatus, workdirStatus);
 
       spawnedChild.stdout?.emit("data", Buffer.from("ledger result"));
       spawnedChild.stderr?.emit("data", Buffer.from("ledger note"));
@@ -284,6 +362,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.equal(completed.stdoutSummary.text, "ledger result");
       assert.equal(completed.stderrSummary.text, "ledger note");
       assert.equal(completed.stdoutSummary.truncated, false);
+      assert.deepEqual(completed.workdirStatus, workdirStatus);
       assert.ok(completed.completedAt);
       assert.ok(completed.durationMs >= 0);
     } finally {

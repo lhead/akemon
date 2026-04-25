@@ -143,6 +143,44 @@ describe("software-agent HTTP endpoint", () => {
     ]);
   });
 
+  it("rejects software-agent workdirs outside the serve workdir by default", async () => {
+    let calls = 0;
+    const res = await callSoftwareAgentEndpoint({
+      async sendTask(envelope) {
+        calls++;
+        return successResult(envelope);
+      },
+    }, { goal: "inspect repo", workdir: "/outside" }, "owner-secret");
+
+    assert.equal(res.statusCode, 400);
+    assert.match(res.body.error, /outside base workdir/);
+    assert.equal(calls, 0);
+  });
+
+  it("allows outside software-agent workdirs only with an explicit owner override", async () => {
+    let received: TaskEnvelope | null = null;
+    const res = await callSoftwareAgentEndpoint({
+      async sendTask(envelope) {
+        received = envelope;
+        return successResult(envelope);
+      },
+    }, {
+      goal: "inspect repo",
+      workdir: "/outside",
+      allowOutsideWorkdir: true,
+    }, "owner-secret");
+
+    assert.equal(res.statusCode, 200);
+    assert.ok(received);
+    const envelope = received as TaskEnvelope;
+    assert.equal(envelope.workdir, "/outside");
+    assert.equal(envelope.workdirSafety?.baseWorkdir, "/repo");
+    assert.equal(envelope.workdirSafety?.requestedWorkdir, "/outside");
+    assert.equal(envelope.workdirSafety?.effectiveWorkdir, "/outside");
+    assert.equal(envelope.workdirSafety?.outsideBaseWorkdir, true);
+    assert.equal(envelope.workdirSafety?.allowOutsideWorkdir, true);
+  });
+
   it("rejects invalid envelope fields before calling the software agent", async () => {
     let calls = 0;
     const res = await callSoftwareAgentEndpoint({
