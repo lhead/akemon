@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable, Writable } from "node:stream";
 import { describe, it } from "node:test";
-import { handleSoftwareAgentRunHttp } from "./server.js";
+import {
+  handleSoftwareAgentResetHttp,
+  handleSoftwareAgentRunHttp,
+  handleSoftwareAgentStatusHttp,
+} from "./server.js";
 import type { SoftwareAgentResult, TaskEnvelope } from "./software-agent-peripheral.js";
 
 class TestResponse extends Writable {
@@ -32,17 +36,7 @@ async function callSoftwareAgentEndpoint(
   body: unknown,
   token?: string,
 ): Promise<{ statusCode: number; body: any }> {
-  const rawBody = JSON.stringify(body);
-  const req = Readable.from([Buffer.from(rawBody)]) as IncomingMessage;
-  Object.assign(req, {
-    method: "POST",
-    url: "/self/software-agent/run",
-    headers: {
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-      "content-type": "application/json",
-    },
-  });
-
+  const req = createRequest("POST", "/self/software-agent/run", body, token);
   const res = new TestResponse();
   await handleSoftwareAgentRunHttp(req, res as unknown as ServerResponse, {
     options: { secretKey: "owner-secret", key: "legacy-owner-key" },
@@ -54,6 +48,52 @@ async function callSoftwareAgentEndpoint(
     statusCode: res.statusCode,
     body: res.body ? JSON.parse(res.body) : {},
   };
+}
+
+async function callSoftwareAgentStatusEndpoint(
+  softwareAgent: { getState(): Record<string, unknown> } | null,
+  token?: string,
+): Promise<{ statusCode: number; body: any }> {
+  const req = createRequest("GET", "/self/software-agent/status", undefined, token);
+  const res = new TestResponse();
+  await handleSoftwareAgentStatusHttp(req, res as unknown as ServerResponse, {
+    options: { secretKey: "owner-secret", key: "legacy-owner-key" },
+    softwareAgent,
+  });
+  return {
+    statusCode: res.statusCode,
+    body: res.body ? JSON.parse(res.body) : {},
+  };
+}
+
+async function callSoftwareAgentResetEndpoint(
+  softwareAgent: { getState(): Record<string, unknown>; resetSession(): Promise<void> } | null,
+  token?: string,
+): Promise<{ statusCode: number; body: any }> {
+  const req = createRequest("POST", "/self/software-agent/reset", undefined, token);
+  const res = new TestResponse();
+  await handleSoftwareAgentResetHttp(req, res as unknown as ServerResponse, {
+    options: { secretKey: "owner-secret", key: "legacy-owner-key" },
+    softwareAgent,
+  });
+  return {
+    statusCode: res.statusCode,
+    body: res.body ? JSON.parse(res.body) : {},
+  };
+}
+
+function createRequest(method: string, url: string, body: unknown, token?: string): IncomingMessage {
+  const rawBody = body === undefined ? "" : JSON.stringify(body);
+  const req = Readable.from(rawBody ? [Buffer.from(rawBody)] : []) as IncomingMessage;
+  Object.assign(req, {
+    method,
+    url,
+    headers: {
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+  });
+  return req;
 }
 
 describe("software-agent HTTP endpoint", () => {
@@ -113,6 +153,42 @@ describe("software-agent HTTP endpoint", () => {
     assert.equal(res.statusCode, 400);
     assert.match(res.body.error, /Invalid roleScope/);
     assert.equal(calls, 0);
+  });
+
+  it("returns owner-only software-agent status", async () => {
+    const unauth = await callSoftwareAgentStatusEndpoint({
+      getState: () => ({ id: "software-agent:codex", busy: false }),
+    });
+
+    assert.equal(unauth.statusCode, 401);
+
+    const res = await callSoftwareAgentStatusEndpoint({
+      getState: () => ({
+        id: "software-agent:codex",
+        busy: false,
+        transport: "codex-exec",
+      }),
+    }, "owner-secret");
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.id, "software-agent:codex");
+    assert.equal(res.body.busy, false);
+    assert.equal(res.body.transport, "codex-exec");
+  });
+
+  it("resets the owner-only software-agent session", async () => {
+    let resets = 0;
+    const res = await callSoftwareAgentResetEndpoint({
+      async resetSession() {
+        resets++;
+      },
+      getState: () => ({ id: "software-agent:codex", busy: false, sessionId: "after-reset" }),
+    }, "owner-secret");
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.state.sessionId, "after-reset");
+    assert.equal(resets, 1);
   });
 });
 

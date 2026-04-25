@@ -18,6 +18,39 @@ const RELAY_HTTP = "https://relay.akemon.dev";
 
 const program = new Command();
 
+function parsePortOption(port: string | number | undefined): number {
+  const value = typeof port === "number" ? port : parseInt(String(port || "3000"));
+  return Number.isInteger(value) && value > 0 ? value : 3000;
+}
+
+async function callLocalOwnerEndpoint(path: string, opts: { port?: string }, init: RequestInit = {}): Promise<any> {
+  const credentials = await getOrCreateRelayCredentials();
+  const port = parsePortOption(opts.port);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${credentials.secretKey}`,
+  };
+  if (init.body !== undefined) headers["Content-Type"] = "application/json";
+
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+    ...init,
+    headers: {
+      ...headers,
+      ...(init.headers as Record<string, string> | undefined),
+    },
+  });
+
+  const text = await res.text();
+  let data: any;
+  try { data = text ? JSON.parse(text) : {}; }
+  catch { data = { output: text }; }
+
+  if (!res.ok || data.success === false) {
+    console.error(data.error || text || `Request failed with HTTP ${res.status}`);
+    process.exit(1);
+  }
+  return data;
+}
+
 program
   .name("akemon")
   .description("Agent work marketplace — train your agent, let it work for others")
@@ -159,8 +192,6 @@ program
   .option("--deliverable <text>", "Expected output shape")
   .option("--timeout-ms <ms>", "Task timeout in milliseconds")
   .action(async (goalParts: string[], opts) => {
-    const credentials = await getOrCreateRelayCredentials();
-    const port = parseInt(opts.port) || 3000;
     const body: Record<string, unknown> = {
       goal: goalParts.join(" "),
       roleScope: opts.roleScope,
@@ -179,27 +210,35 @@ program
       body.timeoutMs = timeoutMs;
     }
 
-    const res = await fetch(`http://127.0.0.1:${port}/self/software-agent/run`, {
+    const data = await callLocalOwnerEndpoint("/self/software-agent/run", opts, {
       method: "POST",
-      headers: {
-        Authorization: `Bearer ${credentials.secretKey}`,
-        "Content-Type": "application/json",
-      },
       body: JSON.stringify(body),
     });
 
-    const text = await res.text();
-    let data: any;
-    try { data = text ? JSON.parse(text) : {}; }
-    catch { data = { output: text }; }
-
-    if (!res.ok || data.success === false) {
-      console.error(data.error || text || `Request failed with HTTP ${res.status}`);
-      process.exit(1);
-    }
-
     if (data.output) console.log(data.output);
     else console.log(JSON.stringify(data, null, 2));
+  });
+
+program
+  .command("software-agent-status")
+  .description("Show the owner-only local software-agent peripheral state")
+  .option("-p, --port <port>", "Local akemon serve port", "3000")
+  .action(async (opts) => {
+    const data = await callLocalOwnerEndpoint("/self/software-agent/status", opts, {
+      method: "GET",
+    });
+    console.log(JSON.stringify(data, null, 2));
+  });
+
+program
+  .command("software-agent-reset")
+  .description("Reset the owner-only local software-agent peripheral session")
+  .option("-p, --port <port>", "Local akemon serve port", "3000")
+  .action(async (opts) => {
+    const data = await callLocalOwnerEndpoint("/self/software-agent/reset", opts, {
+      method: "POST",
+    });
+    console.log(JSON.stringify(data, null, 2));
   });
 
 program

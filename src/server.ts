@@ -183,6 +183,58 @@ export async function handleSoftwareAgentRunHttp(
   }
 }
 
+export async function handleSoftwareAgentStatusHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: {
+    options: Pick<ServeOptions, "secretKey" | "key">;
+    softwareAgent: Pick<CodexSoftwareAgentPeripheral, "getState"> | null;
+  },
+): Promise<void> {
+  if (!isOwnerRequest(req, deps.options)) {
+    res.writeHead(401, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Owner token required" }));
+    return;
+  }
+  if (!deps.softwareAgent) {
+    res.writeHead(503, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Software agent peripheral not ready" }));
+    return;
+  }
+
+  res.writeHead(200, { "Content-Type": "application/json" })
+    .end(JSON.stringify(deps.softwareAgent.getState(), null, 2));
+}
+
+export async function handleSoftwareAgentResetHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: {
+    options: Pick<ServeOptions, "secretKey" | "key">;
+    softwareAgent: Pick<CodexSoftwareAgentPeripheral, "getState" | "resetSession"> | null;
+  },
+): Promise<void> {
+  if (!isOwnerRequest(req, deps.options)) {
+    res.writeHead(401, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Owner token required" }));
+    return;
+  }
+  if (!deps.softwareAgent) {
+    res.writeHead(503, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Software agent peripheral not ready" }));
+    return;
+  }
+
+  try {
+    await deps.softwareAgent.resetSession();
+    res.writeHead(200, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ ok: true, state: deps.softwareAgent.getState() }, null, 2));
+  } catch (err: any) {
+    res.writeHead(500, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: err.message || String(err) }));
+  }
+}
+
 import { RelayPeripheral } from "./relay-peripheral.js";
 import { EnginePeripheral, LLM_ENGINES as LLM_ENGINES_SET } from "./engine-peripheral.js";
 import { EngineQueue } from "./engine-queue.js";
@@ -308,6 +360,20 @@ export async function serve(options: ServeOptions): Promise<void> {
         await handleSoftwareAgentRunHttp(req, res, {
           options,
           workdir,
+          softwareAgent: codexSoftwareAgent,
+        });
+        return;
+      }
+      if (req.url === "/self/software-agent/status" && req.method === "GET") {
+        await handleSoftwareAgentStatusHttp(req, res, {
+          options,
+          softwareAgent: codexSoftwareAgent,
+        });
+        return;
+      }
+      if (req.url === "/self/software-agent/reset" && req.method === "POST") {
+        await handleSoftwareAgentResetHttp(req, res, {
+          options,
           softwareAgent: codexSoftwareAgent,
         });
         return;
