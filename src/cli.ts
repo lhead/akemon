@@ -61,13 +61,27 @@ async function callLocalOwnerEndpoint(path: string, opts: { port?: string }, ini
   };
   if (init.body !== undefined) headers["Content-Type"] = "application/json";
 
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
-    ...init,
-    headers: {
-      ...headers,
-      ...(init.headers as Record<string, string> | undefined),
-    },
-  });
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      ...init,
+      headers: {
+        ...headers,
+        ...(init.headers as Record<string, string> | undefined),
+      },
+    });
+  } catch (error) {
+    const cause = (error as { cause?: { message?: string } }).cause;
+    if (error instanceof TypeError && error.message === "fetch failed" && cause?.message === "bad port") {
+      console.error(`Port ${port} cannot be used for the local akemon serve connection. Choose a different --port.`);
+      process.exit(1);
+    }
+    if (error instanceof TypeError && error.message === "fetch failed") {
+      console.error(`Cannot connect to local akemon serve on port ${port}. Start it with: akemon serve --port ${port}`);
+      process.exit(1);
+    }
+    throw error;
+  }
 
   const text = await res.text();
   let data: any;

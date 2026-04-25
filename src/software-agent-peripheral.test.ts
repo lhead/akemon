@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -10,6 +10,7 @@ import {
   CodexSoftwareAgentPeripheral,
   buildTaskEnvelopePrompt,
   createOwnerTaskEnvelope,
+  listSoftwareAgentTaskRecords,
   resolveWorkdirSafety,
   summarizeText,
   type GitWorktreeStatus,
@@ -371,6 +372,26 @@ describe("CodexSoftwareAgentPeripheral", () => {
   });
 });
 
+describe("listSoftwareAgentTaskRecords", () => {
+  it("ignores malformed JSON and returns recent records sorted and limited", async () => {
+    const ledgerDir = await mkdtemp(join(tmpdir(), "akemon-software-agent-ledger-list-"));
+    try {
+      await writeFile(join(ledgerDir, "bad.json"), "{not json\n");
+      await writeFile(join(ledgerDir, "older.json"), JSON.stringify(taskRecord("older", "2026-04-25T01:00:00.000Z")));
+      await writeFile(join(ledgerDir, "middle.json"), JSON.stringify(taskRecord("middle", "2026-04-25T02:00:00.000Z")));
+      await writeFile(join(ledgerDir, "newer.json"), JSON.stringify(taskRecord("newer", "2026-04-25T03:00:00.000Z")));
+
+      const allRecords = listSoftwareAgentTaskRecords(ledgerDir, 10);
+      assert.deepEqual(allRecords.map((record) => record.taskId), ["newer", "middle", "older"]);
+
+      const limitedRecords = listSoftwareAgentTaskRecords(ledgerDir, 2);
+      assert.deepEqual(limitedRecords.map((record) => record.taskId), ["newer", "middle"]);
+    } finally {
+      await rm(ledgerDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("summarizeText", () => {
   it("keeps short text and truncates long text with size metadata", () => {
     const short = summarizeText("hello\nworld", 20);
@@ -385,3 +406,16 @@ describe("summarizeText", () => {
     assert.match(long.text, /\[truncated /);
   });
 });
+
+function taskRecord(taskId: string, updatedAt: string) {
+  return {
+    schemaVersion: 1,
+    taskId,
+    status: "completed",
+    startedAt: "2026-04-25T00:00:00.000Z",
+    updatedAt,
+    envelope: {
+      goal: `${taskId} task`,
+    },
+  };
+}
