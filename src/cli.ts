@@ -147,6 +147,62 @@ program
   });
 
 program
+  .command("software-agent")
+  .description("Run an owner-only local software-agent task via a running akemon serve")
+  .argument("<goal...>", "Task goal to send to the software agent")
+  .option("-p, --port <port>", "Local akemon serve port", "3000")
+  .option("-w, --workdir <path>", "Workdir for the software agent (default: serve workdir)")
+  .option("--role-scope <scope>", "Role scope: owner|public|order|agent|system", "owner")
+  .option("--memory-scope <scope>", "Memory scope: none|public|task|owner", "owner")
+  .option("--risk <level>", "Risk level: low|medium|high", "medium")
+  .option("--memory-summary <text>", "Pre-filtered memory/context text to include")
+  .option("--deliverable <text>", "Expected output shape")
+  .option("--timeout-ms <ms>", "Task timeout in milliseconds")
+  .action(async (goalParts: string[], opts) => {
+    const credentials = await getOrCreateRelayCredentials();
+    const port = parseInt(opts.port) || 3000;
+    const body: Record<string, unknown> = {
+      goal: goalParts.join(" "),
+      roleScope: opts.roleScope,
+      memoryScope: opts.memoryScope,
+      riskLevel: opts.risk,
+    };
+    if (opts.workdir) body.workdir = opts.workdir;
+    if (opts.memorySummary) body.memorySummary = opts.memorySummary;
+    if (opts.deliverable) body.deliverable = opts.deliverable;
+    if (opts.timeoutMs) {
+      const timeoutMs = Number(opts.timeoutMs);
+      if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+        console.error("--timeout-ms must be a positive integer");
+        process.exit(1);
+      }
+      body.timeoutMs = timeoutMs;
+    }
+
+    const res = await fetch(`http://127.0.0.1:${port}/self/software-agent/run`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${credentials.secretKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const text = await res.text();
+    let data: any;
+    try { data = text ? JSON.parse(text) : {}; }
+    catch { data = { output: text }; }
+
+    if (!res.ok || data.success === false) {
+      console.error(data.error || text || `Request failed with HTTP ${res.status}`);
+      process.exit(1);
+    }
+
+    if (data.output) console.log(data.output);
+    else console.log(JSON.stringify(data, null, 2));
+  });
+
+program
   .command("dashboard")
   .description("Open your agent dashboard in the browser")
   .action(async () => {

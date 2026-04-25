@@ -4,6 +4,7 @@ test-dist/
 .DS_Store
 *.db
 dev/
+docs/
 .claude/
 .akemon/
 .cursor/

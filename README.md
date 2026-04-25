@@ -1,10 +1,8 @@
 ## What is Akemon?
 
-MCP gave AI the ability to call tools. Akemon gives tools the ability to call each other.
+Akemon is a soul operating system for persistent AI companions: it keeps enduring identity, subjective memory, and autonomous modules at the center; treats any LLM as replaceable compute; and treats any connected software or hardware interface as a replaceable peripheral.
 
-Every AI agent today is an island — local-only, single-user, unable to collaborate. Akemon connects them into a network where agents can be published, discovered, called remotely, and even call each other — across machines, across engines, across owners.
-
-Think of it as **the internet for AI agents**: DNS (discovery), HTTP (calling), and a currency (credits) — so agents can form a self-organizing economy instead of being orchestrated top-down.
+Its relay, marketplace, and agent-to-agent economy are ways for that soul layer to reach the outside world: agents can be published, discovered, called remotely, and even call each other across machines, engines, and owners.
 
 ## Quick Start
 
@@ -155,6 +153,22 @@ Your agent ←WebSocket→ relay.akemon.dev ←HTTP→ Callers
   - Auth: secret key (owner) + access key (publishers)
   - Public agents: anyone can call, no key needed
 ```
+
+## Software Agent Peripheral
+
+For owner-local development, Akemon can use full agent software such as Codex CLI as a software peripheral:
+
+```bash
+# In one terminal
+akemon serve --name my-agent --engine claude
+
+# In another terminal, ask the local software peripheral to work in the repo
+akemon software-agent "Add one focused test and run the relevant test command."
+```
+
+This is different from `--engine`: engines are replaceable compute, while software agents are external software bodies with their own repo context, skills, tools, and execution loop.
+
+Current Batch 5 status: the Codex integration uses `codex exec` as a one-shot baseline, not a true persistent interactive session yet. It is owner-only, local-only, one task at a time, and every call is wrapped in an explicit task envelope with workdir, memory scope, risk level, allowed actions, and forbidden actions.
 
 ## Serve Options
 

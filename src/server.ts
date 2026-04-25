@@ -2,8 +2,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { exec } from "child_process";
 import { scanAndKillOrphans } from "./orphan-scan.js";
-import { createServer } from "http";
+import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { createInterface } from "readline";
+import { mkdir } from "fs/promises";
+import { join } from "path";
 import {
   initWorld, initBioState, initGuide,
   getSelfState, loadRecentCanvasEntries,
@@ -95,6 +97,92 @@ function promptOwner(task: string, isHuman: boolean): Promise<string> {
   });
 }
 
+function bearerToken(req: IncomingMessage): string | null {
+  const auth = req.headers["authorization"];
+  return auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+}
+
+function isOwnerRequest(req: IncomingMessage, options: Pick<ServeOptions, "secretKey" | "key">): boolean {
+  const token = bearerToken(req);
+  const validTokens = [options.secretKey, options.key].filter(Boolean);
+  return !!token && validTokens.includes(token);
+}
+
+function readJsonBody(req: IncomingMessage, maxBytes = 256 * 1024): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on("data", (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        reject(new Error(`Request body too large (max ${maxBytes} bytes)`));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf-8").trim();
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try { resolve(JSON.parse(raw)); }
+      catch { reject(new Error("Invalid JSON body")); }
+    });
+    req.on("error", reject);
+  });
+}
+
+export async function handleSoftwareAgentRunHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: {
+    options: Pick<ServeOptions, "secretKey" | "key">;
+    workdir: string;
+    softwareAgent: Pick<CodexSoftwareAgentPeripheral, "sendTask"> | null;
+  },
+): Promise<void> {
+  if (!isOwnerRequest(req, deps.options)) {
+    res.writeHead(401, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Owner token required" }));
+    return;
+  }
+  if (!deps.softwareAgent) {
+    res.writeHead(503, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: "Software agent peripheral not ready" }));
+    return;
+  }
+
+  let body: any;
+  try {
+    body = await readJsonBody(req);
+  } catch (err: any) {
+    res.writeHead(400, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: err.message || "Invalid request body" }));
+    return;
+  }
+
+  let envelope;
+  try {
+    envelope = createOwnerTaskEnvelope(body, deps.workdir);
+  } catch (err: any) {
+    res.writeHead(400, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: err.message || "Invalid software-agent envelope" }));
+    return;
+  }
+
+  try {
+    const result = await deps.softwareAgent.sendTask(envelope);
+    res.writeHead(result.success ? 200 : 500, { "Content-Type": "application/json" })
+      .end(JSON.stringify(result, null, 2));
+  } catch (err: any) {
+    const busy = String(err.message || "").includes("busy");
+    res.writeHead(busy ? 409 : 500, { "Content-Type": "application/json" })
+      .end(JSON.stringify({ error: err.message || String(err) }));
+  }
+}
+
 import { RelayPeripheral } from "./relay-peripheral.js";
 import { EnginePeripheral, LLM_ENGINES as LLM_ENGINES_SET } from "./engine-peripheral.js";
 import { EngineQueue } from "./engine-queue.js";
@@ -106,6 +194,8 @@ import { SocialModule } from "./social-module.js";
 import { LongTermModule } from "./longterm-module.js";
 import { ReflectionModule } from "./reflection-module.js";
 import { ScriptModule } from "./script-module.js";
+import { FileEventLog, PersistentEventBus } from "./event-bus.js";
+import { CodexSoftwareAgentPeripheral, createOwnerTaskEnvelope } from "./software-agent-peripheral.js";
 import { SIG, sig } from "./types.js";
 import type { ComputeRequest, ComputeResult, Peripheral } from "./types.js";
 import { ServeOptions, loadConversation, listConversations, buildLLMContext, resolveConvId } from "./context.js";
@@ -206,16 +296,26 @@ export async function serve(options: ServeOptions): Promise<void> {
     emitTaskCompleted,
   };
 
+  let codexSoftwareAgent: CodexSoftwareAgentPeripheral | null = null;
+
   const httpServer = createServer(async (req, res) => {
     // Suppress noisy polling endpoints from log
     const isQuiet = req.url === "/self/state" || req.url?.startsWith("/self/state?");
     if (!isQuiet) console.log(`[http] ${req.method} ${req.url} session=${req.headers["mcp-session-id"] || "none"}`);
 
     try {
+      if (req.url === "/self/software-agent/run" && req.method === "POST") {
+        await handleSoftwareAgentRunHttp(req, res, {
+          options,
+          workdir,
+          softwareAgent: codexSoftwareAgent,
+        });
+        return;
+      }
+
       // Auth check
       if (options.key) {
-        const auth = req.headers["authorization"];
-        const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
+        const token = bearerToken(req);
         if (token !== options.key) {
           console.log(`[http] Unauthorized (bad or missing token)`);
           res.writeHead(401, { "Content-Type": "application/json" })
@@ -390,12 +490,24 @@ export async function serve(options: ServeOptions): Promise<void> {
     );
   }
 
-  // V2: Shared module context + EventBus
-  const { SimpleEventBus } = await import("./event-bus.js");
-  const bus = new SimpleEventBus();
+  // V2: Shared module context + persistent EventBus.
+  // This is the durable spine for module/peripheral/engine activity; recovery
+  // side effects are intentionally deferred until the event schema stabilizes.
+  const eventLogDir = join(workdir, ".akemon", "agents", options.agentName, "events");
+  await mkdir(eventLogDir, { recursive: true });
+  const eventLogPath = join(eventLogDir, "events.jsonl");
+  const bus = new PersistentEventBus(new FileEventLog(eventLogPath));
+  console.log(`[v2] Event log: ${eventLogPath}`);
+
+  codexSoftwareAgent = new CodexSoftwareAgentPeripheral({
+    workdir,
+    model: process.env.AKEMON_CODEX_MODEL,
+    sandbox: "workspace-write",
+  });
+  await codexSoftwareAgent.start(bus);
 
   // Peripheral registry — Core routes by capability
-  const peripherals: Peripheral[] = [relay, engineP];
+  const peripherals: Peripheral[] = [relay, engineP, codexSoftwareAgent];
 
   // requestCompute: acquire the engine slot (priority-aware), execute with a
   // hard timeout, and release. The slot release and subprocess kill are both
@@ -579,6 +691,8 @@ export async function serve(options: ServeOptions): Promise<void> {
     for (const m of allModules) {
       try { await m.stop(); } catch {}
     }
+    try { await codexSoftwareAgent?.stop(); } catch {}
+    bus.getLog().close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

@@ -27,6 +27,10 @@ export const SIG = {
   ENGINE_BUSY:        "engine:busy",
   ENGINE_FREE:        "engine:free",
 
+  // Software agent peripherals (Codex CLI, Claude Code, etc.)
+  SOFTWARE_AGENT_TASK:     "software-agent:task",
+  SOFTWARE_AGENT_RESPONSE: "software-agent:response",
+
   // Task execution
   TASK_RECEIVED:      "task:received",
   TASK_STARTED:       "task:started",

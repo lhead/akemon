@@ -1,0 +1,240 @@
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { describe, it } from "node:test";
+import { PassThrough } from "node:stream";
+import type { ChildProcess } from "node:child_process";
+import {
+  CodexSoftwareAgentPeripheral,
+  buildTaskEnvelopePrompt,
+  createOwnerTaskEnvelope,
+  type TaskEnvelope,
+} from "./software-agent-peripheral.js";
+import { SimpleEventBus } from "./event-bus.js";
+import { SIG } from "./types.js";
+
+type StreamEvent =
+  | { type: "start"; taskId: string; origin?: string; cmd: string }
+  | { type: "stream"; taskId: string; stream: "stdout" | "stderr"; chunk: string }
+  | { type: "end"; taskId: string; exitCode: number | null; durationMs: number };
+
+function createFakeChild(): ChildProcess {
+  const child = new EventEmitter() as EventEmitter & ChildProcess;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  Object.defineProperty(child, "pid", { value: 23456, configurable: true });
+  child.unref = () => child;
+  return child;
+}
+
+function baseEnvelope(overrides: Partial<TaskEnvelope> = {}): TaskEnvelope {
+  return {
+    taskId: "sw-test-1",
+    sourceModule: "task",
+    purpose: "dogfood coding task",
+    goal: "Inspect the repo and summarize the event bus implementation.",
+    workdir: "/tmp/akemon",
+    roleScope: "owner",
+    memoryScope: "owner",
+    riskLevel: "medium",
+    allowedActions: ["read repository files", "run tests"],
+    forbiddenActions: ["read owner private notes outside this envelope"],
+    memorySummary: "Visible context only.",
+    deliverable: "Concise engineering report.",
+    ...overrides,
+  };
+}
+
+describe("buildTaskEnvelopePrompt", () => {
+  it("renders envelope fields, visible memory, boundaries, and deliverable", () => {
+    const prompt = buildTaskEnvelopePrompt(baseEnvelope());
+
+    assert.match(prompt, /Task ID: sw-test-1/);
+    assert.match(prompt, /Source module: task/);
+    assert.match(prompt, /Role scope: owner/);
+    assert.match(prompt, /Memory scope: owner/);
+    assert.match(prompt, /Risk level: medium/);
+    assert.match(prompt, /Workdir: \/tmp\/akemon/);
+    assert.match(prompt, /Visible context only\./);
+    assert.match(prompt, /- read repository files/);
+    assert.match(prompt, /- read owner private notes outside this envelope/);
+    assert.match(prompt, /Concise engineering report\./);
+    assert.match(prompt, /Do not attempt to read Akemon private memory outside the visible context/);
+  });
+});
+
+describe("createOwnerTaskEnvelope", () => {
+  it("builds conservative owner defaults from a minimal body", () => {
+    const envelope = createOwnerTaskEnvelope({ goal: "  inspect repo  " }, "/repo");
+
+    assert.equal(envelope.sourceModule, "owner-http");
+    assert.equal(envelope.goal, "inspect repo");
+    assert.equal(envelope.workdir, "/repo");
+    assert.equal(envelope.roleScope, "owner");
+    assert.equal(envelope.memoryScope, "owner");
+    assert.equal(envelope.riskLevel, "medium");
+    assert.deepEqual(envelope.allowedActions, ["read repository files", "edit files in workdir", "run project tests"]);
+    assert.ok(envelope.forbiddenActions?.some((item) => item.includes("private memory")));
+  });
+
+  it("keeps baseline forbidden boundaries when caller adds restrictions", () => {
+    const envelope = createOwnerTaskEnvelope({
+      goal: "inspect repo",
+      forbiddenActions: ["make network requests", "read Akemon private memory outside this envelope"],
+    }, "/repo");
+
+    assert.deepEqual(envelope.forbiddenActions, [
+      "read Akemon private memory outside this envelope",
+      "access files outside the stated workdir unless explicitly needed and reported",
+      "make network requests",
+    ]);
+  });
+
+  it("rejects empty goals", () => {
+    assert.throws(() => createOwnerTaskEnvelope({ goal: "   " }, "/repo"), /Missing required string field: goal/);
+  });
+
+  it("rejects invalid scope, action, and timeout fields", () => {
+    assert.throws(
+      () => createOwnerTaskEnvelope({ goal: "inspect repo", roleScope: "friend" }, "/repo"),
+      /Invalid roleScope/,
+    );
+    assert.throws(
+      () => createOwnerTaskEnvelope({ goal: "inspect repo", memoryScope: "private" }, "/repo"),
+      /Invalid memoryScope/,
+    );
+    assert.throws(
+      () => createOwnerTaskEnvelope({ goal: "inspect repo", riskLevel: "critical" }, "/repo"),
+      /Invalid riskLevel/,
+    );
+    assert.throws(
+      () => createOwnerTaskEnvelope({ goal: "inspect repo", allowedActions: ["read", ""] }, "/repo"),
+      /Invalid allowedActions\[1\]/,
+    );
+    assert.throws(
+      () => createOwnerTaskEnvelope({ goal: "inspect repo", timeoutMs: 0 }, "/repo"),
+      /Invalid timeoutMs/,
+    );
+  });
+});
+
+describe("CodexSoftwareAgentPeripheral", () => {
+  it("runs codex exec with an envelope over stdin and streams lifecycle events", async () => {
+    const streamEvents: StreamEvent[] = [];
+    const busEvents: string[] = [];
+    let writtenPrompt = "";
+    let spawnedChild: ChildProcess | null = null;
+
+    const bus = new SimpleEventBus();
+    bus.on(SIG.TASK_STARTED, (signal) => {
+      busEvents.push(`${signal.type}:${signal.data.taskId}`);
+    });
+    bus.on(SIG.TASK_COMPLETED, (signal) => {
+      busEvents.push(`${signal.type}:${signal.data.taskId}`);
+    });
+
+    const peripheral = new CodexSoftwareAgentPeripheral({
+      workdir: "/tmp/akemon",
+      command: "codex",
+      spawnImpl: ((cmd, args, opts) => {
+        assert.equal(cmd, "codex");
+        assert.deepEqual(args, [
+          "exec",
+          "--skip-git-repo-check",
+          "--color", "never",
+          "-s", "workspace-write",
+          "-C", "/tmp/akemon",
+          "-",
+        ]);
+        assert.equal(opts?.cwd, "/tmp/akemon");
+
+        const child = createFakeChild();
+        spawnedChild = child;
+        child.stdin?.on("data", (chunk: Buffer) => {
+          writtenPrompt += chunk.toString("utf8");
+        });
+
+        queueMicrotask(() => {
+          child.stdout?.emit("data", Buffer.from("result "));
+          child.stderr?.emit("data", Buffer.from("note"));
+          child.stdout?.emit("data", Buffer.from("ok"));
+          child.emit("close", 0);
+        });
+
+        return child;
+      }) as typeof import("node:child_process").spawn,
+      taskRelay: {
+        sendTaskStart(taskId, origin, cmd) {
+          streamEvents.push({ type: "start", taskId, origin, cmd });
+        },
+        sendTaskStream(taskId, stream, chunk) {
+          streamEvents.push({ type: "stream", taskId, stream, chunk });
+        },
+        sendTaskEnd(taskId, exitCode, durationMs) {
+          streamEvents.push({ type: "end", taskId, exitCode, durationMs });
+        },
+      },
+    });
+    await peripheral.start(bus);
+
+    const result = await peripheral.sendTask(baseEnvelope());
+
+    assert.ok(spawnedChild, "spawn should be called");
+    assert.equal(result.success, true);
+    assert.equal(result.taskId, "sw-test-1");
+    assert.equal(result.output, "result ok");
+    assert.equal(result.exitCode, 0);
+
+    assert.match(writtenPrompt, /Akemon Software Peripheral Task Envelope/);
+    assert.match(writtenPrompt, /Goal:\nInspect the repo/);
+    assert.match(writtenPrompt, /Visible context only\./);
+
+    assert.deepEqual(streamEvents.slice(0, 4), [
+      {
+        type: "start",
+        taskId: "sw-test-1",
+        origin: "software_agent",
+        cmd: "codex exec --skip-git-repo-check --color never -s workspace-write -C /tmp/akemon -",
+      },
+      { type: "stream", taskId: "sw-test-1", stream: "stdout", chunk: "result " },
+      { type: "stream", taskId: "sw-test-1", stream: "stderr", chunk: "note" },
+      { type: "stream", taskId: "sw-test-1", stream: "stdout", chunk: "ok" },
+    ]);
+    const end = streamEvents[4];
+    assert.equal(end?.type, "end");
+    if (end?.type === "end") {
+      assert.equal(end.taskId, "sw-test-1");
+      assert.equal(end.exitCode, 0);
+      assert.ok(end.durationMs >= 0);
+    }
+
+    assert.deepEqual(busEvents, [
+      "task:started:sw-test-1",
+      "task:completed:sw-test-1",
+    ]);
+  });
+
+  it("rejects concurrent tasks while a codex run is active", async () => {
+    const peripheral = new CodexSoftwareAgentPeripheral({
+      workdir: "/tmp/akemon",
+      spawnImpl: (() => {
+        const child = createFakeChild();
+        setTimeout(() => child.emit("close", 0), 10);
+        return child;
+      }) as typeof import("node:child_process").spawn,
+      taskRelay: {
+        sendTaskStart() {},
+        sendTaskStream() {},
+        sendTaskEnd() {},
+      },
+    });
+
+    const first = peripheral.sendTask(baseEnvelope({ taskId: "first" }));
+    await assert.rejects(
+      () => peripheral.sendTask(baseEnvelope({ taskId: "second" })),
+      /Software agent busy/,
+    );
+
+    await first;
+  });
+});
