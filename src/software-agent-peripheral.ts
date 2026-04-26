@@ -13,7 +13,7 @@
 
 import { randomUUID } from "crypto";
 import { spawn, spawnSync, type ChildProcess } from "child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import { isAbsolute, join, relative, resolve as resolvePath } from "path";
 import { StringDecoder } from "string_decoder";
 import type { EventBus, Peripheral, Signal } from "./types.js";
@@ -166,6 +166,7 @@ export interface CodexSoftwareAgentConfig {
   taskRelay?: SoftwareTaskRelay;
   defaultTimeoutMs?: number;
   taskLedgerDir?: string;
+  taskLedgerMaxRecords?: number;
   gitStatusImpl?: (workdir: string) => GitWorktreeStatus;
 }
 
@@ -188,6 +189,7 @@ const RISK_LEVELS: RiskLevel[] = ["low", "medium", "high"];
 const MAX_STREAM_SUMMARY_CHARS = 12_000;
 const STREAM_SUMMARY_HEAD_CHARS = 4_000;
 const STREAM_SUMMARY_TAIL_CHARS = 8_000;
+const DEFAULT_TASK_LEDGER_MAX_RECORDS = 200;
 
 export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
   id: string;
@@ -496,6 +498,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       mkdirSync(dir, { recursive: true });
       const safeTaskId = safeTaskFilename(record.taskId);
       writeFileSync(join(dir, `${safeTaskId}.json`), `${JSON.stringify(redactSecrets(record), null, 2)}\n`);
+      pruneSoftwareAgentTaskRecords(dir, this.config.taskLedgerMaxRecords, record.taskId);
     } catch (err: any) {
       console.error(`[software-agent] Failed to write task ledger: ${err.message || String(err)}`);
     }
@@ -732,6 +735,43 @@ export function readSoftwareAgentTaskRecord(
   return readSoftwareAgentTaskRecordFile(file);
 }
 
+export function pruneSoftwareAgentTaskRecords(
+  taskLedgerDir: string,
+  maxRecords = DEFAULT_TASK_LEDGER_MAX_RECORDS,
+  preserveTaskId?: string,
+): number {
+  const safeMaxRecords = normalizeTaskLedgerMaxRecords(maxRecords);
+  try {
+    if (!existsSync(taskLedgerDir)) return 0;
+    const records = readdirSync(taskLedgerDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+      .map((entry) => {
+        const file = join(taskLedgerDir, entry.name);
+        const record = readSoftwareAgentTaskRecordFile(file);
+        return record ? { file, record } : null;
+      })
+      .filter((entry): entry is { file: string; record: SoftwareAgentTaskRecord } => !!entry)
+      .sort((a, b) => compareSoftwareAgentTaskRecords(a.record, b.record));
+
+    const keepTaskIds = new Set(records.slice(0, safeMaxRecords).map((entry) => entry.record.taskId));
+    if (preserveTaskId) keepTaskIds.add(preserveTaskId);
+
+    let deleted = 0;
+    for (const entry of records) {
+      if (keepTaskIds.has(entry.record.taskId)) continue;
+      try {
+        unlinkSync(entry.file);
+        deleted++;
+      } catch {
+        // Best effort: retention should not break task completion.
+      }
+    }
+    return deleted;
+  } catch {
+    return 0;
+  }
+}
+
 function readOptionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "string") throw new Error(`Invalid ${field}: expected string`);
@@ -807,6 +847,11 @@ function summarizeGitError(stderr: unknown, error?: Error): string | undefined {
 function normalizeTaskRecordLimit(limit: number): number {
   if (!Number.isInteger(limit) || limit <= 0) return 20;
   return Math.min(limit, 100);
+}
+
+function normalizeTaskLedgerMaxRecords(limit: number): number {
+  if (!Number.isInteger(limit) || limit <= 0) return DEFAULT_TASK_LEDGER_MAX_RECORDS;
+  return Math.min(limit, 10_000);
 }
 
 function readSoftwareAgentTaskRecordFile(file: string): SoftwareAgentTaskRecord | null {

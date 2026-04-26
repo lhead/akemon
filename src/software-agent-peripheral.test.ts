@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -437,6 +437,40 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.doesNotMatch(recordText, new RegExp(apiKey));
       assert.match(recordText, /\[REDACTED\]/);
       assert.match(relayChunks.join(""), /\[REDACTED\]/);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prunes old task ledger records after writing a new task", async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), "akemon-software-agent-ledger-retention-"));
+    try {
+      const spawnedChild = createFakeChild();
+      const ledgerDir = join(tmpDir, "tasks");
+      await mkdir(ledgerDir, { recursive: true });
+      const peripheral = new CodexSoftwareAgentPeripheral({
+        workdir: "/tmp/akemon",
+        spawnImpl: (() => spawnedChild) as typeof import("node:child_process").spawn,
+        taskRelay: {
+          sendTaskStart() {},
+          sendTaskStream() {},
+          sendTaskEnd() {},
+        },
+        taskLedgerDir: ledgerDir,
+        taskLedgerMaxRecords: 2,
+      });
+
+      await writeFile(join(ledgerDir, "older-1.json"), JSON.stringify(taskRecord("older-1", "2026-04-25T01:00:00.000Z")));
+      await writeFile(join(ledgerDir, "older-2.json"), JSON.stringify(taskRecord("older-2", "2026-04-25T02:00:00.000Z")));
+      await writeFile(join(ledgerDir, "older-3.json"), JSON.stringify(taskRecord("older-3", "2026-04-25T03:00:00.000Z")));
+
+      const run = peripheral.sendTask(baseEnvelope({ taskId: "retention-current" }));
+      spawnedChild.stdout?.emit("data", Buffer.from("ok"));
+      spawnedChild.emit("close", 0);
+      await run;
+
+      const records = listSoftwareAgentTaskRecords(ledgerDir, 10);
+      assert.deepEqual(records.map((record) => record.taskId), ["retention-current", "older-3"]);
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }
