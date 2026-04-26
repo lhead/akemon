@@ -164,11 +164,16 @@ akemon serve --name my-agent --engine claude
 
 # In another terminal, ask the local software peripheral to work in the repo
 akemon software-agent "Add one focused test and run the relevant test command."
+
+# Review recent software-agent runs
+akemon software-agent-tasks --limit 5
 ```
 
 This is different from `--engine`: engines are replaceable compute, while software agents are external software bodies with their own repo context, skills, tools, and execution loop.
 
-Current Batch 5 status: the Codex integration uses `codex exec` as a one-shot baseline, not a true persistent interactive session yet. It is owner-only, local-only, one task at a time, and every call is wrapped in an explicit task envelope with workdir, memory scope, risk level, allowed actions, and forbidden actions.
+Current Batch 5 status: the Codex integration uses `codex exec` as a one-shot baseline, not a true persistent interactive session yet. It is owner-only, local-only, one task at a time, streams local stdout/stderr by default, and every call is wrapped in an explicit task envelope with workdir, memory scope, risk level, allowed actions, and forbidden actions.
+
+Software-agent tasks default to the `akemon serve` workdir boundary. Use `--allow-outside-workdir` only when you explicitly want the software agent to run outside that root. Each run is recorded under `.akemon/agents/<name>/software-agent/tasks/` with the envelope, result, output summaries, and git worktree status.
 
 ## Serve Options
 
