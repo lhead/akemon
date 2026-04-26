@@ -177,6 +177,16 @@ Software-agent tasks default to the `akemon serve` workdir boundary. Use `--allo
 
 Common secret-like values are redacted from software-agent streams, task ledger records, relay task stream events, and the persistent event log before they are displayed or stored.
 
+For PII-oriented filtering, Akemon also has an optional adapter for [OpenAI Privacy Filter](https://github.com/openai/privacy-filter). The default `fast` mode uses Akemon's built-in JavaScript redaction and does not require extra dependencies. To use OPF, install the external `opf` Python CLI yourself, then opt in explicitly:
+
+```bash
+akemon privacy-filter --mode fast "OPENAI_API_KEY=sk-..."
+akemon privacy-filter --mode pii --backend opf --device cpu "Alice was born on 1990-01-02."
+akemon privacy-filter --mode strict --backend opf --checkpoint ~/.opf/privacy_filter "Alice ..."
+```
+
+You can also configure OPF with `AKEMON_PRIVACY_FILTER=opf`, `AKEMON_OPF_COMMAND`, `AKEMON_OPF_DEVICE`, `AKEMON_OPF_CHECKPOINT`, `AKEMON_OPF_TIMEOUT_MS`, and `AKEMON_OPF_MAX_INPUT_CHARS`. In `pii` mode, OPF failures fall back to built-in redaction with a warning; in `strict` mode they fail the command.
+
 The software-agent task ledger keeps the most recent 200 task records by default.
 
 The persistent event log rotates automatically at about 10 MB per file and keeps the current `events.jsonl` plus five rotated files.

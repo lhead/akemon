@@ -6,6 +6,12 @@ import { getOrCreateRelayCredentials } from "./config.js";
 import { connectRelay } from "./relay-client.js";
 import { listAgents } from "./list.js";
 import { connect } from "./connect.js";
+import {
+  PrivacyFilterUnavailableError,
+  sanitizeText,
+  type PrivacyFilterBackend,
+  type PrivacyFilterMode,
+} from "./privacy-filter.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -27,6 +33,29 @@ function clampPositiveInt(value: string | number | undefined, fallback: number, 
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, max);
+}
+
+function parsePrivacyFilterMode(value: string): PrivacyFilterMode {
+  if (value === "fast" || value === "pii" || value === "strict") return value;
+  console.error("--mode must be one of: fast, pii, strict");
+  process.exit(1);
+}
+
+function parsePrivacyFilterBackend(value: string | undefined): PrivacyFilterBackend | undefined {
+  if (value === undefined) return undefined;
+  if (value === "fast" || value === "opf") return value;
+  console.error("--backend must be one of: fast, opf");
+  process.exit(1);
+}
+
+function parsePositiveIntCliOption(value: string | number | undefined, optionName: string): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.error(`${optionName} must be a positive integer`);
+    process.exit(1);
+  }
+  return parsed;
 }
 
 function printSoftwareAgentTaskList(tasks: any[]): void {
@@ -396,6 +425,48 @@ program
       method: "POST",
     });
     console.log(JSON.stringify(data, null, 2));
+  });
+
+program
+  .command("privacy-filter")
+  .description("Sanitize text with built-in redaction and optional OpenAI Privacy Filter")
+  .argument("<text...>", "Text to sanitize")
+  .option("--mode <mode>", "Mode: fast, pii, or strict", "fast")
+  .option("--backend <backend>", "Backend: fast or opf")
+  .option("--command <command>", "OPF command (default: opf)")
+  .option("--device <device>", "OPF device, e.g. cpu or cuda")
+  .option("--checkpoint <path>", "OPF checkpoint directory")
+  .option("--timeout-ms <ms>", "OPF timeout in milliseconds")
+  .option("--max-input-chars <n>", "Maximum text length to pass to OPF")
+  .option("--json", "Print result metadata as JSON")
+  .action(async (textParts: string[], opts) => {
+    try {
+      const result = await sanitizeText(textParts.join(" "), {
+        mode: parsePrivacyFilterMode(opts.mode),
+        backend: parsePrivacyFilterBackend(opts.backend),
+        command: opts.command,
+        device: opts.device,
+        checkpoint: opts.checkpoint,
+        timeoutMs: parsePositiveIntCliOption(opts.timeoutMs, "--timeout-ms"),
+        maxInputChars: parsePositiveIntCliOption(opts.maxInputChars, "--max-input-chars"),
+      });
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+
+      console.log(result.text);
+      for (const warning of result.warnings) {
+        console.error(`[privacy-filter] ${warning}`);
+      }
+    } catch (error) {
+      if (error instanceof PrivacyFilterUnavailableError || error instanceof TypeError) {
+        console.error(error.message);
+        process.exit(1);
+      }
+      throw error;
+    }
   });
 
 program
