@@ -12,6 +12,8 @@ import {
   type PrivacyFilterBackend,
   type PrivacyFilterMode,
 } from "./privacy-filter.js";
+import { SoftwareAgentStreamCliRenderer } from "./software-agent-stream-cli.js";
+import type { SoftwareAgentEnvPolicy } from "./software-agent-peripheral.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -46,6 +48,19 @@ function parsePrivacyFilterBackend(value: string | undefined): PrivacyFilterBack
   if (value === "fast" || value === "opf") return value;
   console.error("--backend must be one of: fast, opf");
   process.exit(1);
+}
+
+function parseSoftwareAgentEnvPolicy(value: string | undefined): SoftwareAgentEnvPolicy {
+  const normalized = (value || "inherit").trim().toLowerCase();
+  if (normalized === "inherit" || normalized === "allowlist") return normalized;
+  console.error("--software-agent-env must be one of: inherit, allowlist");
+  process.exit(1);
+}
+
+function parseCommaSeparatedCliOption(value: string | undefined): string[] | undefined {
+  if (!value) return undefined;
+  const items = value.split(",").map((item) => item.trim()).filter(Boolean);
+  return items.length ? items : undefined;
 }
 
 function parsePositiveIntCliOption(value: string | number | undefined, optionName: string): number | undefined {
@@ -150,6 +165,7 @@ async function streamLocalOwnerEndpoint(path: string, opts: { port?: string }, b
   const decoder = new TextDecoder();
   let buffer = "";
   let failed = false;
+  const streamRenderer = new SoftwareAgentStreamCliRenderer();
   const reader = res.body.getReader();
   while (true) {
     const { done, value } = await reader.read();
@@ -158,52 +174,12 @@ async function streamLocalOwnerEndpoint(path: string, opts: { port?: string }, b
     const lines = buffer.split(/\r?\n/);
     buffer = lines.pop() || "";
     for (const line of lines) {
-      if (handleSoftwareAgentStreamLine(line)) failed = true;
+      if (streamRenderer.handleLine(line)) failed = true;
     }
   }
   buffer += decoder.decode();
-  if (buffer.trim() && handleSoftwareAgentStreamLine(buffer)) failed = true;
+  if (buffer.trim() && streamRenderer.handleLine(buffer)) failed = true;
   if (failed) process.exit(1);
-}
-
-function handleSoftwareAgentStreamLine(line: string): boolean {
-  const trimmed = line.trim();
-  if (!trimmed) return false;
-
-  let event: any;
-  try {
-    event = JSON.parse(trimmed);
-  } catch {
-    process.stderr.write(`${trimmed}\n`);
-    return false;
-  }
-
-  if (event.type === "start" && event.taskId) {
-    process.stderr.write(`[software-agent] started ${event.taskId}\n`);
-    return false;
-  }
-  if (event.type === "stdout" && typeof event.chunk === "string") {
-    process.stdout.write(event.chunk);
-    return false;
-  }
-  if (event.type === "stderr" && typeof event.chunk === "string") {
-    process.stderr.write(event.chunk);
-    return false;
-  }
-  if (event.type === "end") {
-    const result = event.result;
-    if (result?.success === false && result.error) {
-      process.stderr.write(`${result.error}\n`);
-      return true;
-    }
-    return false;
-  }
-  if (event.type === "error") {
-    process.stderr.write(`${event.error || "Software-agent stream failed"}\n`);
-    return true;
-  }
-
-  return false;
 }
 
 program
@@ -235,6 +211,8 @@ program
   .option("--without <modules>", "Disable specific modules (comma-separated: biostate,memory)")
   .option("--script <name>", "Script to load for ScriptModule (default: daily-life)", "daily-life")
   .option("--terminal", "Enable remote terminal access (PTY)")
+  .option("--software-agent-env <policy>", "Software-agent child environment policy: inherit or allowlist", process.env.AKEMON_SOFTWARE_AGENT_ENV_POLICY || "inherit")
+  .option("--software-agent-env-allow <vars>", "Comma-separated extra env vars for software-agent allowlist")
   .option("--relay <url>", "Relay WebSocket URL", RELAY_WS)
   .action(async (opts) => {
     const port = parseInt(opts.port);
@@ -273,6 +251,8 @@ program
       notifyUrl: opts.notify,
       enabledModules,
       scriptName: opts.script,
+      softwareAgentEnvPolicy: parseSoftwareAgentEnvPolicy(opts.softwareAgentEnv),
+      softwareAgentEnvAllowlist: parseCommaSeparatedCliOption(opts.softwareAgentEnvAllow),
     });
 
     console.log(`\nakemon v${pkg.version}`);
@@ -345,6 +325,7 @@ program
   .option("--memory-scope <scope>", "Memory scope: none|public|task|owner", "owner")
   .option("--risk <level>", "Risk level: low|medium|high", "medium")
   .option("--memory-summary <text>", "Pre-filtered memory/context text to include")
+  .option("--session <id>", "Akemon-side context session id for explicit software-agent continuity")
   .option("--deliverable <text>", "Expected output shape")
   .option("--timeout-ms <ms>", "Task timeout in milliseconds")
   .option("--no-stream", "Disable local streaming and wait for the final response")
@@ -358,6 +339,7 @@ program
     if (opts.workdir) body.workdir = opts.workdir;
     if (opts.allowOutsideWorkdir) body.allowOutsideWorkdir = true;
     if (opts.memorySummary) body.memorySummary = opts.memorySummary;
+    if (opts.session) body.contextSessionId = opts.session;
     if (opts.deliverable) body.deliverable = opts.deliverable;
     if (opts.timeoutMs) {
       const timeoutMs = Number(opts.timeoutMs);

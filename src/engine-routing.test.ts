@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   resolveEngineConfig,
+  resolveEngineRoute,
+  EngineRegistry,
   deriveChildOrigin,
   downgradeForRetry,
   type EngineRouting,
@@ -100,6 +102,86 @@ describe("resolveEngineConfig", () => {
     const routing: EngineRouting = { reflection: reflEntry, default: defaultEntry };
     const result = resolveEngineConfig(routing, "reflection");
     assert.deepEqual(result, reflEntry);
+  });
+});
+
+describe("EngineRegistry", () => {
+  it("selects a registry route by origin, capabilities, privacy, cost, and latency", () => {
+    const routing: EngineRouting = {
+      routes: [
+        {
+          engine: "claude",
+          model: "opus",
+          origins: ["user_manual"],
+          capabilities: ["chat", "code"],
+          privacy: "external",
+          cost: "high",
+          latency: "medium",
+        },
+        {
+          engine: "raw",
+          model: "local-code",
+          origins: ["user_manual", "self_cycle"],
+          capabilities: ["chat", "code", "json"],
+          privacy: "local",
+          cost: "low",
+          latency: "low",
+        },
+      ],
+      default: { engine: "claude" },
+    };
+
+    const result = new EngineRegistry(routing).resolve({
+      origin: "user_manual",
+      requiredCapabilities: ["code"],
+      privacy: "local",
+      maxCost: "medium",
+      maxLatency: "medium",
+    });
+
+    assert.equal(result.source, "route");
+    assert.equal(result.entry?.engine, "raw");
+    assert.equal(result.entry?.model, "local-code");
+  });
+
+  it("falls back to legacy origin/default routes when no registry route matches", () => {
+    const routing: EngineRouting = {
+      routes: [
+        {
+          engine: "raw",
+          origins: ["self_cycle"],
+          capabilities: ["reflection"],
+          privacy: "local",
+        },
+      ],
+      user_manual: { engine: "codex", model: "gpt-5.4" },
+      default: { engine: "claude" },
+    };
+
+    const exact = resolveEngineRoute(routing, {
+      origin: "user_manual",
+      requiredCapabilities: ["code"],
+    });
+    const fallback = resolveEngineRoute(routing, {
+      origin: "platform",
+      requiredCapabilities: ["tool_use"],
+    });
+
+    assert.equal(exact.source, "origin");
+    assert.equal(exact.entry?.engine, "codex");
+    assert.equal(fallback.source, "default");
+    assert.equal(fallback.entry?.engine, "claude");
+  });
+
+  it("keeps legacy resolveEngineConfig behavior stable", () => {
+    const routing: EngineRouting = {
+      routes: [{ engine: "raw", origins: ["user_manual"] }],
+      user_manual: { engine: "claude" },
+      default: { engine: "codex" },
+    };
+
+    assert.deepEqual(resolveEngineConfig(routing, "user_manual"), { engine: "claude" });
+    assert.deepEqual(resolveEngineConfig(routing, "platform"), { engine: "codex" });
   });
 });
 

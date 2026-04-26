@@ -20,6 +20,7 @@ import type { RelayPeripheral } from "./relay-peripheral.js";
 import type { EnginePeripheral } from "./engine-peripheral.js";
 import type { BioStateModule } from "./bio-module.js";
 import type { MemoryModule } from "./memory-module.js";
+import type { SoftwareAgentEnvPolicy } from "./software-agent-peripheral.js";
 
 // ---------------------------------------------------------------------------
 // ServeOptions
@@ -52,6 +53,10 @@ export interface ServeOptions {
   enabledModules?: string[];
   /** Script name for ScriptModule (default: daily-life) */
   scriptName?: string;
+  /** Software-agent child process environment policy (default: inherit). */
+  softwareAgentEnvPolicy?: SoftwareAgentEnvPolicy;
+  /** Extra variable names to pass when softwareAgentEnvPolicy is allowlist. */
+  softwareAgentEnvAllowlist?: string[];
 }
 
 // ---------------------------------------------------------------------------

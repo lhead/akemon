@@ -22,8 +22,9 @@ import { sendFailureEvent } from "./relay-client.js";
 import {
   type Origin,
   type EngineRouting,
+  type EngineRouteRequest,
   type EngineRoutingEntry,
-  resolveEngineConfig,
+  resolveEngineRoute,
 } from "./engine-routing.js";
 
 // ---------------------------------------------------------------------------
@@ -160,11 +161,13 @@ export class EnginePeripheral implements Peripheral {
     origin?: Origin,
     routing?: EngineRouting,
     taskId?: string,
+    routeRequest?: Omit<EngineRouteRequest, "origin">,
   ): Promise<string> {
-    const entry = resolveEngineConfig(routing, origin);
+    const resolution = resolveEngineRoute(routing, { origin, ...routeRequest });
+    const entry = resolution.entry;
     const cfg = entry ? applyRoutingEntry(this.config, entry) : this.config;
     if (origin && entry) {
-      console.log(`[engine] using ${cfg.engine}${cfg.model ? `/${cfg.model}` : ""} (origin=${origin})`);
+      console.log(`[engine] using ${cfg.engine}${cfg.model ? `/${cfg.model}` : ""} (origin=${origin}, source=${resolution.source})`);
     }
     const t0 = Date.now();
     try {

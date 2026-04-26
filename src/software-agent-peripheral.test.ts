@@ -97,6 +97,7 @@ describe("createOwnerTaskEnvelope", () => {
     assert.equal(envelope.roleScope, "owner");
     assert.equal(envelope.memoryScope, "owner");
     assert.equal(envelope.riskLevel, "medium");
+    assert.equal(envelope.contextSessionId, undefined);
     assert.deepEqual(envelope.allowedActions, ["read repository files", "edit files in workdir", "run project tests"]);
     assert.ok(envelope.forbiddenActions?.some((item) => item.includes("private memory")));
   });
@@ -165,6 +166,10 @@ describe("createOwnerTaskEnvelope", () => {
       /Invalid allowedActions\[1\]/,
     );
     assert.throws(
+      () => createOwnerTaskEnvelope({ goal: "inspect repo", contextSessionId: "../bad" }, "/repo"),
+      /Invalid contextSessionId/,
+    );
+    assert.throws(
       () => createOwnerTaskEnvelope({ goal: "inspect repo", timeoutMs: 0 }, "/repo"),
       /Invalid timeoutMs/,
     );
@@ -201,6 +206,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
           "-",
         ]);
         assert.equal(opts?.cwd, "/tmp/akemon");
+        assert.equal(opts?.env, process.env);
 
         const child = createFakeChild();
         spawnedChild = child;
@@ -330,6 +336,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
     assert.equal(state.activeWorkdir, null);
     assert.equal(state.busy, false);
     assert.deepEqual(state.workdirStatus, status);
+    assert.deepEqual(state.environment, { policy: "inherit" });
   });
 
   it("records task ledger state from running to completed", async () => {
@@ -367,6 +374,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.equal(running.taskId, "ledger-running");
       assert.equal(running.envelope.goal, "Inspect the repo and summarize the event bus implementation.");
       assert.equal(running.transport, "codex-exec");
+      assert.deepEqual(running.environment, { policy: "inherit" });
       assert.deepEqual(running.workdirStatus, workdirStatus);
 
       spawnedChild.stdout?.emit("data", Buffer.from("ledger result"));
@@ -386,6 +394,160 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.deepEqual(completed.workdirStatus, workdirStatus);
       assert.ok(completed.completedAt);
       assert.ok(completed.durationMs >= 0);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes a context packet and carries previous summary across explicit Akemon sessions", async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), "akemon-software-agent-context-"));
+    try {
+      const contextSessionDir = join(tmpDir, "sessions");
+      const ledgerDir = join(tmpDir, "tasks");
+      const children: ChildProcess[] = [];
+      const prompts: string[] = [];
+      const peripheral = new CodexSoftwareAgentPeripheral({
+        workdir: "/tmp/akemon",
+        contextSessionDir,
+        taskLedgerDir: ledgerDir,
+        spawnImpl: (() => {
+          const index = prompts.length;
+          prompts.push("");
+          const child = createFakeChild();
+          child.stdin?.on("data", (chunk: Buffer) => {
+            prompts[index] += chunk.toString("utf8");
+          });
+          children.push(child);
+          return child;
+        }) as typeof import("node:child_process").spawn,
+        taskRelay: {
+          sendTaskStart() {},
+          sendTaskStream() {},
+          sendTaskEnd() {},
+        },
+      });
+
+      const first = peripheral.sendTask(baseEnvelope({
+        taskId: "ctx-1",
+        contextSessionId: "project-alpha",
+        memorySummary: "Visible context only.",
+      }));
+      children[0].stdout?.emit("data", Buffer.from("first result"));
+      children[0].emit("close", 0);
+      await first;
+
+      const packetPath = join(contextSessionDir, "project-alpha", "TASK_CONTEXT.md");
+      const statePath = join(contextSessionDir, "project-alpha", "SESSION.json");
+      const firstPacket = await readFile(packetPath, "utf-8");
+      const firstState = JSON.parse(await readFile(statePath, "utf-8"));
+
+      assert.match(prompts[0], /Read the context packet first/);
+      assert.match(prompts[0], new RegExp(packetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.doesNotMatch(prompts[0], /Visible context only/);
+      assert.match(firstPacket, /Akemon context session: project-alpha/);
+      assert.match(firstPacket, /Visible context only\./);
+      assert.equal(firstState.sessionId, "project-alpha");
+      assert.equal(firstState.lastTaskId, "ctx-1");
+      assert.equal(firstState.lastResult.outputSummary.text, "first result");
+
+      const second = peripheral.sendTask(baseEnvelope({
+        taskId: "ctx-2",
+        contextSessionId: "project-alpha",
+        goal: "Continue the same investigation.",
+        memorySummary: "Second visible context.",
+      }));
+      children[1].stdout?.emit("data", Buffer.from("second result"));
+      children[1].emit("close", 0);
+      await second;
+
+      const secondPacket = await readFile(packetPath, "utf-8");
+      const secondRecord = JSON.parse(await readFile(join(ledgerDir, "ctx-2.json"), "utf-8"));
+
+      assert.match(secondPacket, /Previous task summary for this Akemon context session/);
+      assert.match(secondPacket, /Previous task: ctx-1/);
+      assert.match(secondPacket, /first result/);
+      assert.equal(secondRecord.contextSession.sessionId, "project-alpha");
+      assert.equal(secondRecord.contextSession.packetPath, packetPath);
+      assert.equal(secondRecord.envelope.contextPacketPath, packetPath);
+      assert.match(prompts[1], /Continue the same investigation/);
+      assert.doesNotMatch(prompts[1], /first result/);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("can run codex with an allowlisted child environment and records no env values", async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), "akemon-software-agent-env-"));
+    try {
+      const spawnedChild = createFakeChild();
+      const ledgerDir = join(tmpDir, "tasks");
+      const openAiKey = "sk-123456789012345678901234";
+      const sourceEnv: NodeJS.ProcessEnv = {
+        PATH: "/usr/bin",
+        HOME: "/Users/tester",
+        SHELL: "/bin/zsh",
+        USER: "tester",
+        TMPDIR: "/tmp",
+        CODEX_HOME: "/Users/tester/.codex",
+        OPENAI_API_KEY: openAiKey,
+        UNLISTED_ALLOWED: "custom-value",
+        AKEMON_KEY: "owner-secret",
+        AKEMON_RAW_KEY: "raw-secret",
+        RELAY_OWNER_TOKEN: "relay-secret",
+        NOT_ALLOWED: "hidden-value",
+      };
+      let childEnv: NodeJS.ProcessEnv | undefined;
+
+      const peripheral = new CodexSoftwareAgentPeripheral({
+        workdir: "/tmp/akemon",
+        envPolicy: "allowlist",
+        envAllowlist: ["UNLISTED_ALLOWED", "AKEMON_KEY", "RELAY_OWNER_TOKEN"],
+        sourceEnv,
+        spawnImpl: ((_cmd, _args, opts) => {
+          childEnv = opts?.env as NodeJS.ProcessEnv;
+          return spawnedChild;
+        }) as typeof import("node:child_process").spawn,
+        taskRelay: {
+          sendTaskStart() {},
+          sendTaskStream() {},
+          sendTaskEnd() {},
+        },
+        taskLedgerDir: ledgerDir,
+      });
+
+      const run = peripheral.sendTask(baseEnvelope({ taskId: "env-allowlist" }));
+      spawnedChild.stdout?.emit("data", Buffer.from("ok"));
+      spawnedChild.emit("close", 0);
+      await run;
+
+      assert.equal(childEnv?.PATH, "/usr/bin");
+      assert.equal(childEnv?.HOME, "/Users/tester");
+      assert.equal(childEnv?.SHELL, "/bin/zsh");
+      assert.equal(childEnv?.USER, "tester");
+      assert.equal(childEnv?.TMPDIR, "/tmp");
+      assert.equal(childEnv?.CODEX_HOME, "/Users/tester/.codex");
+      assert.equal(childEnv?.OPENAI_API_KEY, openAiKey);
+      assert.equal(childEnv?.UNLISTED_ALLOWED, "custom-value");
+      assert.equal(childEnv?.AKEMON_KEY, undefined);
+      assert.equal(childEnv?.AKEMON_RAW_KEY, undefined);
+      assert.equal(childEnv?.RELAY_OWNER_TOKEN, undefined);
+      assert.equal(childEnv?.NOT_ALLOWED, undefined);
+
+      const recordText = await readFile(join(ledgerDir, "env-allowlist.json"), "utf-8");
+      const record = JSON.parse(recordText);
+      assert.equal(record.environment.policy, "allowlist");
+      assert.deepEqual(record.environment.allowedKeys.sort(), [
+        "CODEX_HOME",
+        "HOME",
+        "OPENAI_API_KEY",
+        "PATH",
+        "SHELL",
+        "TMPDIR",
+        "UNLISTED_ALLOWED",
+        "USER",
+      ]);
+      assert.doesNotMatch(recordText, new RegExp(openAiKey));
+      assert.doesNotMatch(recordText, /owner-secret|raw-secret|relay-secret|custom-value|hidden-value/);
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }

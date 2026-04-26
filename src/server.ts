@@ -283,6 +283,8 @@ export async function handleSoftwareAgentRunStreamHttp(
           writeSoftwareAgentStreamEvent(res, {
             type: "end",
             taskId: event.taskId,
+            exitCode: event.exitCode,
+            durationMs: event.durationMs,
             result: event.result,
           });
         },
@@ -364,6 +366,10 @@ export async function handleSoftwareAgentTasksHttp(
 
 function softwareAgentTaskLedgerDir(workdir: string, agentName: string): string {
   return join(workdir, ".akemon", "agents", agentName, "software-agent", "tasks");
+}
+
+function softwareAgentContextSessionDir(workdir: string, agentName: string): string {
+  return join(workdir, ".akemon", "agents", agentName, "software-agent", "sessions");
 }
 
 function readPositiveIntQuery(value: string | null, fallback: number, max: number): number {
@@ -448,11 +454,12 @@ function runEngine(
   origin?: import("./engine-routing.js").Origin,
   routing?: import("./engine-routing.js").EngineRouting,
   taskId?: string,
+  routeRequest?: Omit<import("./engine-routing.js").EngineRouteRequest, "origin">,
 ): Promise<string> {
   if (!_engineP) {
     throw new Error("Engine peripheral not initialized");
   }
-  const result = _engineP.runEngine(task, allowAll, extraAllowedTools, signal, origin, routing, taskId);
+  const result = _engineP.runEngine(task, allowAll, extraAllowedTools, signal, origin, routing, taskId, routeRequest);
   // Sync trace back to module-level for reporting
   result.then(() => { lastEngineTrace = _engineP!.lastTrace; }).catch(() => { lastEngineTrace = _engineP!.lastTrace; });
   return result;
@@ -763,6 +770,9 @@ export async function serve(options: ServeOptions): Promise<void> {
     model: process.env.AKEMON_CODEX_MODEL,
     sandbox: "workspace-write",
     taskLedgerDir: softwareAgentTaskLedgerDir(workdir, options.agentName),
+    contextSessionDir: softwareAgentContextSessionDir(workdir, options.agentName),
+    envPolicy: options.softwareAgentEnvPolicy,
+    envAllowlist: options.softwareAgentEnvAllowlist,
   });
 
   // Peripheral registry — Core routes by capability
@@ -816,6 +826,7 @@ export async function serve(options: ServeOptions): Promise<void> {
         req.origin,
         routing,
         req.taskId,
+        req.engineHints,
       );
       emitTokenUsage(prompt.length, response.length);
       return { success: true, response };

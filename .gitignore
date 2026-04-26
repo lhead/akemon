@@ -6,5 +6,6 @@ test-dist/
 dev/
 docs/
 .claude/
+.agents/
 .akemon/
 .cursor/

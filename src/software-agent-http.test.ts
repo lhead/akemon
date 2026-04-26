@@ -202,6 +202,7 @@ describe("software-agent HTTP endpoint", () => {
       memoryScope: "owner",
       riskLevel: "low",
       forbiddenActions: ["make network requests"],
+      contextSessionId: "project-alpha",
       timeoutMs: 5000,
     }, "owner-secret");
 
@@ -211,6 +212,7 @@ describe("software-agent HTTP endpoint", () => {
     const envelope = received as TaskEnvelope;
     assert.equal(envelope.goal, "inspect repo");
     assert.equal(envelope.riskLevel, "low");
+    assert.equal(envelope.contextSessionId, "project-alpha");
     assert.equal(envelope.timeoutMs, 5000);
     assert.match(envelope.memorySummary || "", /Akemon memory boundary/);
     assert.deepEqual(envelope.forbiddenActions, [
@@ -371,6 +373,8 @@ describe("software-agent HTTP endpoint", () => {
       {
         type: "end",
         taskId: "stream-task",
+        exitCode: 0,
+        durationMs: 7,
         result: {
           success: true,
           taskId: "stream-task",

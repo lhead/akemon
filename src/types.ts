@@ -103,6 +103,8 @@ export interface ComputeRequest {
   relay?: { http: string; agentName: string };
   /** Task origin for engine routing and concurrency control */
   origin?: import("./engine-routing.js").Origin;
+  /** Optional constraints for EngineRegistry selection. */
+  engineHints?: Omit<import("./engine-routing.js").EngineRouteRequest, "origin">;
 }
 
 /** Core → Module: compute result */

@@ -24,6 +24,7 @@ import { redactSecrets, StreamingRedactor } from "./redaction.js";
 export type MemoryScope = "none" | "public" | "task" | "owner";
 export type RoleScope = "owner" | "public" | "order" | "agent" | "system";
 export type RiskLevel = "low" | "medium" | "high";
+export type SoftwareAgentEnvPolicy = "inherit" | "allowlist";
 
 export interface TaskEnvelope {
   /** Stable task id for event log and Live Tasks stream */
@@ -50,6 +51,12 @@ export interface TaskEnvelope {
   forbiddenActions?: string[];
   /** Pre-filtered memory/context text. Must already respect roleScope. */
   memorySummary?: string;
+  /** Akemon-managed context session for cross-run continuity. Distinct from Codex transport session id. */
+  contextSessionId?: string;
+  /** Path to the Akemon-generated context packet for this task. */
+  contextPacketPath?: string;
+  /** Concise summary from the previous task in the same Akemon context session. */
+  previousTaskSummary?: string;
   /** Expected output shape */
   deliverable?: string;
   /** Optional hard timeout for this run */
@@ -93,6 +100,17 @@ export interface GitWorktreeStatus {
   error?: string;
 }
 
+export interface SoftwareAgentEnvironmentAudit {
+  policy: SoftwareAgentEnvPolicy;
+  allowedKeys?: string[];
+}
+
+export interface SoftwareAgentContextSessionAudit {
+  sessionId: string;
+  packetPath: string;
+  statePath: string;
+}
+
 export interface SoftwareAgentTaskRecord {
   schemaVersion: 1;
   taskId: string;
@@ -103,6 +121,8 @@ export interface SoftwareAgentTaskRecord {
   commandLine: string;
   envelope: TaskEnvelope;
   startedAt: string;
+  environment?: SoftwareAgentEnvironmentAudit;
+  contextSession?: SoftwareAgentContextSessionAudit;
   workdirStatus?: GitWorktreeStatus;
   updatedAt: string;
   completedAt?: string;
@@ -167,7 +187,11 @@ export interface CodexSoftwareAgentConfig {
   defaultTimeoutMs?: number;
   taskLedgerDir?: string;
   taskLedgerMaxRecords?: number;
+  contextSessionDir?: string;
   gitStatusImpl?: (workdir: string) => GitWorktreeStatus;
+  envPolicy?: SoftwareAgentEnvPolicy;
+  envAllowlist?: string[];
+  sourceEnv?: NodeJS.ProcessEnv;
 }
 
 const defaultTaskRelay: SoftwareTaskRelay = {
@@ -189,6 +213,37 @@ const RISK_LEVELS: RiskLevel[] = ["low", "medium", "high"];
 const MAX_STREAM_SUMMARY_CHARS = 12_000;
 const STREAM_SUMMARY_HEAD_CHARS = 4_000;
 const DEFAULT_TASK_LEDGER_MAX_RECORDS = 200;
+const CONTEXT_PACKET_FILENAME = "TASK_CONTEXT.md";
+const CONTEXT_SESSION_STATE_FILENAME = "SESSION.json";
+const MAX_CONTEXT_SESSION_ID_LENGTH = 120;
+const MAX_CONTEXT_SESSION_SUMMARY_CHARS = 4_000;
+const DEFAULT_SOFTWARE_AGENT_ENV_POLICY: SoftwareAgentEnvPolicy = "inherit";
+const DEFAULT_SOFTWARE_AGENT_ENV_ALLOWLIST = [
+  "PATH",
+  "HOME",
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "TEMP",
+  "TMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TERM",
+  "COLORTERM",
+  "NO_COLOR",
+  "FORCE_COLOR",
+  "OPENAI_API_KEY",
+  "OPENAI_BASE_URL",
+  "OPENAI_ORG_ID",
+  "OPENAI_ORGANIZATION",
+  "OPENAI_PROJECT",
+  "OPENAI_MODEL",
+  "CODEX_HOME",
+  "CODEX_MODEL",
+  "CODEX_PROFILE",
+] as const;
 
 export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
   id: string;
@@ -204,7 +259,11 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
   private sessionId = randomUUID();
 
   constructor(config: CodexSoftwareAgentConfig) {
-    this.config = config;
+    this.config = {
+      ...config,
+      envPolicy: normalizeSoftwareAgentEnvPolicy(config.envPolicy),
+      envAllowlist: normalizeSoftwareAgentEnvAllowlist(config.envAllowlist),
+    };
     this.id = config.id || "software-agent:codex";
     this.name = config.name || "Codex CLI Software Agent";
   }
@@ -251,6 +310,12 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       baseWorkdir: resolvePath(this.config.workdir),
       workdirStatus: this.collectWorkdirStatus(currentWorkdir),
       taskLedgerDir: this.config.taskLedgerDir,
+      contextSessionDir: this.config.contextSessionDir,
+      environment: buildSoftwareAgentChildEnvironment({
+        policy: this.config.envPolicy,
+        allowlist: this.config.envAllowlist,
+        sourceEnv: this.config.sourceEnv,
+      }).audit,
     };
   }
 
@@ -277,14 +342,21 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     const { signal, observer } = normalizeSoftwareAgentTaskOptions(taskOptions);
 
     const taskId = envelope.taskId || `sw_${Date.now()}_${randomUUID().slice(0, 8)}`;
+    const contextSessionId = normalizeContextSessionId(envelope.contextSessionId) || taskId;
     const workdirSafety = resolveWorkdirSafety(
       this.config.workdir,
       envelope.workdir || this.config.workdir,
       envelope.workdirSafety?.allowOutsideWorkdir || false,
     );
     const workdir = workdirSafety.effectiveWorkdir;
-    const effectiveEnvelope = { ...envelope, taskId, workdir, workdirSafety };
-    const prompt = buildTaskEnvelopePrompt(effectiveEnvelope);
+    let effectiveEnvelope: TaskEnvelope = { ...envelope, taskId, contextSessionId, workdir, workdirSafety };
+    const contextSession = this.config.contextSessionDir
+      ? writeSoftwareAgentContextPacket(this.config.contextSessionDir, effectiveEnvelope)
+      : undefined;
+    if (contextSession) effectiveEnvelope = contextSession.envelope;
+    const prompt = contextSession
+      ? buildContextPacketLaunchPrompt(effectiveEnvelope, contextSession.audit.packetPath)
+      : buildTaskEnvelopePrompt(effectiveEnvelope);
     const { cmd, args } = buildCodexExecCommand({
       command: this.config.command || "codex",
       workdir,
@@ -299,6 +371,11 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     const spawnImpl = this.config.spawnImpl || spawn;
     const timeoutMs = envelope.timeoutMs || this.config.defaultTimeoutMs || DEFAULT_TIMEOUT_MS;
     const workdirStatus = this.collectWorkdirStatus(workdir);
+    const childEnvironment = buildSoftwareAgentChildEnvironment({
+      policy: this.config.envPolicy,
+      allowlist: this.config.envAllowlist,
+      sourceEnv: this.config.sourceEnv,
+    });
 
     const baseTaskRecord = (): Omit<SoftwareAgentTaskRecord, "status" | "updatedAt"> => ({
       schemaVersion: 1,
@@ -309,6 +386,8 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       commandLine,
       envelope: effectiveEnvelope,
       startedAt: startedAtIso,
+      environment: childEnvironment.audit,
+      contextSession: contextSession?.audit,
       workdirStatus,
     });
 
@@ -335,7 +414,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       try {
         child = spawnImpl(cmd, args, {
           cwd: workdir,
-          env: process.env,
+          env: childEnvironment.env,
           stdio: ["pipe", "pipe", "pipe"],
           detached: true,
         });
@@ -365,6 +444,9 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           stdoutSummary: summarizeText(""),
           stderrSummary: summarizeText(result.error || ""),
         });
+        if (contextSession) {
+          writeSoftwareAgentContextSessionState(contextSession.audit.statePath, effectiveEnvelope, result, completedAt);
+        }
         this.bus?.emit(SIG.TASK_FAILED, sig(SIG.TASK_FAILED, result, this.id));
         resolve(result);
         return;
@@ -431,6 +513,9 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           stdoutSummary: summarizeText(stdout),
           stderrSummary: summarizeText(stderr),
         });
+        if (contextSession) {
+          writeSoftwareAgentContextSessionState(contextSession.audit.statePath, effectiveEnvelope, result, completedAt);
+        }
 
         this.bus?.emit(success ? SIG.TASK_COMPLETED : SIG.TASK_FAILED, sig(success ? SIG.TASK_COMPLETED : SIG.TASK_FAILED, {
           ...result,
@@ -543,6 +628,7 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
     "[Akemon Software Peripheral Task Envelope]",
     "",
     `Task ID: ${envelope.taskId || "(unspecified)"}`,
+    `Akemon context session: ${envelope.contextSessionId || "(one-shot)"}`,
     `Source module: ${envelope.sourceModule}`,
     `Purpose: ${envelope.purpose}`,
     `Role scope: ${envelope.roleScope}`,
@@ -550,6 +636,10 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
     `Risk level: ${envelope.riskLevel}`,
     `Workdir: ${envelope.workdir}`,
   ];
+
+  if (envelope.contextPacketPath) {
+    lines.push(`Context packet path: ${envelope.contextPacketPath}`);
+  }
 
   if (envelope.workdirSafety) {
     lines.push(`Base workdir: ${envelope.workdirSafety.baseWorkdir}`);
@@ -560,6 +650,12 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
   }
 
   lines.push("", "Goal:", envelope.goal, "");
+
+  if (envelope.previousTaskSummary?.trim()) {
+    lines.push("Previous task summary for this Akemon context session:");
+    lines.push(envelope.previousTaskSummary.trim());
+    lines.push("");
+  }
 
   if (envelope.memorySummary?.trim()) {
     lines.push("Visible Akemon memory/context:");
@@ -594,6 +690,27 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
   return lines.join("\n");
 }
 
+export function buildContextPacketLaunchPrompt(envelope: TaskEnvelope, contextPacketPath: string): string {
+  return [
+    "[Akemon Software Peripheral Task]",
+    "",
+    `Task ID: ${envelope.taskId || "(unspecified)"}`,
+    `Akemon context session: ${envelope.contextSessionId || "(one-shot)"}`,
+    `Context packet: ${contextPacketPath}`,
+    `Workdir: ${envelope.workdir}`,
+    "",
+    "Goal:",
+    envelope.goal,
+    "",
+    "Instructions:",
+    "- Read the context packet first before doing repository work.",
+    "- Treat that file as the complete Akemon-provided context for this task.",
+    "- Do not read Akemon private memory outside the context packet.",
+    "- Work only in the stated workdir unless the packet explicitly allows otherwise.",
+    "- Report what changed, what you verified, and any remaining risk.",
+  ].join("\n");
+}
+
 export function createOwnerTaskEnvelope(body: any, defaultWorkdir: string): TaskEnvelope {
   const goal = typeof body?.goal === "string" ? body.goal.trim() : "";
   if (!goal) throw new Error("Missing required string field: goal");
@@ -620,6 +737,7 @@ export function createOwnerTaskEnvelope(body: any, defaultWorkdir: string): Task
       : [...DEFAULT_OWNER_ALLOWED_ACTIONS],
     forbiddenActions: [...new Set([...DEFAULT_OWNER_FORBIDDEN_ACTIONS, ...callerForbiddenActions])],
     memorySummary: typeof body?.memorySummary === "string" ? body.memorySummary : "",
+    contextSessionId: readOptionalContextSessionId(body?.contextSessionId ?? body?.sessionId, "contextSessionId"),
     deliverable: typeof body?.deliverable === "string"
       ? body.deliverable
       : "Return a concise engineering summary with changes, verification, and remaining risks.",
@@ -773,11 +891,143 @@ export function pruneSoftwareAgentTaskRecords(
   }
 }
 
+export function buildSoftwareAgentChildEnvironment(opts: {
+  policy?: SoftwareAgentEnvPolicy;
+  allowlist?: string[];
+  sourceEnv?: NodeJS.ProcessEnv;
+} = {}): { env: NodeJS.ProcessEnv; audit: SoftwareAgentEnvironmentAudit } {
+  const policy = normalizeSoftwareAgentEnvPolicy(opts.policy);
+  const sourceEnv = opts.sourceEnv || process.env;
+
+  if (policy === "inherit") {
+    return {
+      env: sourceEnv,
+      audit: { policy },
+    };
+  }
+
+  const allowlist = normalizeSoftwareAgentEnvAllowlist([
+    ...DEFAULT_SOFTWARE_AGENT_ENV_ALLOWLIST,
+    ...(opts.allowlist || []),
+  ]);
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of allowlist) {
+    if (isForbiddenSoftwareAgentEnvKey(key)) continue;
+    const value = sourceEnv[key];
+    if (value !== undefined) env[key] = value;
+  }
+
+  return {
+    env,
+    audit: {
+      policy,
+      allowedKeys: Object.keys(env).sort(),
+    },
+  };
+}
+
+function writeSoftwareAgentContextPacket(
+  contextSessionDir: string,
+  envelope: TaskEnvelope,
+): { envelope: TaskEnvelope; audit: SoftwareAgentContextSessionAudit } {
+  const sessionId = normalizeContextSessionId(envelope.contextSessionId) || envelope.taskId || randomUUID();
+  const sessionDir = join(contextSessionDir, sessionId);
+  const packetPath = join(sessionDir, CONTEXT_PACKET_FILENAME);
+  const statePath = join(sessionDir, CONTEXT_SESSION_STATE_FILENAME);
+  const previousTaskSummary = readSoftwareAgentContextSessionSummary(statePath);
+  const packetEnvelope: TaskEnvelope = {
+    ...envelope,
+    contextSessionId: sessionId,
+    contextPacketPath: packetPath,
+    previousTaskSummary,
+  };
+
+  mkdirSync(sessionDir, { recursive: true });
+  const content = buildTaskEnvelopePrompt(packetEnvelope);
+  writeFileSync(packetPath, `${redactSecrets(content)}\n`);
+
+  return {
+    envelope: packetEnvelope,
+    audit: { sessionId, packetPath, statePath },
+  };
+}
+
+function writeSoftwareAgentContextSessionState(
+  statePath: string,
+  envelope: TaskEnvelope,
+  result: SoftwareAgentResult,
+  updatedAt: string,
+): void {
+  try {
+    const state = {
+      schemaVersion: 1,
+      sessionId: envelope.contextSessionId,
+      updatedAt,
+      lastTaskId: result.taskId,
+      lastGoal: envelope.goal,
+      lastResult: {
+        success: result.success,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+        outputSummary: summarizeText(result.output || "", MAX_CONTEXT_SESSION_SUMMARY_CHARS),
+        errorSummary: result.error ? summarizeText(result.error, MAX_CONTEXT_SESSION_SUMMARY_CHARS) : undefined,
+      },
+    };
+    writeFileSync(statePath, `${JSON.stringify(redactSecrets(state), null, 2)}\n`);
+  } catch (err: any) {
+    console.error(`[software-agent] Failed to write context session state: ${err.message || String(err)}`);
+  }
+}
+
+function readSoftwareAgentContextSessionSummary(statePath: string): string | undefined {
+  try {
+    if (!existsSync(statePath)) return undefined;
+    const parsed = JSON.parse(readFileSync(statePath, "utf8"));
+    if (!parsed || parsed.schemaVersion !== 1 || !parsed.lastTaskId || !parsed.lastResult) return undefined;
+    const result = parsed.lastResult;
+    const status = result.success === true ? "completed" : "failed";
+    const lines = [
+      `Previous task: ${parsed.lastTaskId}`,
+      parsed.lastGoal ? `Previous goal: ${parsed.lastGoal}` : "",
+      `Status: ${status}`,
+      Number.isInteger(result.exitCode) ? `Exit code: ${result.exitCode}` : "Exit code: null",
+      Number.isInteger(result.durationMs) ? `Duration: ${result.durationMs}ms` : "",
+      result.outputSummary?.text ? "Previous output summary:" : "",
+      result.outputSummary?.text || "",
+      result.errorSummary?.text ? "Previous error summary:" : "",
+      result.errorSummary?.text || "",
+    ].filter(Boolean);
+    const summary = lines.join("\n").trim();
+    return summary ? summarizeText(summary, MAX_CONTEXT_SESSION_SUMMARY_CHARS).text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function readOptionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "string") throw new Error(`Invalid ${field}: expected string`);
   const trimmed = value.trim();
   return trimmed || undefined;
+}
+
+function readOptionalContextSessionId(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string") throw new Error(`Invalid ${field}: expected string`);
+  return normalizeContextSessionId(value, field);
+}
+
+function normalizeContextSessionId(value: string | undefined, field = "contextSessionId"): string | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > MAX_CONTEXT_SESSION_ID_LENGTH) {
+    throw new Error(`Invalid ${field}: expected at most ${MAX_CONTEXT_SESSION_ID_LENGTH} characters`);
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(trimmed)) {
+    throw new Error(`Invalid ${field}: expected letters, numbers, dot, underscore, or hyphen`);
+  }
+  return trimmed;
 }
 
 function normalizeSoftwareAgentTaskOptions(
@@ -788,6 +1038,36 @@ function normalizeSoftwareAgentTaskOptions(
     return { signal: options };
   }
   return options;
+}
+
+function normalizeSoftwareAgentEnvPolicy(value: unknown): SoftwareAgentEnvPolicy {
+  if (value === undefined || value === null || value === "") return DEFAULT_SOFTWARE_AGENT_ENV_POLICY;
+  if (value === "inherit" || value === "allowlist") return value;
+  throw new Error("Invalid software-agent env policy: expected inherit or allowlist");
+}
+
+function normalizeSoftwareAgentEnvAllowlist(values: readonly string[] | undefined): string[] {
+  if (!values) return [];
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== "string") {
+      throw new Error("Invalid software-agent env allowlist entry: expected string");
+    }
+    const key = value.trim();
+    if (!key) continue;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new Error(`Invalid software-agent env allowlist entry: ${key}`);
+    }
+    seen.add(key);
+  }
+  return [...seen];
+}
+
+function isForbiddenSoftwareAgentEnvKey(key: string): boolean {
+  const upper = key.toUpperCase();
+  if (upper.startsWith("AKEMON_")) return true;
+  const looksLikeCredential = /(?:SECRET|TOKEN|ACCESS|KEY|CREDENTIAL)/.test(upper);
+  return looksLikeCredential && (upper.includes("RELAY") || upper.includes("OWNER"));
 }
 
 function isAbortSignal(value: unknown): value is AbortSignal {

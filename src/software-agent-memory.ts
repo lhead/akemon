@@ -26,14 +26,6 @@ const OWNER_MEMORY_EXCLUDE_TERMS = [
   "bio",
 ];
 
-const OWNER_MEMORY_EXCLUDE_CJK_TERMS = [
-  "全部记忆",
-  "个人",
-  "笔记",
-  "日记",
-  "状态",
-];
-
 export async function buildSoftwareAgentMemorySummary(opts: SoftwareAgentMemoryBuildOptions): Promise<string> {
   const budget = opts.contextBudget ?? DEFAULT_CONTEXT_BUDGET;
   const parts: string[] = [
@@ -150,8 +142,7 @@ async function resolveRoleMemoryPolicy(
 function roleExcludesOwnerMemory(policy: RoleMemoryPolicy): boolean {
   return policy.exclude.some((item) => {
     const normalized = item.toLowerCase();
-    return OWNER_MEMORY_EXCLUDE_TERMS.some((term) => normalized.includes(term))
-      || OWNER_MEMORY_EXCLUDE_CJK_TERMS.some((term) => item.includes(term));
+    return OWNER_MEMORY_EXCLUDE_TERMS.some((term) => normalized.includes(term));
   });
 }
 
