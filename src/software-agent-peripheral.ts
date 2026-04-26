@@ -19,7 +19,7 @@ import { StringDecoder } from "string_decoder";
 import type { EventBus, Peripheral, Signal } from "./types.js";
 import { SIG, sig } from "./types.js";
 import { sendTaskEnd, sendTaskStart, sendTaskStream } from "./relay-client.js";
-import { redactSecrets, redactText } from "./redaction.js";
+import { redactSecrets, StreamingRedactor } from "./redaction.js";
 
 export type MemoryScope = "none" | "public" | "task" | "owner";
 export type RoleScope = "owner" | "public" | "order" | "agent" | "system";
@@ -375,6 +375,13 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       let aborted = false;
       const outDecoder = new StringDecoder("utf8");
       const errDecoder = new StringDecoder("utf8");
+      const outRedactor = new StreamingRedactor();
+      const errRedactor = new StreamingRedactor();
+      const emitSafeStream = (stream: "stdout" | "stderr", text: string) => {
+        if (!text) return;
+        relay.sendTaskStream(taskId, stream, text);
+        observer?.onStream?.({ taskId, stream, chunk: text });
+      };
 
       const finish = (exitCode: number | null, error?: string) => {
         if (finished) return;
@@ -385,16 +392,14 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         const tailErr = errDecoder.end();
         if (tailOut) {
           stdout += tailOut;
-          const safeTailOut = redactText(tailOut);
-          relay.sendTaskStream(taskId, "stdout", safeTailOut);
-          observer?.onStream?.({ taskId, stream: "stdout", chunk: safeTailOut });
+          emitSafeStream("stdout", outRedactor.push(tailOut));
         }
         if (tailErr) {
           stderr += tailErr;
-          const safeTailErr = redactText(tailErr);
-          relay.sendTaskStream(taskId, "stderr", safeTailErr);
-          observer?.onStream?.({ taskId, stream: "stderr", chunk: safeTailErr });
+          emitSafeStream("stderr", errRedactor.push(tailErr));
         }
+        emitSafeStream("stdout", outRedactor.flush());
+        emitSafeStream("stderr", errRedactor.flush());
         const durationMs = Date.now() - startedAt;
         this.activeChild = null;
         this.activeTaskId = null;
@@ -462,18 +467,14 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         const text = outDecoder.write(chunk);
         if (!text) return;
         stdout += text;
-        const safeText = redactText(text);
-        relay.sendTaskStream(taskId, "stdout", safeText);
-        observer?.onStream?.({ taskId, stream: "stdout", chunk: safeText });
+        emitSafeStream("stdout", outRedactor.push(text));
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
         const text = errDecoder.write(chunk);
         if (!text) return;
         stderr += text;
-        const safeText = redactText(text);
-        relay.sendTaskStream(taskId, "stderr", safeText);
-        observer?.onStream?.({ taskId, stream: "stderr", chunk: safeText });
+        emitSafeStream("stderr", errRedactor.push(text));
       });
 
       child.on("close", (code) => {

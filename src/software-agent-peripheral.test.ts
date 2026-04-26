@@ -391,7 +391,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
     }
   });
 
-  it("redacts secrets from streamed chunks and task ledger records", async () => {
+  it("redacts secrets split across streamed chunks and task ledger records", async () => {
     const tmpDir = await mkdtemp(join(tmpdir(), "akemon-software-agent-redaction-"));
     try {
       const spawnedChild = createFakeChild();
@@ -423,8 +423,10 @@ describe("CodexSoftwareAgentPeripheral", () => {
         },
       });
 
-      spawnedChild.stdout?.emit("data", Buffer.from(`result OPENAI_API_KEY=${apiKey}`));
-      spawnedChild.stderr?.emit("data", Buffer.from(`Authorization: Bearer ${apiKey}`));
+      spawnedChild.stdout?.emit("data", Buffer.from("result OPENAI_API_KEY=sk-123456789012"));
+      spawnedChild.stdout?.emit("data", Buffer.from("345678901234"));
+      spawnedChild.stderr?.emit("data", Buffer.from("Authorization: Bearer sk-123456789012"));
+      spawnedChild.stderr?.emit("data", Buffer.from("345678901234"));
       spawnedChild.emit("close", 0);
 
       await run;
@@ -434,6 +436,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.doesNotMatch(observerChunks.join(""), new RegExp(apiKey));
       assert.doesNotMatch(recordText, new RegExp(apiKey));
       assert.match(recordText, /\[REDACTED\]/);
+      assert.match(relayChunks.join(""), /\[REDACTED\]/);
     } finally {
       await rm(tmpDir, { recursive: true, force: true });
     }

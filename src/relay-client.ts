@@ -2,7 +2,7 @@ import WebSocket from "ws";
 import http from "http";
 import { RelayCredentials } from "./config.js";
 import { getMetrics, updateMetrics } from "./metrics.js";
-import { redactText } from "./redaction.js";
+import { redactText, StreamingRedactor } from "./redaction.js";
 
 const DEFAULT_RELAY_URL = "wss://relay.akemon.dev";
 
@@ -61,6 +61,7 @@ export interface RelayClientOptions {
 // Pending agent_call results (callId → resolve function)
 const pendingAgentCalls = new Map<string, (result: string) => void>();
 let relayWsRef: WebSocket | null = null;
+const taskStreamRedactors = new Map<string, StreamingRedactor>();
 
 function sendRelayMessage(msg: RelayMessage): void {
   if (!relayWsRef || relayWsRef.readyState !== WebSocket.OPEN) return;
@@ -152,6 +153,7 @@ export function callAgent(target: string, task: string): Promise<string> {
 }
 
 export function sendTaskStart(taskId: string, origin: string | undefined, cmd: string): void {
+  clearTaskStreamRedactors(taskId);
   sendRelayMessage({
     type: "task_start",
     task_id: taskId,
@@ -161,20 +163,54 @@ export function sendTaskStart(taskId: string, origin: string | undefined, cmd: s
 }
 
 export function sendTaskStream(taskId: string, stream: "stdout" | "stderr", chunk: string): void {
+  const safeChunk = taskStreamRedactor(taskId, stream).push(chunk);
+  if (!safeChunk) return;
   sendRelayMessage({
     type: "task_stream",
     task_id: taskId,
     stream,
-    chunk: redactText(chunk),
+    chunk: safeChunk,
   });
 }
 
 export function sendTaskEnd(taskId: string, exitCode: number | null, durationMs: number): void {
+  flushTaskStreamRedactor(taskId, "stdout");
+  flushTaskStreamRedactor(taskId, "stderr");
   sendRelayMessage({
     type: "task_end",
     task_id: taskId,
     exit_code: exitCode,
     duration_ms: durationMs,
+  });
+}
+
+function clearTaskStreamRedactors(taskId: string): void {
+  taskStreamRedactors.delete(`${taskId}:stdout`);
+  taskStreamRedactors.delete(`${taskId}:stderr`);
+}
+
+function taskStreamRedactor(taskId: string, stream: "stdout" | "stderr"): StreamingRedactor {
+  const key = `${taskId}:${stream}`;
+  let redactor = taskStreamRedactors.get(key);
+  if (!redactor) {
+    redactor = new StreamingRedactor();
+    taskStreamRedactors.set(key, redactor);
+  }
+  return redactor;
+}
+
+function flushTaskStreamRedactor(taskId: string, stream: "stdout" | "stderr"): void {
+  const key = `${taskId}:${stream}`;
+  const redactor = taskStreamRedactors.get(key);
+  if (!redactor) return;
+  const safeChunk = redactor.flush();
+  taskStreamRedactors.delete(key);
+  if (!safeChunk) return;
+  sendRelayMessage({
+    type: "task_stream",
+    task_id: taskId,
+    stream,
+    chunk: safeChunk,
   });
 }
 

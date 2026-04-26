@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isSensitiveKey, redactSecrets, redactText } from "./redaction.js";
+import { isSensitiveKey, redactSecrets, redactText, StreamingRedactor } from "./redaction.js";
 
 const OPENAI_KEY = "sk-123456789012345678901234";
 const GITHUB_TOKEN = "ghp_123456789012345678901234567890123456";
@@ -50,5 +50,50 @@ describe("redaction", () => {
     assert.equal(isSensitiveKey("rawApiKey"), true);
     assert.equal(isSensitiveKey("tokenLimit"), false);
     assert.equal(isSensitiveKey("tokensToday"), false);
+  });
+
+  it("streams ordinary chunks without buffering", () => {
+    const redactor = new StreamingRedactor();
+
+    assert.equal(redactor.push("hello "), "hello ");
+    assert.equal(redactor.push("world\n"), "world\n");
+    assert.equal(redactor.flush(), "");
+  });
+
+  it("redacts secret assignments split across stream chunks", () => {
+    const redactor = new StreamingRedactor();
+    const output = [
+      redactor.push("before OPENAI_API_KEY=sk-123456789012"),
+      redactor.push("345678901234 after\n"),
+      redactor.flush(),
+    ].join("");
+
+    assert.doesNotMatch(output, /sk-123456789012345678901234/);
+    assert.match(output, /before OPENAI_API_KEY=\[REDACTED\] after/);
+  });
+
+  it("holds and redacts bare known tokens split across stream chunks", () => {
+    const redactor = new StreamingRedactor();
+    const output = [
+      redactor.push("token sk-123456789012"),
+      redactor.push("345678901234\n"),
+      redactor.flush(),
+    ].join("");
+
+    assert.doesNotMatch(output, /sk-123456789012345678901234/);
+    assert.match(output, /token \[REDACTED\]/);
+  });
+
+  it("holds and redacts private key blocks split across stream chunks", () => {
+    const redactor = new StreamingRedactor();
+    const output = [
+      redactor.push("key -----BEGIN PRIVATE KEY-----\nabc123"),
+      redactor.push("\n-----END PRIVATE KEY-----\n"),
+      redactor.flush(),
+    ].join("");
+
+    assert.doesNotMatch(output, /BEGIN PRIVATE KEY/);
+    assert.doesNotMatch(output, /abc123/);
+    assert.match(output, /key \[REDACTED\]/);
   });
 });

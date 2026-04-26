@@ -35,6 +35,69 @@ const SENSITIVE_KEY_NAMES = new Set([
   "privatekey",
 ]);
 
+export interface StreamingRedactorOptions {
+  maxBufferedChars?: number;
+}
+
+const DEFAULT_MAX_BUFFERED_CHARS = 8192;
+const SECRET_TERMINATOR_RE = /[\s"',}\])>]$/;
+const POTENTIAL_SECRET_TAIL_PATTERNS: RegExp[] = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*$/i,
+  /(?:^|[\s{,])["']?[A-Za-z0-9_.-]*(?:secret|token|password|passwd|pwd|api[_-]?key|access[_-]?key|private[_-]?key|credential)s?["']?\s*[:=]\s*["']?[^"',\s})]*$/i,
+  /\b(?:Authorization\s*:\s*)?(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]*$/i,
+  /\b(?:sk-ant-|sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|npm_|xox[baprs]-)[A-Za-z0-9._~+/=-]*$/i,
+  /\b(?:AKIA|ASIA)[0-9A-Z]*$/i,
+  /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/i,
+  /\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*$/i,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]*$/i,
+];
+
+export class StreamingRedactor {
+  private pending = "";
+  private readonly maxBufferedChars: number;
+
+  constructor(options: StreamingRedactorOptions = {}) {
+    this.maxBufferedChars = normalizePositiveInt(options.maxBufferedChars, DEFAULT_MAX_BUFFERED_CHARS);
+  }
+
+  push(chunk: string): string {
+    if (!chunk) return "";
+    this.pending += chunk;
+
+    const redacted = redactText(this.pending);
+    if (redacted !== this.pending) {
+      if (SECRET_TERMINATOR_RE.test(this.pending) || this.pending.length > this.maxBufferedChars) {
+        this.pending = "";
+        return redacted;
+      }
+      return "";
+    }
+
+    const holdStart = findPotentialSecretTailStart(this.pending);
+    if (holdStart >= 0) {
+      const output = this.pending.slice(0, holdStart);
+      const held = this.pending.slice(holdStart);
+      if (held.length > this.maxBufferedChars) {
+        this.pending = "";
+        return `${redactText(output)}${REDACTION}`;
+      }
+      this.pending = held;
+      return redactText(output);
+    }
+
+    const output = this.pending;
+    this.pending = "";
+    return output;
+  }
+
+  flush(): string {
+    if (!this.pending) return "";
+    const output = redactText(this.pending);
+    this.pending = "";
+    return output;
+  }
+}
+
 export function redactText(text: string): string {
   let redacted = text;
   redacted = redacted.replace(PRIVATE_KEY_BLOCK_RE, REDACTION);
@@ -97,4 +160,20 @@ function redactValue(value: unknown, seen: WeakMap<object, unknown>, key: string
 function isPlainObject(value: object): value is Record<string, unknown> {
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
+}
+
+function findPotentialSecretTailStart(text: string): number {
+  let start = -1;
+  for (const pattern of POTENTIAL_SECRET_TAIL_PATTERNS) {
+    pattern.lastIndex = 0;
+    const match = pattern.exec(text);
+    if (match?.index !== undefined && (start < 0 || match.index < start)) {
+      start = match.index;
+    }
+  }
+  return start;
+}
+
+function normalizePositiveInt(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 }
