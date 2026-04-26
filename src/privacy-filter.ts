@@ -122,22 +122,23 @@ async function runOpfCli(text: string, options: PrivacyFilterOptions, env: NodeJ
   );
   const device = options.device || env.AKEMON_OPF_DEVICE;
   const checkpoint = options.checkpoint || env.AKEMON_OPF_CHECKPOINT;
-  const args = buildOpfArgs(text, { device, checkpoint });
+  const args = buildOpfArgs({ device, checkpoint });
   const spawnImpl = options.spawnImpl || spawn;
 
   const stdout = await collectChildOutput(
     spawnImpl(command, args, {
       env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     }),
+    text,
     timeoutMs,
     maxBufferBytes,
   );
 
-  return parseOpfRedactedText(stdout);
+  return parseOpfRedactedText(stdout, text);
 }
 
-function buildOpfArgs(text: string, options: { device?: string; checkpoint?: string }): string[] {
+function buildOpfArgs(options: { device?: string; checkpoint?: string }): string[] {
   const args = [
     "redact",
     "--format",
@@ -151,11 +152,15 @@ function buildOpfArgs(text: string, options: { device?: string; checkpoint?: str
 
   if (options.device) args.push("--device", options.device);
   if (options.checkpoint) args.push("--checkpoint", options.checkpoint);
-  args.push(text);
   return args;
 }
 
-function collectChildOutput(child: ChildProcess, timeoutMs: number, maxBufferBytes: number): Promise<string> {
+function collectChildOutput(
+  child: ChildProcess,
+  inputText: string,
+  timeoutMs: number,
+  maxBufferBytes: number,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     let stdout = "";
     let stderr = "";
@@ -208,17 +213,99 @@ function collectChildOutput(child: ChildProcess, timeoutMs: number, maxBufferByt
       }
       resolve(stdout);
     });
+
+    if (!child.stdin) {
+      fail(new PrivacyFilterUnavailableError("OPF stdin was not available"));
+      return;
+    }
+    child.stdin.on("error", fail);
+    child.stdin.end(inputText.endsWith("\n") ? inputText : `${inputText}\n`);
   });
 }
 
-function parseOpfRedactedText(stdout: string): string {
-  let parsed: unknown;
+function parseOpfRedactedText(stdout: string, originalText: string): string {
+  const records = parseOpfJsonRecords(stdout);
+  const redactedLines: string[] = [];
+  for (const record of records) {
+    const redacted = readOpfRedactedText(record);
+    redactedLines.push(redacted);
+  }
+
+  const lines = originalText.split(/\r?\n/);
+  if (lines.filter((line) => line.trim()).length > 1) {
+    let redactedIndex = 0;
+    return lines.map((line) => {
+      if (!line.trim()) return line;
+      return redactedLines[redactedIndex++] ?? line;
+    }).join("\n");
+  }
+
+  return redactedLines[0] ?? "";
+}
+
+function parseOpfJsonRecords(stdout: string): unknown[] {
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    throw new PrivacyFilterUnavailableError("OPF returned empty output");
+  }
+
   try {
-    parsed = JSON.parse(stdout);
+    return [JSON.parse(trimmed)];
+  } catch {}
+
+  const chunks = splitConcatenatedJsonObjects(trimmed);
+  if (!chunks.length) {
+    throw new PrivacyFilterUnavailableError("OPF did not return valid JSON");
+  }
+  try {
+    return chunks.map((chunk) => JSON.parse(chunk));
   } catch (error) {
     throw new PrivacyFilterUnavailableError("OPF did not return valid JSON", { cause: error });
   }
+}
 
+function splitConcatenatedJsonObjects(text: string): string[] {
+  const chunks: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+    if (char === "{") {
+      if (depth === 0) start = i;
+      depth += 1;
+      continue;
+    }
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0 && start >= 0) {
+        chunks.push(text.slice(start, i + 1));
+        start = -1;
+      }
+    }
+  }
+
+  return depth === 0 && !inString ? chunks : [];
+}
+
+function readOpfRedactedText(parsed: unknown): string {
   if (!parsed || typeof parsed !== "object") {
     throw new PrivacyFilterUnavailableError("OPF JSON output was not an object");
   }

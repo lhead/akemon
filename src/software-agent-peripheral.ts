@@ -188,7 +188,6 @@ const MEMORY_SCOPES: MemoryScope[] = ["none", "public", "task", "owner"];
 const RISK_LEVELS: RiskLevel[] = ["low", "medium", "high"];
 const MAX_STREAM_SUMMARY_CHARS = 12_000;
 const STREAM_SUMMARY_HEAD_CHARS = 4_000;
-const STREAM_SUMMARY_TAIL_CHARS = 8_000;
 const DEFAULT_TASK_LEDGER_MAX_RECORDS = 200;
 
 export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
@@ -226,10 +225,12 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
   }
 
   async resetSession(): Promise<void> {
-    if (this.activeChild?.pid) {
-      try { process.kill(-this.activeChild.pid, "SIGTERM"); } catch {}
+    const activePid = this.activeChild?.pid;
+    if (activePid) {
+      const processGroupId = -activePid;
+      try { process.kill(processGroupId, "SIGTERM"); } catch {}
       setTimeout(() => {
-        try { process.kill(-this.activeChild!.pid!, "SIGKILL"); } catch {}
+        try { process.kill(processGroupId, "SIGKILL"); } catch {}
       }, 3000).unref();
     }
     this.activeChild = null;

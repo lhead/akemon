@@ -2,6 +2,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { exec } from "child_process";
 import { scanAndKillOrphans } from "./orphan-scan.js";
+import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
 import { createInterface } from "readline";
 import { mkdir } from "fs/promises";
@@ -104,8 +105,20 @@ function bearerToken(req: IncomingMessage): string | null {
 
 function isOwnerRequest(req: IncomingMessage, options: Pick<ServeOptions, "secretKey" | "key">): boolean {
   const token = bearerToken(req);
-  const validTokens = [options.secretKey, options.key].filter(Boolean);
-  return !!token && validTokens.includes(token);
+  const validTokens = [options.secretKey, options.key]
+    .filter((validToken): validToken is string => typeof validToken === "string" && validToken.length > 0);
+  return !!token && validTokens.some((validToken) => constantTimeTokenEqual(token, validToken));
+}
+
+function constantTimeTokenEqual(left: string, right: string): boolean {
+  const leftBuffer = Buffer.from(left);
+  const rightBuffer = Buffer.from(right);
+  const length = Math.max(leftBuffer.length, rightBuffer.length, 1);
+  const leftPadded = Buffer.alloc(length);
+  const rightPadded = Buffer.alloc(length);
+  leftBuffer.copy(leftPadded);
+  rightBuffer.copy(rightPadded);
+  return timingSafeEqual(leftPadded, rightPadded) && leftBuffer.length === rightBuffer.length;
 }
 
 function writeJsonResponse(res: ServerResponse, statusCode: number, body: unknown, pretty = false): void {
@@ -204,7 +217,7 @@ export async function handleSoftwareAgentRunHttp(
 
   try {
     const result = await softwareAgent.sendTask(envelope);
-    writeJsonResponse(res, result.success ? 200 : 500, redactSecrets(result), true);
+    writeJsonResponse(res, 200, redactSecrets(result), true);
   } catch (err: any) {
     const busy = String(err.message || "").includes("busy");
     writeJsonResponse(res, busy ? 409 : 500, { error: err.message || String(err) });

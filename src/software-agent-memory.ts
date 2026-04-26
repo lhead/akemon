@@ -17,6 +17,23 @@ interface RoleMemoryPolicy {
   exclude: string[];
 }
 
+const OWNER_MEMORY_EXCLUDE_TERMS = [
+  "owner",
+  "private",
+  "personal",
+  "note",
+  "diary",
+  "bio",
+];
+
+const OWNER_MEMORY_EXCLUDE_CJK_TERMS = [
+  "全部记忆",
+  "个人",
+  "笔记",
+  "日记",
+  "状态",
+];
+
 export async function buildSoftwareAgentMemorySummary(opts: SoftwareAgentMemoryBuildOptions): Promise<string> {
   const budget = opts.contextBudget ?? DEFAULT_CONTEXT_BUDGET;
   const parts: string[] = [
@@ -133,17 +150,8 @@ async function resolveRoleMemoryPolicy(
 function roleExcludesOwnerMemory(policy: RoleMemoryPolicy): boolean {
   return policy.exclude.some((item) => {
     const normalized = item.toLowerCase();
-    return normalized.includes("owner")
-      || normalized.includes("private")
-      || normalized.includes("personal")
-      || normalized.includes("note")
-      || normalized.includes("diary")
-      || normalized.includes("bio")
-      || normalized.includes("全部记忆")
-      || normalized.includes("个人")
-      || normalized.includes("笔记")
-      || normalized.includes("日记")
-      || normalized.includes("状态");
+    return OWNER_MEMORY_EXCLUDE_TERMS.some((term) => normalized.includes(term))
+      || OWNER_MEMORY_EXCLUDE_CJK_TERMS.some((term) => item.includes(term));
   });
 }
 

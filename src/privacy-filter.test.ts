@@ -10,11 +10,13 @@ const OPENAI_KEY = "sk-123456789012345678901234";
 interface SpawnCapture {
   command?: string;
   args?: string[];
+  stdin?: string;
   calls: number;
 }
 
 function createFakeChild(): ChildProcess {
   const child = new EventEmitter() as EventEmitter & ChildProcess;
+  child.stdin = new PassThrough();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   child.kill = () => true;
@@ -33,6 +35,9 @@ function fakeSpawn(
     capture.args = [...(args || [])];
 
     const child = createFakeChild();
+    child.stdin?.on("data", (chunk: Buffer | string) => {
+      capture.stdin = `${capture.stdin || ""}${Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk}`;
+    });
     queueMicrotask(() => {
       child.stdout?.emit("data", Buffer.from(stdout));
       if (stderr) child.stderr?.emit("data", Buffer.from(stderr));
@@ -84,8 +89,28 @@ describe("sanitizeText", () => {
     assert.ok(capture.args?.includes("cpu"));
     assert.ok(capture.args?.includes("--checkpoint"));
     assert.ok(capture.args?.includes("/tmp/opf-checkpoint"));
-    assert.doesNotMatch(capture.args?.at(-1) || "", new RegExp(OPENAI_KEY));
-    assert.match(capture.args?.at(-1) || "", /\[REDACTED\]/);
+    assert.equal(capture.args?.some((arg) => arg.includes("Alice")), false);
+    assert.equal(capture.args?.some((arg) => arg.includes("[REDACTED]")), false);
+    assert.doesNotMatch(capture.stdin || "", new RegExp(OPENAI_KEY));
+    assert.match(capture.stdin || "", /Alice has OPENAI_API_KEY=\[REDACTED\]\n/);
+  });
+
+  it("reconstructs multi-line OPF stdin output from concatenated JSON records", async () => {
+    const capture: SpawnCapture = { calls: 0 };
+    const stdout = [
+      JSON.stringify({ redacted_text: "[NAME] first line" }),
+      JSON.stringify({ redacted_text: "[NAME] second line" }),
+    ].join("\n");
+
+    const result = await sanitizeText("Alice first line\n\nBob second line", {
+      mode: "pii",
+      backend: "opf",
+      spawnImpl: fakeSpawn(stdout, "", 0, capture),
+    });
+
+    assert.equal(result.opfApplied, true);
+    assert.equal(result.text, "[NAME] first line\n\n[NAME] second line");
+    assert.equal(capture.stdin, "Alice first line\n\nBob second line\n");
   });
 
   it("falls back to built-in redaction when OPF fails in pii mode", async () => {

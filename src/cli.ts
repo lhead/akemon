@@ -175,7 +175,7 @@ function handleSoftwareAgentStreamLine(line: string): boolean {
     event = JSON.parse(trimmed);
   } catch {
     process.stderr.write(`${trimmed}\n`);
-    return true;
+    return false;
   }
 
   if (event.type === "start" && event.taskId) {

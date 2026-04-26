@@ -220,6 +220,24 @@ describe("software-agent HTTP endpoint", () => {
     ]);
   });
 
+  it("returns task failures as a completed HTTP response", async () => {
+    const res = await callSoftwareAgentEndpoint({
+      async sendTask(envelope) {
+        return {
+          ...successResult(envelope),
+          success: false,
+          output: "",
+          error: "tests failed",
+          exitCode: 1,
+        };
+      },
+    }, { goal: "inspect repo" }, "owner-secret");
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.success, false);
+    assert.equal(res.body.error, "tests failed");
+  });
+
   it("rejects software-agent workdirs outside the serve workdir by default", async () => {
     let calls = 0;
     const res = await callSoftwareAgentEndpoint({

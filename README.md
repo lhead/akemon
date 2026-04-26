@@ -175,6 +175,8 @@ Current Batch 5 status: the Codex integration uses `codex exec` as a one-shot ba
 
 Software-agent tasks default to the `akemon serve` workdir boundary. Use `--allow-outside-workdir` only when you explicitly want the software agent to run outside that root. Each run is recorded under `.akemon/agents/<name>/software-agent/tasks/` with the envelope, result, output summaries, and git worktree status.
 
+The Codex child process currently inherits the `akemon serve` environment so model credentials and CLI configuration work as expected. Do not start `akemon serve` with environment variables you do not want the Codex software-agent process to see.
+
 Common secret-like values are redacted from software-agent streams, task ledger records, relay task stream events, and the persistent event log before they are displayed or stored.
 
 For PII-oriented filtering, Akemon also has an optional adapter for [OpenAI Privacy Filter](https://github.com/openai/privacy-filter). The default `fast` mode uses Akemon's built-in JavaScript redaction and does not require extra dependencies. To use OPF, install the external `opf` Python CLI yourself, then opt in explicitly:
