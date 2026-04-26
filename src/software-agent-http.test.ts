@@ -79,7 +79,6 @@ async function callSoftwareAgentStatusEndpoint(
 
 async function callSoftwareAgentStreamEndpoint(
   softwareAgent: {
-    getState(): Record<string, unknown>;
     sendTask(envelope: TaskEnvelope, options?: SoftwareAgentTaskOptions): Promise<SoftwareAgentResult>;
   } | null,
   body: unknown,
@@ -282,7 +281,6 @@ describe("software-agent HTTP endpoint", () => {
   it("streams owner-only software-agent task events as ndjson", async () => {
     let received: TaskEnvelope | null = null;
     const res = await callSoftwareAgentStreamEndpoint({
-      getState: () => ({ id: "software-agent:codex", busy: false }),
       async sendTask(envelope, options) {
         received = envelope;
         const taskId = envelope.taskId || "stream-task";
@@ -334,17 +332,16 @@ describe("software-agent HTTP endpoint", () => {
   it("rejects run-stream before streaming when the software agent is busy", async () => {
     let calls = 0;
     const res = await callSoftwareAgentStreamEndpoint({
-      getState: () => ({ id: "software-agent:codex", busy: true }),
-      async sendTask(envelope) {
+      async sendTask() {
         calls++;
-        return successResult(envelope);
+        throw new Error("Software agent busy (task=existing)");
       },
     }, { goal: "inspect repo" }, "owner-secret");
 
     assert.equal(res.statusCode, 409);
     assert.match(JSON.parse(res.body).error, /busy/);
     assert.equal(res.events.length, 0);
-    assert.equal(calls, 0);
+    assert.equal(calls, 1);
   });
 
   it("returns owner-only software-agent status", async () => {

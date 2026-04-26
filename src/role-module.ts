@@ -23,7 +23,7 @@ export interface RoleDef {
   description: string;    // first non-heading paragraph after #
   triggers: string[];     // trigger:xxx tags
   include: string[];      // context include declarations
-  exclude: string[];      // context exclude declarations (v1: declarative, not enforced)
+  exclude: string[];      // context exclude declarations
   customRules: string;    // content outside ## 激活 and ## 上下文范围
   raw: string;            // full md content
 }

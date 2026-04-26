@@ -130,6 +130,56 @@ describe("buildSoftwareAgentMemorySummary", () => {
       await fixture.cleanup();
     }
   });
+
+  it("applies active role exclude declarations to owner memory inclusion", async () => {
+    const fixture = await makeMemoryFixture();
+    try {
+      const selfBase = join(fixture.workdir, ".akemon", "agents", fixture.agentName, "self");
+      await writeFile(join(selfBase, "roles", "no-bio.md"), `# No Bio
+Owner role that excludes bio state.
+
+## 激活
+- trigger:no_bio
+
+## 上下文范围
+include: owner task context
+exclude: bio state
+`);
+
+      const summary = await buildSoftwareAgentMemorySummary({
+        workdir: fixture.workdir,
+        agentName: fixture.agentName,
+        envelope: envelope(),
+        request: {
+          roleTrigger: "trigger:no_bio",
+          memorySummary: "owner vital detail should not appear",
+        },
+      });
+
+      assert.match(summary, /Active role exclusions: bio state/);
+      assert.match(summary, /Role-excluded owner memory/);
+      assert.doesNotMatch(summary, /owner vital detail should not appear/);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("rejects non-string request context fields", async () => {
+    const fixture = await makeMemoryFixture();
+    try {
+      await assert.rejects(
+        () => buildSoftwareAgentMemorySummary({
+          workdir: fixture.workdir,
+          agentName: fixture.agentName,
+          envelope: envelope(),
+          request: { productName: 123 },
+        }),
+        /Invalid productName: expected string/,
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
 });
 
 describe("canIncludeOwnerMemory", () => {

@@ -197,7 +197,7 @@ export async function handleSoftwareAgentRunStreamHttp(
     options: Pick<ServeOptions, "secretKey" | "key">;
     workdir: string;
     agentName: string;
-    softwareAgent: Pick<CodexSoftwareAgentPeripheral, "sendTask" | "getState"> | null;
+    softwareAgent: Pick<CodexSoftwareAgentPeripheral, "sendTask"> | null;
   },
 ): Promise<void> {
   if (!isOwnerRequest(req, deps.options)) {
@@ -235,30 +235,30 @@ export async function handleSoftwareAgentRunStreamHttp(
     return;
   }
 
-  if (deps.softwareAgent.getState().busy) {
-    res.writeHead(409, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Software agent busy" }));
-    return;
-  }
-
   const abortController = new AbortController();
   let responseFinished = false;
+  let streamStarted = false;
   res.on("close", () => {
     if (!responseFinished) abortController.abort();
   });
 
-  res.writeHead(200, {
-    "Content-Type": "application/x-ndjson; charset=utf-8",
-    "Cache-Control": "no-cache",
-    "X-Accel-Buffering": "no",
-  });
-  res.flushHeaders?.();
+  const ensureStreamStarted = () => {
+    if (streamStarted) return;
+    streamStarted = true;
+    res.writeHead(200, {
+      "Content-Type": "application/x-ndjson; charset=utf-8",
+      "Cache-Control": "no-cache",
+      "X-Accel-Buffering": "no",
+    });
+    res.flushHeaders?.();
+  };
 
   try {
     await deps.softwareAgent.sendTask(envelope, {
       signal: abortController.signal,
       observer: {
         onStart(event) {
+          ensureStreamStarted();
           writeSoftwareAgentStreamEvent(res, {
             type: "start",
             taskId: event.taskId,
@@ -266,6 +266,7 @@ export async function handleSoftwareAgentRunStreamHttp(
           });
         },
         onStream(event) {
+          ensureStreamStarted();
           writeSoftwareAgentStreamEvent(res, {
             type: event.stream,
             taskId: event.taskId,
@@ -273,6 +274,7 @@ export async function handleSoftwareAgentRunStreamHttp(
           });
         },
         onEnd(event) {
+          ensureStreamStarted();
           writeSoftwareAgentStreamEvent(res, {
             type: "end",
             taskId: event.taskId,
@@ -282,13 +284,20 @@ export async function handleSoftwareAgentRunStreamHttp(
       },
     });
   } catch (err: any) {
+    if (!streamStarted) {
+      const busy = String(err.message || "").includes("busy");
+      res.writeHead(busy ? 409 : 500, { "Content-Type": "application/json" })
+        .end(JSON.stringify({ error: err.message || String(err) }));
+      responseFinished = true;
+      return;
+    }
     writeSoftwareAgentStreamEvent(res, {
       type: "error",
       error: err.message || String(err),
     });
   } finally {
     responseFinished = true;
-    res.end();
+    if (streamStarted && !res.writableEnded) res.end();
   }
 }
 
@@ -775,10 +784,12 @@ export async function serve(options: ServeOptions): Promise<void> {
     sandbox: "workspace-write",
     taskLedgerDir: softwareAgentTaskLedgerDir(workdir, options.agentName),
   });
-  await codexSoftwareAgent.start(bus);
 
   // Peripheral registry — Core routes by capability
   const peripherals: Peripheral[] = [relay, engineP, codexSoftwareAgent];
+  for (const peripheral of peripherals) {
+    await peripheral.start(bus);
+  }
 
   // requestCompute: acquire the engine slot (priority-aware), execute with a
   // hard timeout, and release. The slot release and subprocess kill are both

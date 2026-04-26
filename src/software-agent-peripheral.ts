@@ -513,6 +513,7 @@ export function summarizeText(text: string, maxChars = MAX_STREAM_SUMMARY_CHARS)
   const headChars = Math.min(STREAM_SUMMARY_HEAD_CHARS, maxChars);
   const tailChars = Math.max(0, maxChars - headChars);
   const omittedChars = chars - headChars - tailChars;
+  const tailText = tailChars > 0 ? normalized.slice(-tailChars) : "";
   return {
     chars,
     bytes,
@@ -520,7 +521,7 @@ export function summarizeText(text: string, maxChars = MAX_STREAM_SUMMARY_CHARS)
     text: [
       normalized.slice(0, headChars),
       `[truncated ${omittedChars} chars]`,
-      normalized.slice(-tailChars),
+      tailText,
     ].join("\n"),
     truncated: true,
     omittedChars,

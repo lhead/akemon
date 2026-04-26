@@ -424,6 +424,7 @@ describe("summarizeText", () => {
     assert.equal(long.chars, 30);
     assert.equal(long.bytes, 30);
     assert.match(long.text, /\[truncated /);
+    assert.equal(long.text, `${"x".repeat(10)}\n[truncated 20 chars]\n`);
   });
 });
 
