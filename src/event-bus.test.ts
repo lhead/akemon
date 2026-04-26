@@ -79,4 +79,41 @@ describe("PersistentEventBus", () => {
     assert.doesNotMatch(JSON.stringify(logged), new RegExp(apiKey));
     assert.doesNotMatch(JSON.stringify(logged), /ak_secret_should_not_persist/);
   });
+
+  it("rotates event logs when the size cap is reached", async () => {
+    const path = join(tmpDir, "events.jsonl");
+    const bus = new PersistentEventBus(new FileEventLog(path, { maxBytes: 80, maxFiles: 2 }));
+
+    bus.emit("custom:event", sig("custom:event", { n: 1, text: "x".repeat(80) }, "test"));
+    bus.emit("custom:event", sig("custom:event", { n: 2, text: "x".repeat(80) }, "test"));
+    bus.emit("custom:event", sig("custom:event", { n: 3, text: "x".repeat(80) }, "test"));
+
+    const current = JSON.parse((await readFile(path, "utf-8")).trim());
+    const previous = JSON.parse((await readFile(join(tmpDir, "events.1.jsonl"), "utf-8")).trim());
+    const older = JSON.parse((await readFile(join(tmpDir, "events.2.jsonl"), "utf-8")).trim());
+
+    assert.equal(current.s.data.n, 3);
+    assert.equal(previous.s.data.n, 2);
+    assert.equal(older.s.data.n, 1);
+  });
+
+  it("replays rotated event logs from oldest to newest", async () => {
+    const path = join(tmpDir, "events.jsonl");
+    const bus = new PersistentEventBus(new FileEventLog(path, { maxBytes: 80, maxFiles: 1 }));
+
+    bus.emit("custom:event", sig("custom:event", { n: 1, text: "x".repeat(80) }, "test"));
+    bus.emit("custom:event", sig("custom:event", { n: 2, text: "x".repeat(80) }, "test"));
+    bus.emit("custom:event", sig("custom:event", { n: 3, text: "x".repeat(80) }, "test"));
+
+    const recovered = new PersistentEventBus(new FileEventLog(path, { maxBytes: 80, maxFiles: 1 }));
+    const seen: number[] = [];
+    recovered.on("custom:event", (signal) => {
+      seen.push(Number(signal.data.n));
+    });
+
+    const count = await recovered.recover();
+
+    assert.equal(count, 2);
+    assert.deepEqual(seen, [2, 3]);
+  });
 });

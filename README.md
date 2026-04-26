@@ -177,6 +177,8 @@ Software-agent tasks default to the `akemon serve` workdir boundary. Use `--allo
 
 Common secret-like values are redacted from software-agent streams, task ledger records, relay task stream events, and the persistent event log before they are displayed or stored.
 
+The persistent event log rotates automatically at about 10 MB per file and keeps the current `events.jsonl` plus five rotated files.
+
 ## Serve Options
 
 ```bash

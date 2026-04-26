@@ -5,7 +5,16 @@
  * PersistentEventBus: wraps SimpleEventBus + append-only jsonl log for crash recovery.
  */
 
-import { appendFileSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, extname, join } from "node:path";
 import type { Signal, EventBus, EventHandler, EventLog } from "./types.js";
 import { redactSecrets } from "./redaction.js";
 
@@ -77,17 +86,30 @@ export class SimpleEventBus implements EventBus {
 // FileEventLog — append-only jsonl file for event persistence
 // ---------------------------------------------------------------------------
 
+export interface FileEventLogOptions {
+  maxBytes?: number;
+  maxFiles?: number;
+}
+
+const DEFAULT_EVENT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_EVENT_LOG_MAX_FILES = 5;
+
 export class FileEventLog implements EventLog {
   private path: string;
+  private maxBytes: number;
+  private maxFiles: number;
 
-  constructor(path: string) {
+  constructor(path: string, options: FileEventLogOptions = {}) {
     this.path = path;
+    this.maxBytes = normalizePositiveInt(options.maxBytes, DEFAULT_EVENT_LOG_MAX_BYTES);
+    this.maxFiles = normalizePositiveInt(options.maxFiles, DEFAULT_EVENT_LOG_MAX_FILES);
     if (!existsSync(path)) writeFileSync(path, "");
   }
 
   append(event: string, signal: Signal): void {
     try {
       const line = JSON.stringify(redactSecrets({ e: event, s: signal })) + "\n";
+      this.rotateIfNeeded(Buffer.byteLength(line, "utf8"));
       appendFileSync(this.path, line);
     } catch {
       // Don't let log failures break the bus
@@ -95,15 +117,17 @@ export class FileEventLog implements EventLog {
   }
 
   async replay(handler: (event: string, signal: Signal) => void): Promise<void> {
-    if (!existsSync(this.path)) return;
-    const content = readFileSync(this.path, "utf-8");
-    for (const line of content.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const { e, s } = JSON.parse(line);
-        handler(e, s);
-      } catch {
-        // Skip corrupted lines
+    for (const file of this.replayPaths()) {
+      if (!existsSync(file)) continue;
+      const content = readFileSync(file, "utf-8");
+      for (const line of content.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const { e, s } = JSON.parse(line);
+          handler(e, s);
+        } catch {
+          // Skip corrupted lines
+        }
       }
     }
   }
@@ -111,6 +135,48 @@ export class FileEventLog implements EventLog {
   close(): void {
     // No-op for sync file writes
   }
+
+  private rotateIfNeeded(incomingBytes: number): void {
+    if (this.maxBytes <= 0) return;
+    if (!existsSync(this.path)) {
+      writeFileSync(this.path, "");
+      return;
+    }
+
+    const currentBytes = statSync(this.path).size;
+    if (currentBytes <= 0 || currentBytes + incomingBytes <= this.maxBytes) return;
+
+    const oldest = this.rotatedPath(this.maxFiles);
+    if (existsSync(oldest)) unlinkSync(oldest);
+
+    for (let index = this.maxFiles - 1; index >= 1; index--) {
+      const from = this.rotatedPath(index);
+      if (existsSync(from)) renameSync(from, this.rotatedPath(index + 1));
+    }
+
+    renameSync(this.path, this.rotatedPath(1));
+    writeFileSync(this.path, "");
+  }
+
+  private replayPaths(): string[] {
+    const paths: string[] = [];
+    for (let index = this.maxFiles; index >= 1; index--) {
+      paths.push(this.rotatedPath(index));
+    }
+    paths.push(this.path);
+    return paths;
+  }
+
+  private rotatedPath(index: number): string {
+    const dir = dirname(this.path);
+    const ext = extname(this.path);
+    const base = basename(this.path, ext);
+    return join(dir, `${base}.${index}${ext}`);
+  }
+}
+
+function normalizePositiveInt(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
 // ---------------------------------------------------------------------------
