@@ -172,6 +172,23 @@ describe("software-agent HTTP endpoint", () => {
     assert.equal(calls, 0);
   });
 
+  it("returns 503 when the software-agent peripheral is not ready", async () => {
+    const run = await callSoftwareAgentEndpoint(null, { goal: "inspect repo" }, "owner-secret");
+    const stream = await callSoftwareAgentStreamEndpoint(null, { goal: "inspect repo" }, "owner-secret");
+    const status = await callSoftwareAgentStatusEndpoint(null, "owner-secret");
+    const reset = await callSoftwareAgentResetEndpoint(null, "owner-secret");
+
+    assert.equal(run.statusCode, 503);
+    assert.match(run.body.error, /not ready/);
+    assert.equal(stream.statusCode, 503);
+    assert.match(JSON.parse(stream.body).error, /not ready/);
+    assert.equal(stream.events.length, 0);
+    assert.equal(status.statusCode, 503);
+    assert.match(status.body.error, /not ready/);
+    assert.equal(reset.statusCode, 503);
+    assert.match(reset.body.error, /not ready/);
+  });
+
   it("forwards a validated owner envelope to the software agent", async () => {
     let received: TaskEnvelope | null = null;
     const res = await callSoftwareAgentEndpoint({

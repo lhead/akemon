@@ -108,6 +108,27 @@ function isOwnerRequest(req: IncomingMessage, options: Pick<ServeOptions, "secre
   return !!token && validTokens.includes(token);
 }
 
+function writeJsonResponse(res: ServerResponse, statusCode: number, body: unknown, pretty = false): void {
+  res.writeHead(statusCode, { "Content-Type": "application/json" })
+    .end(JSON.stringify(body, null, pretty ? 2 : 0));
+}
+
+function requireOwnerRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: Pick<ServeOptions, "secretKey" | "key">,
+): boolean {
+  if (isOwnerRequest(req, options)) return true;
+  writeJsonResponse(res, 401, { error: "Owner token required" });
+  return false;
+}
+
+function requireSoftwareAgent<T>(res: ServerResponse, softwareAgent: T | null): T | null {
+  if (softwareAgent) return softwareAgent;
+  writeJsonResponse(res, 503, { error: "Software agent peripheral not ready" });
+  return null;
+}
+
 function readJsonBody(req: IncomingMessage, maxBytes = 256 * 1024): Promise<any> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -134,6 +155,37 @@ function readJsonBody(req: IncomingMessage, maxBytes = 256 * 1024): Promise<any>
   });
 }
 
+async function readOwnerSoftwareAgentEnvelope(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: {
+    workdir: string;
+    agentName: string;
+  },
+): Promise<TaskEnvelope | null> {
+  let body: any;
+  try {
+    body = await readJsonBody(req);
+  } catch (err: any) {
+    writeJsonResponse(res, 400, { error: err.message || "Invalid request body" });
+    return null;
+  }
+
+  try {
+    const envelope = createOwnerTaskEnvelope(body, deps.workdir);
+    envelope.memorySummary = await buildSoftwareAgentMemorySummary({
+      workdir: deps.workdir,
+      agentName: deps.agentName,
+      envelope,
+      request: body,
+    });
+    return envelope;
+  } catch (err: any) {
+    writeJsonResponse(res, 400, { error: err.message || "Invalid software-agent envelope" });
+    return null;
+  }
+}
+
 export async function handleSoftwareAgentRunHttp(
   req: IncomingMessage,
   res: ServerResponse,
@@ -144,49 +196,18 @@ export async function handleSoftwareAgentRunHttp(
     softwareAgent: Pick<CodexSoftwareAgentPeripheral, "sendTask"> | null;
   },
 ): Promise<void> {
-  if (!isOwnerRequest(req, deps.options)) {
-    res.writeHead(401, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Owner token required" }));
-    return;
-  }
-  if (!deps.softwareAgent) {
-    res.writeHead(503, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Software agent peripheral not ready" }));
-    return;
-  }
-
-  let body: any;
-  try {
-    body = await readJsonBody(req);
-  } catch (err: any) {
-    res.writeHead(400, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: err.message || "Invalid request body" }));
-    return;
-  }
-
-  let envelope;
-  try {
-    envelope = createOwnerTaskEnvelope(body, deps.workdir);
-    envelope.memorySummary = await buildSoftwareAgentMemorySummary({
-      workdir: deps.workdir,
-      agentName: deps.agentName,
-      envelope,
-      request: body,
-    });
-  } catch (err: any) {
-    res.writeHead(400, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: err.message || "Invalid software-agent envelope" }));
-    return;
-  }
+  if (!requireOwnerRequest(req, res, deps.options)) return;
+  const softwareAgent = requireSoftwareAgent(res, deps.softwareAgent);
+  if (!softwareAgent) return;
+  const envelope = await readOwnerSoftwareAgentEnvelope(req, res, deps);
+  if (!envelope) return;
 
   try {
-    const result = await deps.softwareAgent.sendTask(envelope);
-    res.writeHead(result.success ? 200 : 500, { "Content-Type": "application/json" })
-      .end(JSON.stringify(redactSecrets(result), null, 2));
+    const result = await softwareAgent.sendTask(envelope);
+    writeJsonResponse(res, result.success ? 200 : 500, redactSecrets(result), true);
   } catch (err: any) {
     const busy = String(err.message || "").includes("busy");
-    res.writeHead(busy ? 409 : 500, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: err.message || String(err) }));
+    writeJsonResponse(res, busy ? 409 : 500, { error: err.message || String(err) });
   }
 }
 
@@ -200,40 +221,11 @@ export async function handleSoftwareAgentRunStreamHttp(
     softwareAgent: Pick<CodexSoftwareAgentPeripheral, "sendTask"> | null;
   },
 ): Promise<void> {
-  if (!isOwnerRequest(req, deps.options)) {
-    res.writeHead(401, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Owner token required" }));
-    return;
-  }
-  if (!deps.softwareAgent) {
-    res.writeHead(503, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Software agent peripheral not ready" }));
-    return;
-  }
-
-  let body: any;
-  try {
-    body = await readJsonBody(req);
-  } catch (err: any) {
-    res.writeHead(400, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: err.message || "Invalid request body" }));
-    return;
-  }
-
-  let envelope;
-  try {
-    envelope = createOwnerTaskEnvelope(body, deps.workdir);
-    envelope.memorySummary = await buildSoftwareAgentMemorySummary({
-      workdir: deps.workdir,
-      agentName: deps.agentName,
-      envelope,
-      request: body,
-    });
-  } catch (err: any) {
-    res.writeHead(400, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: err.message || "Invalid software-agent envelope" }));
-    return;
-  }
+  if (!requireOwnerRequest(req, res, deps.options)) return;
+  const softwareAgent = requireSoftwareAgent(res, deps.softwareAgent);
+  if (!softwareAgent) return;
+  const envelope = await readOwnerSoftwareAgentEnvelope(req, res, deps);
+  if (!envelope) return;
 
   const abortController = new AbortController();
   let responseFinished = false;
@@ -254,7 +246,7 @@ export async function handleSoftwareAgentRunStreamHttp(
   };
 
   try {
-    await deps.softwareAgent.sendTask(envelope, {
+    await softwareAgent.sendTask(envelope, {
       signal: abortController.signal,
       observer: {
         onStart(event) {
@@ -286,8 +278,7 @@ export async function handleSoftwareAgentRunStreamHttp(
   } catch (err: any) {
     if (!streamStarted) {
       const busy = String(err.message || "").includes("busy");
-      res.writeHead(busy ? 409 : 500, { "Content-Type": "application/json" })
-        .end(JSON.stringify({ error: err.message || String(err) }));
+      writeJsonResponse(res, busy ? 409 : 500, { error: err.message || String(err) });
       responseFinished = true;
       return;
     }
@@ -309,19 +300,11 @@ export async function handleSoftwareAgentStatusHttp(
     softwareAgent: Pick<CodexSoftwareAgentPeripheral, "getState"> | null;
   },
 ): Promise<void> {
-  if (!isOwnerRequest(req, deps.options)) {
-    res.writeHead(401, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Owner token required" }));
-    return;
-  }
-  if (!deps.softwareAgent) {
-    res.writeHead(503, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Software agent peripheral not ready" }));
-    return;
-  }
+  if (!requireOwnerRequest(req, res, deps.options)) return;
+  const softwareAgent = requireSoftwareAgent(res, deps.softwareAgent);
+  if (!softwareAgent) return;
 
-  res.writeHead(200, { "Content-Type": "application/json" })
-    .end(JSON.stringify(deps.softwareAgent.getState(), null, 2));
+  writeJsonResponse(res, 200, softwareAgent.getState(), true);
 }
 
 export async function handleSoftwareAgentTasksHttp(
@@ -333,11 +316,7 @@ export async function handleSoftwareAgentTasksHttp(
     agentName: string;
   },
 ): Promise<void> {
-  if (!isOwnerRequest(req, deps.options)) {
-    res.writeHead(401, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Owner token required" }));
-    return;
-  }
+  if (!requireOwnerRequest(req, res, deps.options)) return;
 
   const url = new URL(req.url || "/", "http://127.0.0.1");
   const basePath = "/self/software-agent/tasks";
@@ -346,33 +325,28 @@ export async function handleSoftwareAgentTasksHttp(
   if (url.pathname === basePath) {
     const limit = readPositiveIntQuery(url.searchParams.get("limit"), 20, 100);
     const tasks = listSoftwareAgentTaskRecords(taskLedgerDir, limit);
-    res.writeHead(200, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ tasks }, null, 2));
+    writeJsonResponse(res, 200, { tasks }, true);
     return;
   }
 
   if (url.pathname.startsWith(`${basePath}/`)) {
     const taskId = decodeURIComponent(url.pathname.slice(basePath.length + 1));
     if (!taskId || taskId.includes("/")) {
-      res.writeHead(400, { "Content-Type": "application/json" })
-        .end(JSON.stringify({ error: "Invalid software-agent task id" }));
+      writeJsonResponse(res, 400, { error: "Invalid software-agent task id" });
       return;
     }
 
     const task = readSoftwareAgentTaskRecord(taskLedgerDir, taskId);
     if (!task) {
-      res.writeHead(404, { "Content-Type": "application/json" })
-        .end(JSON.stringify({ error: "Software-agent task not found" }));
+      writeJsonResponse(res, 404, { error: "Software-agent task not found" });
       return;
     }
 
-    res.writeHead(200, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ task }, null, 2));
+    writeJsonResponse(res, 200, { task }, true);
     return;
   }
 
-  res.writeHead(404, { "Content-Type": "application/json" })
-    .end(JSON.stringify({ error: "Software-agent task endpoint not found" }));
+  writeJsonResponse(res, 404, { error: "Software-agent task endpoint not found" });
 }
 
 function softwareAgentTaskLedgerDir(workdir: string, agentName: string): string {
@@ -399,24 +373,15 @@ export async function handleSoftwareAgentResetHttp(
     softwareAgent: Pick<CodexSoftwareAgentPeripheral, "getState" | "resetSession"> | null;
   },
 ): Promise<void> {
-  if (!isOwnerRequest(req, deps.options)) {
-    res.writeHead(401, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Owner token required" }));
-    return;
-  }
-  if (!deps.softwareAgent) {
-    res.writeHead(503, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: "Software agent peripheral not ready" }));
-    return;
-  }
+  if (!requireOwnerRequest(req, res, deps.options)) return;
+  const softwareAgent = requireSoftwareAgent(res, deps.softwareAgent);
+  if (!softwareAgent) return;
 
   try {
-    await deps.softwareAgent.resetSession();
-    res.writeHead(200, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ ok: true, state: deps.softwareAgent.getState() }, null, 2));
+    await softwareAgent.resetSession();
+    writeJsonResponse(res, 200, { ok: true, state: softwareAgent.getState() }, true);
   } catch (err: any) {
-    res.writeHead(500, { "Content-Type": "application/json" })
-      .end(JSON.stringify({ error: err.message || String(err) }));
+    writeJsonResponse(res, 500, { error: err.message || String(err) });
   }
 }
 
@@ -437,6 +402,7 @@ import {
   createOwnerTaskEnvelope,
   listSoftwareAgentTaskRecords,
   readSoftwareAgentTaskRecord,
+  type TaskEnvelope,
 } from "./software-agent-peripheral.js";
 import { buildSoftwareAgentMemorySummary } from "./software-agent-memory.js";
 import { SIG, sig } from "./types.js";
