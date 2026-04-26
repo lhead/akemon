@@ -61,4 +61,22 @@ describe("PersistentEventBus", () => {
     const lines = (await readFile(path, "utf-8")).trim().split("\n");
     assert.equal(lines.length, 2);
   });
+
+  it("redacts secrets before persisting event log lines", async () => {
+    const path = join(tmpDir, "events.jsonl");
+    const bus = new PersistentEventBus(new FileEventLog(path));
+    const apiKey = "sk-123456789012345678901234";
+
+    bus.emit("custom:event", sig("custom:event", {
+      secretKey: "ak_secret_should_not_persist",
+      message: `OPENAI_API_KEY=${apiKey}`,
+      tokenLimit: 1000,
+    }, "test"));
+
+    const logged = JSON.parse((await readFile(path, "utf-8")).trim());
+    assert.equal(logged.s.data.secretKey, "[REDACTED]");
+    assert.equal(logged.s.data.tokenLimit, 1000);
+    assert.doesNotMatch(JSON.stringify(logged), new RegExp(apiKey));
+    assert.doesNotMatch(JSON.stringify(logged), /ak_secret_should_not_persist/);
+  });
 });

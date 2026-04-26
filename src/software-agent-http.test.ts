@@ -278,6 +278,24 @@ describe("software-agent HTTP endpoint", () => {
     assert.doesNotMatch(summary, /owner secret context/);
   });
 
+  it("redacts secrets from software-agent JSON responses", async () => {
+    const apiKey = "sk-123456789012345678901234";
+    const res = await callSoftwareAgentEndpoint({
+      async sendTask(envelope) {
+        return {
+          ...successResult(envelope),
+          output: `done OPENAI_API_KEY=${apiKey}`,
+          error: `Authorization: Bearer ${apiKey}`,
+        };
+      },
+    }, { goal: "inspect repo" }, "owner-secret");
+
+    const text = JSON.stringify(res.body);
+    assert.equal(res.statusCode, 200);
+    assert.doesNotMatch(text, new RegExp(apiKey));
+    assert.match(text, /\[REDACTED\]/);
+  });
+
   it("streams owner-only software-agent task events as ndjson", async () => {
     let received: TaskEnvelope | null = null;
     const res = await callSoftwareAgentStreamEndpoint({
@@ -327,6 +345,31 @@ describe("software-agent HTTP endpoint", () => {
         },
       },
     ]);
+  });
+
+  it("redacts secrets from software-agent stream events", async () => {
+    const apiKey = "sk-123456789012345678901234";
+    const res = await callSoftwareAgentStreamEndpoint({
+      async sendTask(envelope, options) {
+        const taskId = envelope.taskId || "stream-redaction-task";
+        const result: SoftwareAgentResult = {
+          success: true,
+          taskId,
+          output: `finished OPENAI_API_KEY=${apiKey}`,
+          exitCode: 0,
+          durationMs: 7,
+        };
+        options?.observer?.onStart?.({ taskId, origin: "software_agent", commandLine: "codex exec -" });
+        options?.observer?.onStream?.({ taskId, stream: "stdout", chunk: `OPENAI_API_KEY=${apiKey}` });
+        options?.observer?.onEnd?.({ taskId, exitCode: 0, durationMs: 7, result });
+        return result;
+      },
+    }, { goal: "inspect repo" }, "owner-secret");
+
+    const text = JSON.stringify(res.events);
+    assert.equal(res.statusCode, 200);
+    assert.doesNotMatch(text, new RegExp(apiKey));
+    assert.match(text, /\[REDACTED\]/);
   });
 
   it("rejects run-stream before streaming when the software agent is busy", async () => {

@@ -182,7 +182,7 @@ export async function handleSoftwareAgentRunHttp(
   try {
     const result = await deps.softwareAgent.sendTask(envelope);
     res.writeHead(result.success ? 200 : 500, { "Content-Type": "application/json" })
-      .end(JSON.stringify(result, null, 2));
+      .end(JSON.stringify(redactSecrets(result), null, 2));
   } catch (err: any) {
     const busy = String(err.message || "").includes("busy");
     res.writeHead(busy ? 409 : 500, { "Content-Type": "application/json" })
@@ -388,7 +388,7 @@ function readPositiveIntQuery(value: string | null, fallback: number, max: numbe
 
 function writeSoftwareAgentStreamEvent(res: ServerResponse, event: Record<string, unknown>): void {
   if (res.destroyed) return;
-  res.write(`${JSON.stringify(event)}\n`);
+  res.write(`${JSON.stringify(redactSecrets(event))}\n`);
 }
 
 export async function handleSoftwareAgentResetHttp(
@@ -443,6 +443,7 @@ import { SIG, sig } from "./types.js";
 import type { ComputeRequest, ComputeResult, Peripheral } from "./types.js";
 import { ServeOptions, loadConversation, listConversations, buildLLMContext, resolveConvId } from "./context.js";
 export type { ServeOptions } from "./context.js";
+import { redactSecrets } from "./redaction.js";
 
 import { createMcpServer, initMcpProxy, createMcpProxyServer } from "./mcp-server.js";
 import type { McpDeps, McpServerOptions, McpProxyState } from "./mcp-server.js";

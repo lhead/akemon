@@ -7,6 +7,7 @@
 
 import { appendFileSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import type { Signal, EventBus, EventHandler, EventLog } from "./types.js";
+import { redactSecrets } from "./redaction.js";
 
 export class SimpleEventBus implements EventBus {
   private handlers = new Map<string, Set<EventHandler>>();
@@ -86,7 +87,7 @@ export class FileEventLog implements EventLog {
 
   append(event: string, signal: Signal): void {
     try {
-      const line = JSON.stringify({ e: event, s: signal }) + "\n";
+      const line = JSON.stringify(redactSecrets({ e: event, s: signal })) + "\n";
       appendFileSync(this.path, line);
     } catch {
       // Don't let log failures break the bus

@@ -2,6 +2,7 @@ import WebSocket from "ws";
 import http from "http";
 import { RelayCredentials } from "./config.js";
 import { getMetrics, updateMetrics } from "./metrics.js";
+import { redactText } from "./redaction.js";
 
 const DEFAULT_RELAY_URL = "wss://relay.akemon.dev";
 
@@ -164,7 +165,7 @@ export function sendTaskStream(taskId: string, stream: "stdout" | "stderr", chun
     type: "task_stream",
     task_id: taskId,
     stream,
-    chunk,
+    chunk: redactText(chunk),
   });
 }
 
@@ -594,5 +595,5 @@ function extractSSEData(sse: string): unknown {
 
 /** Send a failure event to the relay for observability storage. Fire-and-forget. */
 export function sendFailureEvent(kind: string, label: string, message: string): void {
-  sendRelayMessage({ type: "failure_event", kind, label, message });
+  sendRelayMessage({ type: "failure_event", kind, label, message: redactText(message) });
 }

@@ -175,6 +175,8 @@ Current Batch 5 status: the Codex integration uses `codex exec` as a one-shot ba
 
 Software-agent tasks default to the `akemon serve` workdir boundary. Use `--allow-outside-workdir` only when you explicitly want the software agent to run outside that root. Each run is recorded under `.akemon/agents/<name>/software-agent/tasks/` with the envelope, result, output summaries, and git worktree status.
 
+Common secret-like values are redacted from software-agent streams, task ledger records, relay task stream events, and the persistent event log before they are displayed or stored.
+
 ## Serve Options
 
 ```bash

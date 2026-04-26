@@ -19,6 +19,7 @@ import { StringDecoder } from "string_decoder";
 import type { EventBus, Peripheral, Signal } from "./types.js";
 import { SIG, sig } from "./types.js";
 import { sendTaskEnd, sendTaskStart, sendTaskStream } from "./relay-client.js";
+import { redactSecrets, redactText } from "./redaction.js";
 
 export type MemoryScope = "none" | "public" | "task" | "owner";
 export type RoleScope = "owner" | "public" | "order" | "agent" | "system";
@@ -349,7 +350,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           durationMs,
         };
         relay.sendTaskEnd(taskId, null, durationMs);
-        observer?.onEnd?.({ taskId, exitCode: null, durationMs, result });
+        observer?.onEnd?.({ taskId, exitCode: null, durationMs, result: redactSecrets(result) });
         const completedAt = new Date().toISOString();
         this.writeTaskRecord({
           ...baseTaskRecord(),
@@ -384,13 +385,15 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         const tailErr = errDecoder.end();
         if (tailOut) {
           stdout += tailOut;
-          relay.sendTaskStream(taskId, "stdout", tailOut);
-          observer?.onStream?.({ taskId, stream: "stdout", chunk: tailOut });
+          const safeTailOut = redactText(tailOut);
+          relay.sendTaskStream(taskId, "stdout", safeTailOut);
+          observer?.onStream?.({ taskId, stream: "stdout", chunk: safeTailOut });
         }
         if (tailErr) {
           stderr += tailErr;
-          relay.sendTaskStream(taskId, "stderr", tailErr);
-          observer?.onStream?.({ taskId, stream: "stderr", chunk: tailErr });
+          const safeTailErr = redactText(tailErr);
+          relay.sendTaskStream(taskId, "stderr", safeTailErr);
+          observer?.onStream?.({ taskId, stream: "stderr", chunk: safeTailErr });
         }
         const durationMs = Date.now() - startedAt;
         this.activeChild = null;
@@ -408,7 +411,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           durationMs,
         };
         relay.sendTaskEnd(taskId, exitCode, durationMs);
-        observer?.onEnd?.({ taskId, exitCode, durationMs, result });
+        observer?.onEnd?.({ taskId, exitCode, durationMs, result: redactSecrets(result) });
         const completedAt = new Date().toISOString();
         this.writeTaskRecord({
           ...baseTaskRecord(),
@@ -459,16 +462,18 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
         const text = outDecoder.write(chunk);
         if (!text) return;
         stdout += text;
-        relay.sendTaskStream(taskId, "stdout", text);
-        observer?.onStream?.({ taskId, stream: "stdout", chunk: text });
+        const safeText = redactText(text);
+        relay.sendTaskStream(taskId, "stdout", safeText);
+        observer?.onStream?.({ taskId, stream: "stdout", chunk: safeText });
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
         const text = errDecoder.write(chunk);
         if (!text) return;
         stderr += text;
-        relay.sendTaskStream(taskId, "stderr", text);
-        observer?.onStream?.({ taskId, stream: "stderr", chunk: text });
+        const safeText = redactText(text);
+        relay.sendTaskStream(taskId, "stderr", safeText);
+        observer?.onStream?.({ taskId, stream: "stderr", chunk: safeText });
       });
 
       child.on("close", (code) => {
@@ -489,7 +494,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     try {
       mkdirSync(dir, { recursive: true });
       const safeTaskId = safeTaskFilename(record.taskId);
-      writeFileSync(join(dir, `${safeTaskId}.json`), `${JSON.stringify(record, null, 2)}\n`);
+      writeFileSync(join(dir, `${safeTaskId}.json`), `${JSON.stringify(redactSecrets(record), null, 2)}\n`);
     } catch (err: any) {
       console.error(`[software-agent] Failed to write task ledger: ${err.message || String(err)}`);
     }

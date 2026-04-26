@@ -390,6 +390,54 @@ describe("CodexSoftwareAgentPeripheral", () => {
       await rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("redacts secrets from streamed chunks and task ledger records", async () => {
+    const tmpDir = await mkdtemp(join(tmpdir(), "akemon-software-agent-redaction-"));
+    try {
+      const spawnedChild = createFakeChild();
+      const ledgerDir = join(tmpDir, "tasks");
+      const apiKey = "sk-123456789012345678901234";
+      const relayChunks: string[] = [];
+      const observerChunks: string[] = [];
+      const peripheral = new CodexSoftwareAgentPeripheral({
+        workdir: "/tmp/akemon",
+        spawnImpl: (() => spawnedChild) as typeof import("node:child_process").spawn,
+        taskRelay: {
+          sendTaskStart() {},
+          sendTaskStream(_taskId, _stream, chunk) {
+            relayChunks.push(chunk);
+          },
+          sendTaskEnd() {},
+        },
+        taskLedgerDir: ledgerDir,
+      });
+
+      const run = peripheral.sendTask(baseEnvelope({
+        taskId: "redaction-task",
+        memorySummary: `Visible context with OPENAI_API_KEY=${apiKey}`,
+      }), {
+        observer: {
+          onStream(event) {
+            observerChunks.push(event.chunk);
+          },
+        },
+      });
+
+      spawnedChild.stdout?.emit("data", Buffer.from(`result OPENAI_API_KEY=${apiKey}`));
+      spawnedChild.stderr?.emit("data", Buffer.from(`Authorization: Bearer ${apiKey}`));
+      spawnedChild.emit("close", 0);
+
+      await run;
+      const recordText = await readFile(join(ledgerDir, "redaction-task.json"), "utf-8");
+
+      assert.doesNotMatch(relayChunks.join(""), new RegExp(apiKey));
+      assert.doesNotMatch(observerChunks.join(""), new RegExp(apiKey));
+      assert.doesNotMatch(recordText, new RegExp(apiKey));
+      assert.match(recordText, /\[REDACTED\]/);
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("listSoftwareAgentTaskRecords", () => {
