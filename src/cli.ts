@@ -14,6 +14,10 @@ import {
 } from "./privacy-filter.js";
 import { SoftwareAgentStreamCliRenderer } from "./software-agent-stream-cli.js";
 import type { SoftwareAgentEnvPolicy } from "./software-agent-peripheral.js";
+import {
+  appendWorkMemoryNote,
+  buildWorkMemoryContext,
+} from "./work-memory.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -87,7 +91,26 @@ function printSoftwareAgentTaskList(tasks: any[]): void {
       : "no-git";
     const goal = truncateOneLine(task.envelope?.goal || "", 90);
     console.log(`${task.taskId}  ${task.status}/${result}  ${duration}  ${git}  ${task.updatedAt || task.startedAt}`);
+    if (task.contextSession?.sessionId) console.log(`  session: ${task.contextSession.sessionId}`);
     if (goal) console.log(`  ${goal}`);
+  }
+}
+
+function printSoftwareAgentSessionList(sessions: any[]): void {
+  if (!sessions.length) {
+    console.log("No software-agent context sessions found.");
+    return;
+  }
+
+  for (const session of sessions) {
+    const result = session.lastResult?.success === true ? "ok" : session.lastResult?.success === false ? "error" : "pending";
+    const duration = typeof session.lastResult?.durationMs === "number" ? `${session.lastResult.durationMs}ms` : "-";
+    const updatedAt = session.updatedAt || "-";
+    const goal = truncateOneLine(session.lastGoal || "", 90);
+    console.log(`${session.sessionId}  ${result}  ${duration}  ${updatedAt}`);
+    if (session.lastTaskId) console.log(`  last task: ${session.lastTaskId}`);
+    if (goal) console.log(`  ${goal}`);
+    if (session.packetPath) console.log(`  context: ${session.packetPath}`);
   }
 }
 
@@ -184,7 +207,7 @@ async function streamLocalOwnerEndpoint(path: string, opts: { port?: string }, b
 
 program
   .name("akemon")
-  .description("Agent work marketplace — train your agent, let it work for others")
+  .description("Local AI companion runtime with memory, modules, relay sync, and software-agent control")
   .version(pkg.version);
 
 program
@@ -381,14 +404,35 @@ program
   .argument("[taskId]", "Task id to inspect")
   .option("-p, --port <port>", "Local akemon serve port", "3000")
   .option("-l, --limit <n>", "Maximum recent tasks to list", "20")
+  .option("--session <id>", "Filter listed tasks by Akemon-side context session id")
+  .option("--context", "Print the task's Akemon TASK_CONTEXT.md content when inspecting one task")
   .option("--json", "Print raw JSON")
   .action(async (taskId: string | undefined, opts) => {
+    if (!taskId && opts.context) {
+      console.error("--context requires a taskId");
+      process.exit(1);
+    }
+    if (taskId && opts.session) {
+      console.error("--session cannot be used when inspecting a single taskId");
+      process.exit(1);
+    }
     const path = taskId
-      ? `/self/software-agent/tasks/${encodeURIComponent(taskId)}`
-      : `/self/software-agent/tasks?limit=${clampPositiveInt(opts.limit, 20, 100)}`;
+      ? `/self/software-agent/tasks/${encodeURIComponent(taskId)}${opts.context ? "?includeContext=1" : ""}`
+      : `/self/software-agent/tasks?limit=${clampPositiveInt(opts.limit, 20, 100)}${opts.session ? `&session=${encodeURIComponent(opts.session)}` : ""}`;
     const data = await callLocalOwnerEndpoint(path, opts, {
       method: "GET",
     });
+
+    if (taskId && opts.context) {
+      const contextPacket = data.contextSession?.contextPacket;
+      if (typeof contextPacket === "string" && contextPacket.length > 0) {
+        process.stdout.write(contextPacket);
+        if (!contextPacket.endsWith("\n")) process.stdout.write("\n");
+        return;
+      }
+      console.error("No TASK_CONTEXT.md content found for this task.");
+      process.exit(1);
+    }
 
     if (opts.json || taskId) {
       console.log(JSON.stringify(taskId ? data.task : data, null, 2));
@@ -396,6 +440,46 @@ program
     }
 
     printSoftwareAgentTaskList(Array.isArray(data.tasks) ? data.tasks : []);
+  });
+
+program
+  .command("software-agent-sessions")
+  .description("List or inspect owner-only Akemon-side software-agent context sessions")
+  .argument("[sessionId]", "Context session id to inspect")
+  .option("-p, --port <port>", "Local akemon serve port", "3000")
+  .option("-l, --limit <n>", "Maximum recent sessions to list", "20")
+  .option("--context", "Print the session TASK_CONTEXT.md content")
+  .option("--json", "Print raw JSON")
+  .action(async (sessionId: string | undefined, opts) => {
+    const query = sessionId && opts.context ? "?includeContext=1" : "";
+    const path = sessionId
+      ? `/self/software-agent/sessions/${encodeURIComponent(sessionId)}${query}`
+      : `/self/software-agent/sessions?limit=${clampPositiveInt(opts.limit, 20, 100)}`;
+    const data = await callLocalOwnerEndpoint(path, opts, {
+      method: "GET",
+    });
+
+    if (sessionId) {
+      if (opts.context) {
+        const contextPacket = data.session?.contextPacket;
+        if (typeof contextPacket === "string" && contextPacket.length > 0) {
+          process.stdout.write(contextPacket);
+          if (!contextPacket.endsWith("\n")) process.stdout.write("\n");
+          return;
+        }
+        console.error("No TASK_CONTEXT.md content found for this session.");
+        process.exit(1);
+      }
+      console.log(JSON.stringify(data.session, null, 2));
+      return;
+    }
+
+    if (opts.json) {
+      console.log(JSON.stringify(data, null, 2));
+      return;
+    }
+
+    printSoftwareAgentSessionList(Array.isArray(data.sessions) ? data.sessions : []);
   });
 
 program
@@ -448,6 +532,68 @@ program
         process.exit(1);
       }
       throw error;
+    }
+  });
+
+program
+  .command("work-context")
+  .description("Print a work-memory context packet for external software agents")
+  .option("-w, --workdir <path>", "Akemon workdir (default: cwd)")
+  .option("-n, --name <name>", "Agent name", "my-agent")
+  .option("--purpose <text>", "Purpose of this context packet", "external software-agent work context")
+  .option("--budget <chars>", "Maximum packet size in characters", "12000")
+  .option("--json", "Print raw JSON")
+  .action(async (opts) => {
+    try {
+      const packet = await buildWorkMemoryContext({
+        workdir: opts.workdir || process.cwd(),
+        agentName: opts.name,
+        purpose: opts.purpose,
+        budget: parsePositiveIntCliOption(opts.budget, "--budget"),
+      });
+      if (opts.json) {
+        console.log(JSON.stringify(packet, null, 2));
+        return;
+      }
+      process.stdout.write(packet.text);
+      if (!packet.text.endsWith("\n")) process.stdout.write("\n");
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    }
+  });
+
+program
+  .command("work-note")
+  .description("Append a note to Akemon work memory")
+  .argument("<text...>", "Durable work-memory note")
+  .option("-w, --workdir <path>", "Akemon workdir (default: cwd)")
+  .option("-n, --name <name>", "Agent name", "my-agent")
+  .option("--source <source>", "Note source, e.g. user, codex, or claude-code", "user")
+  .option("--session <id>", "External or Akemon-side session id")
+  .option("--kind <kind>", "Work-memory kind, e.g. note, decision, command, project", "note")
+  .option("--target <path>", "Optional target file under the work memory directory")
+  .option("--json", "Print raw JSON")
+  .action(async (textParts: string[], opts) => {
+    try {
+      const result = await appendWorkMemoryNote({
+        workdir: opts.workdir || process.cwd(),
+        agentName: opts.name,
+        text: textParts.join(" "),
+        source: opts.source,
+        sessionId: opts.session,
+        kind: opts.kind,
+        target: opts.target,
+      });
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      console.log(`Work memory note appended: ${result.note.id}`);
+      console.log(`Path: ${result.path}`);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
     }
   });
 

@@ -51,6 +51,8 @@ export interface TaskEnvelope {
   forbiddenActions?: string[];
   /** Pre-filtered memory/context text. Must already respect roleScope. */
   memorySummary?: string;
+  /** User-owned work memory directory that external software agents may read/update as task context. */
+  workMemoryDir?: string;
   /** Akemon-managed context session for cross-run continuity. Distinct from Codex transport session id. */
   contextSessionId?: string;
   /** Path to the Akemon-generated context packet for this task. */
@@ -111,6 +113,24 @@ export interface SoftwareAgentContextSessionAudit {
   statePath: string;
 }
 
+export interface SoftwareAgentContextSessionRecord {
+  sessionId: string;
+  packetPath: string;
+  statePath: string;
+  hasContextPacket: boolean;
+  updatedAt?: string;
+  lastTaskId?: string;
+  lastGoal?: string;
+  lastResult?: {
+    success: boolean;
+    exitCode: number | null;
+    durationMs: number;
+    outputSummary?: TextSummary;
+    errorSummary?: TextSummary;
+  };
+  contextPacket?: string;
+}
+
 export interface SoftwareAgentTaskRecord {
   schemaVersion: 1;
   taskId: string;
@@ -154,6 +174,9 @@ export interface SoftwareAgentTaskStartEvent {
   taskId: string;
   origin: string | undefined;
   commandLine: string;
+  contextSessionId?: string;
+  contextPacketPath?: string;
+  workMemoryDir?: string;
 }
 
 export interface SoftwareAgentTaskStreamChunkEvent {
@@ -167,6 +190,9 @@ export interface SoftwareAgentTaskEndEvent {
   exitCode: number | null;
   durationMs: number;
   result: SoftwareAgentResult;
+  contextSessionId?: string;
+  contextPacketPath?: string;
+  workMemoryDir?: string;
 }
 
 export interface SoftwareTaskRelay {
@@ -188,6 +214,7 @@ export interface CodexSoftwareAgentConfig {
   taskLedgerDir?: string;
   taskLedgerMaxRecords?: number;
   contextSessionDir?: string;
+  workMemoryDir?: string;
   gitStatusImpl?: (workdir: string) => GitWorktreeStatus;
   envPolicy?: SoftwareAgentEnvPolicy;
   envAllowlist?: string[];
@@ -311,6 +338,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       workdirStatus: this.collectWorkdirStatus(currentWorkdir),
       taskLedgerDir: this.config.taskLedgerDir,
       contextSessionDir: this.config.contextSessionDir,
+      workMemoryDir: this.config.workMemoryDir,
       environment: buildSoftwareAgentChildEnvironment({
         policy: this.config.envPolicy,
         allowlist: this.config.envAllowlist,
@@ -349,7 +377,14 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       envelope.workdirSafety?.allowOutsideWorkdir || false,
     );
     const workdir = workdirSafety.effectiveWorkdir;
-    let effectiveEnvelope: TaskEnvelope = { ...envelope, taskId, contextSessionId, workdir, workdirSafety };
+    let effectiveEnvelope: TaskEnvelope = {
+      ...envelope,
+      taskId,
+      contextSessionId,
+      workdir,
+      workdirSafety,
+      workMemoryDir: envelope.workMemoryDir || this.config.workMemoryDir,
+    };
     const contextSession = this.config.contextSessionDir
       ? writeSoftwareAgentContextPacket(this.config.contextSessionDir, effectiveEnvelope)
       : undefined;
@@ -371,6 +406,11 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
     const spawnImpl = this.config.spawnImpl || spawn;
     const timeoutMs = envelope.timeoutMs || this.config.defaultTimeoutMs || DEFAULT_TIMEOUT_MS;
     const workdirStatus = this.collectWorkdirStatus(workdir);
+    const taskMetadata = {
+      contextSessionId: effectiveEnvelope.contextSessionId,
+      contextPacketPath: effectiveEnvelope.contextPacketPath,
+      workMemoryDir: effectiveEnvelope.workMemoryDir,
+    };
     const childEnvironment = buildSoftwareAgentChildEnvironment({
       policy: this.config.envPolicy,
       allowlist: this.config.envAllowlist,
@@ -401,7 +441,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
       });
       const origin = "software_agent";
       relay.sendTaskStart(taskId, origin, commandLine);
-      observer?.onStart?.({ taskId, origin, commandLine });
+      observer?.onStart?.({ taskId, origin, commandLine, ...taskMetadata });
       this.bus?.emit(SIG.TASK_STARTED, sig(SIG.TASK_STARTED, {
         taskId,
         taskType: "software_agent",
@@ -432,7 +472,13 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           durationMs,
         };
         relay.sendTaskEnd(taskId, null, durationMs);
-        observer?.onEnd?.({ taskId, exitCode: null, durationMs, result: redactSecrets(result) });
+        observer?.onEnd?.({
+          taskId,
+          exitCode: null,
+          durationMs,
+          result: redactSecrets(result),
+          ...taskMetadata,
+        });
         const completedAt = new Date().toISOString();
         this.writeTaskRecord({
           ...baseTaskRecord(),
@@ -501,7 +547,13 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           durationMs,
         };
         relay.sendTaskEnd(taskId, exitCode, durationMs);
-        observer?.onEnd?.({ taskId, exitCode, durationMs, result: redactSecrets(result) });
+        observer?.onEnd?.({
+          taskId,
+          exitCode,
+          durationMs,
+          result: redactSecrets(result),
+          ...taskMetadata,
+        });
         const completedAt = new Date().toISOString();
         this.writeTaskRecord({
           ...baseTaskRecord(),
@@ -637,6 +689,10 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
     `Workdir: ${envelope.workdir}`,
   ];
 
+  if (envelope.workMemoryDir) {
+    lines.push(`Work memory directory: ${envelope.workMemoryDir}`);
+  }
+
   if (envelope.contextPacketPath) {
     lines.push(`Context packet path: ${envelope.contextPacketPath}`);
   }
@@ -663,6 +719,16 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
     lines.push("");
   }
 
+  if (envelope.workMemoryDir) {
+    lines.push("Work memory:");
+    lines.push("- This is user-owned working context for engineering/task continuity.");
+    lines.push("- You may read it with grep, direct file browsing, or semantic review as appropriate.");
+    lines.push("- You may update files under this directory when the task or user asks you to maintain work memory.");
+    lines.push("- Do not read or edit Akemon self memory as part of this software-agent task.");
+    lines.push("- For a quick append, use `akemon work-note \"<durable work memory>\" --source codex --kind note`.");
+    lines.push("");
+  }
+
   if (envelope.allowedActions?.length) {
     lines.push("Allowed actions:");
     for (const item of envelope.allowedActions) lines.push(`- ${item}`);
@@ -684,7 +750,9 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
   lines.push("Instructions:");
   lines.push("- Treat this envelope as the complete Akemon-provided context for this task.");
   lines.push("- Do not attempt to read Akemon private memory outside the visible context above.");
+  lines.push("- Do not read or edit Akemon self memory unless the user explicitly names a normal file to inspect.");
   lines.push("- Work only in the stated workdir unless the envelope explicitly allows otherwise.");
+  lines.push("- If you learn durable work memory, update the work memory directory or use `akemon work-note`.");
   lines.push("- Report what changed, what you verified, and any remaining risk.");
 
   return lines.join("\n");
@@ -698,6 +766,7 @@ export function buildContextPacketLaunchPrompt(envelope: TaskEnvelope, contextPa
     `Akemon context session: ${envelope.contextSessionId || "(one-shot)"}`,
     `Context packet: ${contextPacketPath}`,
     `Workdir: ${envelope.workdir}`,
+    `Work memory directory: ${envelope.workMemoryDir || "(not configured)"}`,
     "",
     "Goal:",
     envelope.goal,
@@ -706,7 +775,9 @@ export function buildContextPacketLaunchPrompt(envelope: TaskEnvelope, contextPa
     "- Read the context packet first before doing repository work.",
     "- Treat that file as the complete Akemon-provided context for this task.",
     "- Do not read Akemon private memory outside the context packet.",
+    "- Do not read or edit Akemon self memory unless the user explicitly names a normal file to inspect.",
     "- Work only in the stated workdir unless the packet explicitly allows otherwise.",
+    "- If you learn durable work memory, update the work memory directory or use `akemon work-note`.",
     "- Report what changed, what you verified, and any remaining risk.",
   ].join("\n");
 }
@@ -831,14 +902,20 @@ export function readGitWorktreeStatus(workdir: string): GitWorktreeStatus {
   }
 }
 
-export function listSoftwareAgentTaskRecords(taskLedgerDir: string, limit = 20): SoftwareAgentTaskRecord[] {
+export function listSoftwareAgentTaskRecords(
+  taskLedgerDir: string,
+  limit = 20,
+  opts: { contextSessionId?: string } = {},
+): SoftwareAgentTaskRecord[] {
   const safeLimit = normalizeTaskRecordLimit(limit);
+  const contextSessionId = opts.contextSessionId?.trim();
   try {
     if (!existsSync(taskLedgerDir)) return [];
     return readdirSync(taskLedgerDir, { withFileTypes: true })
       .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
       .map((entry) => readSoftwareAgentTaskRecordFile(join(taskLedgerDir, entry.name)))
       .filter((record): record is SoftwareAgentTaskRecord => !!record)
+      .filter((record) => !contextSessionId || record.contextSession?.sessionId === contextSessionId || record.envelope.contextSessionId === contextSessionId)
       .sort(compareSoftwareAgentTaskRecords)
       .slice(0, safeLimit);
   } catch {
@@ -852,6 +929,68 @@ export function readSoftwareAgentTaskRecord(
 ): SoftwareAgentTaskRecord | null {
   const file = join(taskLedgerDir, `${safeTaskFilename(taskId)}.json`);
   return readSoftwareAgentTaskRecordFile(file);
+}
+
+export function listSoftwareAgentContextSessions(
+  contextSessionDir: string,
+  limit = 20,
+): SoftwareAgentContextSessionRecord[] {
+  const safeLimit = normalizeTaskRecordLimit(limit);
+  try {
+    if (!existsSync(contextSessionDir)) return [];
+    return readdirSync(contextSessionDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        try {
+          return readSoftwareAgentContextSession(contextSessionDir, entry.name);
+        } catch {
+          return null;
+        }
+      })
+      .filter((record): record is SoftwareAgentContextSessionRecord => !!record)
+      .sort(compareSoftwareAgentContextSessions)
+      .slice(0, safeLimit);
+  } catch {
+    return [];
+  }
+}
+
+export function readSoftwareAgentContextSession(
+  contextSessionDir: string,
+  sessionId: string,
+  opts: { includeContextPacket?: boolean } = {},
+): SoftwareAgentContextSessionRecord | null {
+  const safeSessionId = normalizeContextSessionId(sessionId, "sessionId");
+  if (!safeSessionId) return null;
+  const sessionDir = join(contextSessionDir, safeSessionId);
+  if (!existsSync(sessionDir)) return null;
+
+  const packetPath = join(sessionDir, CONTEXT_PACKET_FILENAME);
+  const statePath = join(sessionDir, CONTEXT_SESSION_STATE_FILENAME);
+  const state = readSoftwareAgentContextSessionState(statePath);
+  const record: SoftwareAgentContextSessionRecord = {
+    sessionId: safeSessionId,
+    packetPath,
+    statePath,
+    hasContextPacket: existsSync(packetPath),
+  };
+
+  if (state) {
+    record.updatedAt = state.updatedAt;
+    record.lastTaskId = state.lastTaskId;
+    record.lastGoal = state.lastGoal;
+    record.lastResult = state.lastResult;
+  }
+
+  if (opts.includeContextPacket && record.hasContextPacket) {
+    try {
+      record.contextPacket = readFileSync(packetPath, "utf8");
+    } catch {
+      record.contextPacket = "";
+    }
+  }
+
+  return record;
 }
 
 export function pruneSoftwareAgentTaskRecords(
@@ -981,9 +1120,8 @@ function writeSoftwareAgentContextSessionState(
 
 function readSoftwareAgentContextSessionSummary(statePath: string): string | undefined {
   try {
-    if (!existsSync(statePath)) return undefined;
-    const parsed = JSON.parse(readFileSync(statePath, "utf8"));
-    if (!parsed || parsed.schemaVersion !== 1 || !parsed.lastTaskId || !parsed.lastResult) return undefined;
+    const parsed = readSoftwareAgentContextSessionState(statePath);
+    if (!parsed?.lastTaskId || !parsed.lastResult) return undefined;
     const result = parsed.lastResult;
     const status = result.success === true ? "completed" : "failed";
     const lines = [
@@ -1002,6 +1140,44 @@ function readSoftwareAgentContextSessionSummary(statePath: string): string | und
   } catch {
     return undefined;
   }
+}
+
+function readSoftwareAgentContextSessionState(statePath: string): SoftwareAgentContextSessionState | null {
+  try {
+    if (!existsSync(statePath)) return null;
+    const parsed = JSON.parse(readFileSync(statePath, "utf8"));
+    if (!isSoftwareAgentContextSessionState(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+interface SoftwareAgentContextSessionState {
+  schemaVersion: 1;
+  sessionId: string;
+  updatedAt: string;
+  lastTaskId: string;
+  lastGoal?: string;
+  lastResult: {
+    success: boolean;
+    exitCode: number | null;
+    durationMs: number;
+    outputSummary?: TextSummary;
+    errorSummary?: TextSummary;
+  };
+}
+
+function isSoftwareAgentContextSessionState(value: any): value is SoftwareAgentContextSessionState {
+  return value
+    && value.schemaVersion === 1
+    && typeof value.sessionId === "string"
+    && typeof value.updatedAt === "string"
+    && typeof value.lastTaskId === "string"
+    && value.lastResult
+    && typeof value.lastResult.success === "boolean"
+    && (typeof value.lastResult.exitCode === "number" || value.lastResult.exitCode === null)
+    && typeof value.lastResult.durationMs === "number";
 }
 
 function readOptionalString(value: unknown, field: string): string | undefined {
@@ -1162,6 +1338,16 @@ function compareSoftwareAgentTaskRecords(a: SoftwareAgentTaskRecord, b: Software
   const aTime = Date.parse(a.updatedAt || a.startedAt) || 0;
   if (bTime !== aTime) return bTime - aTime;
   return b.taskId.localeCompare(a.taskId);
+}
+
+function compareSoftwareAgentContextSessions(
+  a: SoftwareAgentContextSessionRecord,
+  b: SoftwareAgentContextSessionRecord,
+): number {
+  const bTime = Date.parse(b.updatedAt || "") || 0;
+  const aTime = Date.parse(a.updatedAt || "") || 0;
+  if (bTime !== aTime) return bTime - aTime;
+  return b.sessionId.localeCompare(a.sessionId);
 }
 
 function buildCodexExecCommand(opts: {

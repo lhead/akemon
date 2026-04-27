@@ -1,7 +1,7 @@
 {
   "name": "akemon",
   "version": "0.3.5",
-  "description": "Agent work marketplace — train your agent, let it work for others",
+  "description": "Local AI companion runtime with memory, modules, relay sync, and software-agent control",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -31,7 +31,7 @@
     "start": "node dist/cli.js",
     "postinstall": "node scripts/fix-node-pty.cjs",
     "prepublishOnly": "npm run build",
-    "test": "tsc -p tsconfig.test.json && node --test test-dist/*.test.js"
+    "test": "rm -rf test-dist && tsc -p tsconfig.test.json && node --test test-dist/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

@@ -38,6 +38,7 @@ export class SoftwareAgentStreamCliRenderer {
       this.stderrLine(`[software-agent] task ${taskId} started`);
       const commandLine = readString(event.commandLine);
       if (commandLine) this.stderrLine(`[software-agent] command: ${truncateOneLine(commandLine, 160)}`);
+      this.printMetadata(event);
       return false;
     }
 
@@ -87,7 +88,27 @@ export class SoftwareAgentStreamCliRenderer {
       this.stderrLine(`[software-agent] summary: ${truncateOneLine(output, 240)}`);
     }
 
+    this.printNextSteps(event, taskId);
+
     return !success;
+  }
+
+  private printMetadata(event: any): void {
+    const contextSessionId = readString(event.contextSessionId);
+    const contextPacketPath = readString(event.contextPacketPath);
+    const workMemoryDir = readString(event.workMemoryDir);
+    if (contextSessionId) this.stderrLine(`[software-agent] session: ${truncateOneLine(contextSessionId, 120)}`);
+    if (contextPacketPath) this.stderrLine(`[software-agent] context: ${truncateOneLine(contextPacketPath, 240)}`);
+    if (workMemoryDir) this.stderrLine(`[software-agent] work memory: ${truncateOneLine(workMemoryDir, 240)}`);
+  }
+
+  private printNextSteps(event: any, taskId: string): void {
+    const contextSessionId = readString(event.contextSessionId);
+    const workMemoryDir = readString(event.workMemoryDir);
+    const hints: string[] = [`akemon software-agent-tasks ${taskId}`];
+    if (contextSessionId) hints.push(`akemon software-agent-sessions ${contextSessionId} --context`);
+    if (workMemoryDir) hints.push("akemon work-note \"<durable work memory>\" --source codex");
+    this.stderrLine(`[software-agent] next: ${hints.join(" | ")}`);
   }
 
   private stderrLine(line: string): void {

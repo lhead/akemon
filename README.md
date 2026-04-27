@@ -193,6 +193,20 @@ The software-agent task ledger keeps the most recent 200 task records by default
 
 The persistent event log rotates automatically at about 10 MB per file and keeps the current `events.jsonl` plus five rotated files.
 
+## Work Memory
+
+Akemon keeps personality memory under `.akemon/agents/<name>/self/`. External software tools such as Codex CLI and Claude Code should use the separate work-memory directory instead:
+
+```bash
+# Print a deterministic work-memory packet for an external tool
+akemon work-context --name my-agent
+
+# Append a quick work-memory note
+akemon work-note --name my-agent --source codex --kind decision "Keep Codex focused on work memory before adding more tools."
+```
+
+Work memory lives under `.akemon/agents/<name>/work/`. Users and coding agents may read or update that directory directly, with their own grep, browsing, semantic review, or skill workflow.
+
 ## Serve Options
 
 ```bash

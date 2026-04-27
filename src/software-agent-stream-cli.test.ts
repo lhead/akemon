@@ -11,6 +11,9 @@ describe("software-agent stream CLI renderer", () => {
       type: "start",
       taskId: "sw_1",
       commandLine: "codex exec -",
+      contextSessionId: "project-alpha",
+      contextPacketPath: "/repo/.akemon/agents/my-agent/software-agent/sessions/project-alpha/TASK_CONTEXT.md",
+      workMemoryDir: "/repo/.akemon/agents/my-agent/work",
     })), false);
     assert.equal(renderer.handleLine(JSON.stringify({
       type: "stdout",
@@ -27,6 +30,9 @@ describe("software-agent stream CLI renderer", () => {
       taskId: "sw_1",
       exitCode: 0,
       durationMs: 7,
+      contextSessionId: "project-alpha",
+      contextPacketPath: "/repo/.akemon/agents/my-agent/software-agent/sessions/project-alpha/TASK_CONTEXT.md",
+      workMemoryDir: "/repo/.akemon/agents/my-agent/work",
       result: {
         success: true,
         taskId: "sw_1",
@@ -39,8 +45,12 @@ describe("software-agent stream CLI renderer", () => {
     assert.equal(capture.stdout, "hello ");
     assert.match(capture.stderr, /\[software-agent\] task sw_1 started/);
     assert.match(capture.stderr, /\[software-agent\] command: codex exec -/);
+    assert.match(capture.stderr, /\[software-agent\] session: project-alpha/);
+    assert.match(capture.stderr, /\[software-agent\] context: \/repo\/\.akemon\/agents\/my-agent\/software-agent\/sessions\/project-alpha\/TASK_CONTEXT\.md/);
+    assert.match(capture.stderr, /\[software-agent\] work memory: \/repo\/\.akemon\/agents\/my-agent\/work/);
     assert.match(capture.stderr, /note\n\[software-agent\] task sw_1 finished exit=0 duration=7ms/);
     assert.match(capture.stderr, /\[software-agent\] summary: hello world/);
+    assert.match(capture.stderr, /\[software-agent\] next: akemon software-agent-tasks sw_1 \| akemon software-agent-sessions project-alpha --context \| akemon work-note/);
   });
 
   it("marks failed end events as process failures and prints the error", () => {

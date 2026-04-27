@@ -62,6 +62,7 @@ describe("buildTaskEnvelopePrompt", () => {
         allowOutsideWorkdir: false,
         outsideBaseWorkdir: false,
       },
+      workMemoryDir: "/tmp/akemon/.akemon/agents/momo/work",
     }));
 
     assert.match(prompt, /Task ID: sw-test-1/);
@@ -70,6 +71,7 @@ describe("buildTaskEnvelopePrompt", () => {
     assert.match(prompt, /Memory scope: owner/);
     assert.match(prompt, /Risk level: medium/);
     assert.match(prompt, /Workdir: \/tmp\/akemon/);
+    assert.match(prompt, /Work memory directory: \/tmp\/akemon\/\.akemon\/agents\/momo\/work/);
     assert.match(prompt, /Base workdir: \/tmp/);
     assert.match(prompt, /Outside base workdir: no/);
     assert.match(prompt, /Visible context only\./);
@@ -77,6 +79,8 @@ describe("buildTaskEnvelopePrompt", () => {
     assert.match(prompt, /- read owner private notes outside this envelope/);
     assert.match(prompt, /Concise engineering report\./);
     assert.match(prompt, /Do not attempt to read Akemon private memory outside the visible context/);
+    assert.match(prompt, /Do not read or edit Akemon self memory/);
+    assert.match(prompt, /akemon work-note/);
   });
 });
 
@@ -195,6 +199,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
     const peripheral = new CodexSoftwareAgentPeripheral({
       workdir: "/tmp/akemon",
       command: "codex",
+      workMemoryDir: "/tmp/akemon/.akemon/agents/momo/work",
       spawnImpl: ((cmd, args, opts) => {
         assert.equal(cmd, "codex");
         assert.deepEqual(args, [
@@ -240,13 +245,13 @@ describe("CodexSoftwareAgentPeripheral", () => {
     const result = await peripheral.sendTask(baseEnvelope(), {
       observer: {
         onStart(event) {
-          observerEvents.push(`start:${event.taskId}:${event.commandLine}`);
+          observerEvents.push(`start:${event.taskId}:${event.commandLine}:${event.contextSessionId}:${event.workMemoryDir}`);
         },
         onStream(event) {
           observerEvents.push(`${event.stream}:${event.chunk}`);
         },
         onEnd(event) {
-          observerEvents.push(`end:${event.taskId}:${event.result.success}`);
+          observerEvents.push(`end:${event.taskId}:${event.result.success}:${event.contextSessionId}:${event.workMemoryDir}`);
         },
       },
     });
@@ -260,6 +265,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
     assert.match(writtenPrompt, /Akemon Software Peripheral Task Envelope/);
     assert.match(writtenPrompt, /Goal:\nInspect the repo/);
     assert.match(writtenPrompt, /Visible context only\./);
+    assert.match(writtenPrompt, /Work memory directory: \/tmp\/akemon\/\.akemon\/agents\/momo\/work/);
 
     assert.deepEqual(streamEvents.slice(0, 4), [
       {
@@ -280,11 +286,11 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.ok(end.durationMs >= 0);
     }
     assert.deepEqual(observerEvents, [
-      "start:sw-test-1:codex exec --skip-git-repo-check --color never -s workspace-write -C /tmp/akemon -",
+      "start:sw-test-1:codex exec --skip-git-repo-check --color never -s workspace-write -C /tmp/akemon -:sw-test-1:/tmp/akemon/.akemon/agents/momo/work",
       "stdout:result ",
       "stderr:note",
       "stdout:ok",
-      "end:sw-test-1:true",
+      "end:sw-test-1:true:sw-test-1:/tmp/akemon/.akemon/agents/momo/work",
     ]);
 
     assert.deepEqual(busEvents, [
@@ -410,6 +416,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
         workdir: "/tmp/akemon",
         contextSessionDir,
         taskLedgerDir: ledgerDir,
+        workMemoryDir: "/tmp/akemon/.akemon/agents/momo/work",
         spawnImpl: (() => {
           const index = prompts.length;
           prompts.push("");
@@ -445,6 +452,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.match(prompts[0], new RegExp(packetPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
       assert.doesNotMatch(prompts[0], /Visible context only/);
       assert.match(firstPacket, /Akemon context session: project-alpha/);
+      assert.match(firstPacket, /Work memory directory: \/tmp\/akemon\/\.akemon\/agents\/momo\/work/);
       assert.match(firstPacket, /Visible context only\./);
       assert.equal(firstState.sessionId, "project-alpha");
       assert.equal(firstState.lastTaskId, "ctx-1");

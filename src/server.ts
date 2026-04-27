@@ -268,6 +268,9 @@ export async function handleSoftwareAgentRunStreamHttp(
             type: "start",
             taskId: event.taskId,
             commandLine: event.commandLine,
+            contextSessionId: event.contextSessionId,
+            contextPacketPath: event.contextPacketPath,
+            workMemoryDir: event.workMemoryDir,
           });
         },
         onStream(event) {
@@ -286,6 +289,9 @@ export async function handleSoftwareAgentRunStreamHttp(
             exitCode: event.exitCode,
             durationMs: event.durationMs,
             result: event.result,
+            contextSessionId: event.contextSessionId,
+            contextPacketPath: event.contextPacketPath,
+            workMemoryDir: event.workMemoryDir,
           });
         },
       },
@@ -339,7 +345,9 @@ export async function handleSoftwareAgentTasksHttp(
 
   if (url.pathname === basePath) {
     const limit = readPositiveIntQuery(url.searchParams.get("limit"), 20, 100);
-    const tasks = listSoftwareAgentTaskRecords(taskLedgerDir, limit);
+    const tasks = listSoftwareAgentTaskRecords(taskLedgerDir, limit, {
+      contextSessionId: url.searchParams.get("session") || undefined,
+    });
     writeJsonResponse(res, 200, { tasks }, true);
     return;
   }
@@ -357,11 +365,75 @@ export async function handleSoftwareAgentTasksHttp(
       return;
     }
 
-    writeJsonResponse(res, 200, { task }, true);
+    let contextSession;
+    if (readBooleanQuery(url.searchParams.get("includeContext")) && task.contextSession?.sessionId) {
+      try {
+        contextSession = readSoftwareAgentContextSession(
+          softwareAgentContextSessionDir(deps.workdir, deps.agentName),
+          task.contextSession.sessionId,
+          { includeContextPacket: true },
+        );
+      } catch {
+        contextSession = null;
+      }
+    }
+
+    writeJsonResponse(res, 200, { task, ...(contextSession ? { contextSession } : {}) }, true);
     return;
   }
 
   writeJsonResponse(res, 404, { error: "Software-agent task endpoint not found" });
+}
+
+export async function handleSoftwareAgentContextSessionsHttp(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: {
+    options: Pick<ServeOptions, "secretKey" | "key">;
+    workdir: string;
+    agentName: string;
+  },
+): Promise<void> {
+  if (!requireOwnerRequest(req, res, deps.options)) return;
+
+  const url = new URL(req.url || "/", "http://127.0.0.1");
+  const basePath = "/self/software-agent/sessions";
+  const contextSessionDir = softwareAgentContextSessionDir(deps.workdir, deps.agentName);
+
+  if (url.pathname === basePath) {
+    const limit = readPositiveIntQuery(url.searchParams.get("limit"), 20, 100);
+    const sessions = listSoftwareAgentContextSessions(contextSessionDir, limit);
+    writeJsonResponse(res, 200, { sessions }, true);
+    return;
+  }
+
+  if (url.pathname.startsWith(`${basePath}/`)) {
+    const sessionId = decodeURIComponent(url.pathname.slice(basePath.length + 1));
+    if (!sessionId || sessionId.includes("/")) {
+      writeJsonResponse(res, 400, { error: "Invalid software-agent context session id" });
+      return;
+    }
+
+    let session;
+    try {
+      session = readSoftwareAgentContextSession(contextSessionDir, sessionId, {
+        includeContextPacket: readBooleanQuery(url.searchParams.get("includeContext")),
+      });
+    } catch (err: any) {
+      writeJsonResponse(res, 400, { error: err.message || "Invalid software-agent context session id" });
+      return;
+    }
+
+    if (!session) {
+      writeJsonResponse(res, 404, { error: "Software-agent context session not found" });
+      return;
+    }
+
+    writeJsonResponse(res, 200, { session }, true);
+    return;
+  }
+
+  writeJsonResponse(res, 404, { error: "Software-agent context session endpoint not found" });
 }
 
 function softwareAgentTaskLedgerDir(workdir: string, agentName: string): string {
@@ -377,6 +449,10 @@ function readPositiveIntQuery(value: string | null, fallback: number, max: numbe
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
   return Math.min(parsed, max);
+}
+
+function readBooleanQuery(value: string | null): boolean {
+  return value === "1" || value === "true" || value === "yes";
 }
 
 function writeSoftwareAgentStreamEvent(res: ServerResponse, event: Record<string, unknown>): void {
@@ -419,11 +495,14 @@ import { FileEventLog, PersistentEventBus } from "./event-bus.js";
 import {
   CodexSoftwareAgentPeripheral,
   createOwnerTaskEnvelope,
+  listSoftwareAgentContextSessions,
   listSoftwareAgentTaskRecords,
+  readSoftwareAgentContextSession,
   readSoftwareAgentTaskRecord,
   type TaskEnvelope,
 } from "./software-agent-peripheral.js";
 import { buildSoftwareAgentMemorySummary } from "./software-agent-memory.js";
+import { workMemoryDir } from "./work-memory.js";
 import { SIG, sig } from "./types.js";
 import type { ComputeRequest, ComputeResult, Peripheral } from "./types.js";
 import { ServeOptions, loadConversation, listConversations, buildLLMContext, resolveConvId } from "./context.js";
@@ -560,6 +639,17 @@ export async function serve(options: ServeOptions): Promise<void> {
         return;
       }
       const requestPath = req.url?.split("?")[0] || "";
+      if (
+        req.method === "GET"
+        && (requestPath === "/self/software-agent/sessions" || requestPath.startsWith("/self/software-agent/sessions/"))
+      ) {
+        await handleSoftwareAgentContextSessionsHttp(req, res, {
+          options,
+          workdir,
+          agentName: options.agentName,
+        });
+        return;
+      }
       if (
         req.method === "GET"
         && (requestPath === "/self/software-agent/tasks" || requestPath.startsWith("/self/software-agent/tasks/"))
@@ -771,6 +861,7 @@ export async function serve(options: ServeOptions): Promise<void> {
     sandbox: "workspace-write",
     taskLedgerDir: softwareAgentTaskLedgerDir(workdir, options.agentName),
     contextSessionDir: softwareAgentContextSessionDir(workdir, options.agentName),
+    workMemoryDir: workMemoryDir(workdir, options.agentName),
     envPolicy: options.softwareAgentEnvPolicy,
     envAllowlist: options.softwareAgentEnvAllowlist,
   });

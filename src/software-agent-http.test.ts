@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { describe, it } from "node:test";
 import {
+  handleSoftwareAgentContextSessionsHttp,
   handleSoftwareAgentResetHttp,
   handleSoftwareAgentRunHttp,
   handleSoftwareAgentRunStreamHttp,
@@ -110,6 +111,24 @@ async function callSoftwareAgentTasksEndpoint(
   const req = createRequest("GET", path, undefined, token);
   const res = new TestResponse();
   await handleSoftwareAgentTasksHttp(req, res as unknown as ServerResponse, {
+    options: { secretKey: "owner-secret", key: "legacy-owner-key" },
+    workdir,
+    agentName: "test-agent",
+  });
+  return {
+    statusCode: res.statusCode,
+    body: res.body ? JSON.parse(res.body) : {},
+  };
+}
+
+async function callSoftwareAgentContextSessionsEndpoint(
+  workdir: string,
+  path: string,
+  token?: string,
+): Promise<{ statusCode: number; body: any }> {
+  const req = createRequest("GET", path, undefined, token);
+  const res = new TestResponse();
+  await handleSoftwareAgentContextSessionsHttp(req, res as unknown as ServerResponse, {
     options: { secretKey: "owner-secret", key: "legacy-owner-key" },
     workdir,
     agentName: "test-agent",
@@ -343,6 +362,9 @@ describe("software-agent HTTP endpoint", () => {
           taskId,
           origin: "software_agent",
           commandLine: "codex exec -",
+          contextSessionId: "project-alpha",
+          contextPacketPath: "/tmp/project-alpha/TASK_CONTEXT.md",
+          workMemoryDir: "/tmp/.akemon/agents/test-agent/work",
         });
         options?.observer?.onStream?.({ taskId, stream: "stdout", chunk: "hello " });
         options?.observer?.onStream?.({ taskId, stream: "stderr", chunk: "note" });
@@ -354,7 +376,15 @@ describe("software-agent HTTP endpoint", () => {
           durationMs: 7,
         };
         options?.observer?.onStream?.({ taskId, stream: "stdout", chunk: "world" });
-        options?.observer?.onEnd?.({ taskId, exitCode: 0, durationMs: 7, result });
+        options?.observer?.onEnd?.({
+          taskId,
+          exitCode: 0,
+          durationMs: 7,
+          result,
+          contextSessionId: "project-alpha",
+          contextPacketPath: "/tmp/project-alpha/TASK_CONTEXT.md",
+          workMemoryDir: "/tmp/.akemon/agents/test-agent/work",
+        });
         return result;
       },
     }, { goal: "inspect repo" }, "owner-secret");
@@ -366,7 +396,14 @@ describe("software-agent HTTP endpoint", () => {
     assert.equal(envelope.goal, "inspect repo");
     assert.match(envelope.memorySummary || "", /Akemon memory boundary/);
     assert.deepEqual(res.events, [
-      { type: "start", taskId: "stream-task", commandLine: "codex exec -" },
+      {
+        type: "start",
+        taskId: "stream-task",
+        commandLine: "codex exec -",
+        contextSessionId: "project-alpha",
+        contextPacketPath: "/tmp/project-alpha/TASK_CONTEXT.md",
+        workMemoryDir: "/tmp/.akemon/agents/test-agent/work",
+      },
       { type: "stdout", taskId: "stream-task", chunk: "hello " },
       { type: "stderr", taskId: "stream-task", chunk: "note" },
       { type: "stdout", taskId: "stream-task", chunk: "world" },
@@ -382,6 +419,9 @@ describe("software-agent HTTP endpoint", () => {
           exitCode: 0,
           durationMs: 7,
         },
+        contextSessionId: "project-alpha",
+        contextPacketPath: "/tmp/project-alpha/TASK_CONTEXT.md",
+        workMemoryDir: "/tmp/.akemon/agents/test-agent/work",
       },
     ]);
   });
@@ -451,17 +491,51 @@ describe("software-agent HTTP endpoint", () => {
     const workdir = await mkdtemp(join(tmpdir(), "akemon-software-agent-http-"));
     try {
       const ledgerDir = join(workdir, ".akemon", "agents", "test-agent", "software-agent", "tasks");
+      const contextDir = join(workdir, ".akemon", "agents", "test-agent", "software-agent", "sessions", "project-alpha");
       await mkdir(ledgerDir, { recursive: true });
-      await writeSoftwareAgentTaskRecord(ledgerDir, taskRecord({
+      await mkdir(contextDir, { recursive: true });
+      await writeFile(join(contextDir, "TASK_CONTEXT.md"), "Goal:\nOlder task context\n");
+      await writeFile(join(contextDir, "SESSION.json"), JSON.stringify({
+        schemaVersion: 1,
+        sessionId: "project-alpha",
+        updatedAt: "2026-04-25T02:30:00.000Z",
+        lastTaskId: "older",
+        lastGoal: "older task",
+        lastResult: {
+          success: true,
+          exitCode: 0,
+          durationMs: 12,
+        },
+      }));
+      const olderRecord = taskRecord({
         taskId: "older",
         updatedAt: "2026-04-25T01:00:00.000Z",
         goal: "older task",
-      }));
+      });
+      olderRecord.contextSession = {
+        sessionId: "project-alpha",
+        packetPath: join(contextDir, "TASK_CONTEXT.md"),
+        statePath: join(contextDir, "SESSION.json"),
+      };
+      olderRecord.envelope.contextSessionId = "project-alpha";
+      await writeSoftwareAgentTaskRecord(ledgerDir, olderRecord);
       await writeSoftwareAgentTaskRecord(ledgerDir, taskRecord({
         taskId: "newer",
         updatedAt: "2026-04-25T02:00:00.000Z",
         goal: "newer task",
       }));
+      const otherRecord = taskRecord({
+        taskId: "other",
+        updatedAt: "2026-04-25T03:00:00.000Z",
+        goal: "other task",
+      });
+      otherRecord.contextSession = {
+        sessionId: "project-beta",
+        packetPath: "/tmp/project-beta/TASK_CONTEXT.md",
+        statePath: "/tmp/project-beta/SESSION.json",
+      };
+      otherRecord.envelope.contextSessionId = "project-beta";
+      await writeSoftwareAgentTaskRecord(ledgerDir, otherRecord);
 
       const unauth = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks");
       assert.equal(unauth.statusCode, 401);
@@ -469,15 +543,84 @@ describe("software-agent HTTP endpoint", () => {
       const list = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks?limit=1", "owner-secret");
       assert.equal(list.statusCode, 200);
       assert.equal(list.body.tasks.length, 1);
-      assert.equal(list.body.tasks[0].taskId, "newer");
-      assert.equal(list.body.tasks[0].envelope.goal, "newer task");
+      assert.equal(list.body.tasks[0].taskId, "other");
+
+      const sessionList = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks?session=project-alpha", "owner-secret");
+      assert.equal(sessionList.statusCode, 200);
+      assert.deepEqual(sessionList.body.tasks.map((task: any) => task.taskId), ["older"]);
+      assert.equal(sessionList.body.tasks[0].contextSession.sessionId, "project-alpha");
+
+      const unscopedList = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks?limit=2", "owner-secret");
+      assert.equal(unscopedList.statusCode, 200);
+      assert.equal(unscopedList.body.tasks.length, 2);
+      assert.deepEqual(unscopedList.body.tasks.map((task: any) => task.taskId), ["other", "newer"]);
+      assert.equal(unscopedList.body.tasks[1].envelope.goal, "newer task");
 
       const detail = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks/older", "owner-secret");
       assert.equal(detail.statusCode, 200);
       assert.equal(detail.body.task.taskId, "older");
       assert.equal(detail.body.task.envelope.goal, "older task");
 
+      const contextDetail = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks/older?includeContext=1", "owner-secret");
+      assert.equal(contextDetail.statusCode, 200);
+      assert.equal(contextDetail.body.task.taskId, "older");
+      assert.equal(contextDetail.body.contextSession.sessionId, "project-alpha");
+      assert.match(contextDetail.body.contextSession.contextPacket, /Older task context/);
+
       const missing = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks/missing", "owner-secret");
+      assert.equal(missing.statusCode, 404);
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns owner-only software-agent context sessions", async () => {
+    const workdir = await mkdtemp(join(tmpdir(), "akemon-software-agent-sessions-http-"));
+    try {
+      const sessionDir = join(workdir, ".akemon", "agents", "test-agent", "software-agent", "sessions", "project-alpha");
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(sessionDir, "TASK_CONTEXT.md"), "Goal:\nInspect repo\n");
+      await writeFile(join(sessionDir, "SESSION.json"), JSON.stringify({
+        schemaVersion: 1,
+        sessionId: "project-alpha",
+        updatedAt: "2026-04-26T01:00:00.000Z",
+        lastTaskId: "sw_1",
+        lastGoal: "inspect repo",
+        lastResult: {
+          success: true,
+          exitCode: 0,
+          durationMs: 12,
+          outputSummary: {
+            chars: 2,
+            bytes: 2,
+            lines: 1,
+            text: "ok",
+            truncated: false,
+          },
+        },
+      }));
+
+      const unauth = await callSoftwareAgentContextSessionsEndpoint(workdir, "/self/software-agent/sessions");
+      assert.equal(unauth.statusCode, 401);
+
+      const list = await callSoftwareAgentContextSessionsEndpoint(workdir, "/self/software-agent/sessions", "owner-secret");
+      assert.equal(list.statusCode, 200);
+      assert.equal(list.body.sessions.length, 1);
+      assert.equal(list.body.sessions[0].sessionId, "project-alpha");
+      assert.equal(list.body.sessions[0].lastTaskId, "sw_1");
+      assert.equal(list.body.sessions[0].lastGoal, "inspect repo");
+      assert.equal(list.body.sessions[0].hasContextPacket, true);
+      assert.equal(list.body.sessions[0].contextPacket, undefined);
+
+      const detail = await callSoftwareAgentContextSessionsEndpoint(workdir, "/self/software-agent/sessions/project-alpha?includeContext=1", "owner-secret");
+      assert.equal(detail.statusCode, 200);
+      assert.equal(detail.body.session.sessionId, "project-alpha");
+      assert.match(detail.body.session.contextPacket, /Inspect repo/);
+
+      const invalid = await callSoftwareAgentContextSessionsEndpoint(workdir, "/self/software-agent/sessions/..%2Fbad", "owner-secret");
+      assert.equal(invalid.statusCode, 400);
+
+      const missing = await callSoftwareAgentContextSessionsEndpoint(workdir, "/self/software-agent/sessions/missing", "owner-secret");
       assert.equal(missing.statusCode, 404);
     } finally {
       await rm(workdir, { recursive: true, force: true });
