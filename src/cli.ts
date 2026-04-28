@@ -18,6 +18,7 @@ import {
   appendWorkMemoryNote,
   buildWorkMemoryContext,
 } from "./work-memory.js";
+import { renderSoftwareAgentRunResult } from "./software-agent-result-cli.js";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -92,6 +93,8 @@ function printSoftwareAgentTaskList(tasks: any[]): void {
     const goal = truncateOneLine(task.envelope?.goal || "", 90);
     console.log(`${task.taskId}  ${task.status}/${result}  ${duration}  ${git}  ${task.updatedAt || task.startedAt}`);
     if (task.contextSession?.sessionId) console.log(`  session: ${task.contextSession.sessionId}`);
+    const workMemoryDir = task.envelope?.workMemoryDir || task.result?.workMemoryDir;
+    if (workMemoryDir) console.log(`  work memory: ${workMemoryDir}`);
     if (goal) console.log(`  ${goal}`);
   }
 }
@@ -111,6 +114,7 @@ function printSoftwareAgentSessionList(sessions: any[]): void {
     if (session.lastTaskId) console.log(`  last task: ${session.lastTaskId}`);
     if (goal) console.log(`  ${goal}`);
     if (session.packetPath) console.log(`  context: ${session.packetPath}`);
+    if (session.workMemoryDir) console.log(`  work memory: ${session.workMemoryDir}`);
   }
 }
 
@@ -202,6 +206,55 @@ async function streamLocalOwnerEndpoint(path: string, opts: { port?: string }, b
   }
   buffer += decoder.decode();
   if (buffer.trim() && streamRenderer.handleLine(buffer)) failed = true;
+  if (failed) process.exit(1);
+}
+
+async function runSoftwareAgentCli(goalParts: string[], opts: any, forcedSessionId?: string): Promise<void> {
+  const body: Record<string, unknown> = {
+    goal: goalParts.join(" "),
+    roleScope: opts.roleScope,
+    memoryScope: opts.memoryScope,
+    riskLevel: opts.risk,
+  };
+  if (opts.workdir) body.workdir = opts.workdir;
+  if (opts.allowOutsideWorkdir) body.allowOutsideWorkdir = true;
+  if (opts.memorySummary) body.memorySummary = opts.memorySummary;
+  const workContextBudget = parsePositiveIntCliOption(opts.workContextBudget, "--work-context-budget");
+  if (opts.workContext || workContextBudget !== undefined) body.includeWorkMemoryContext = true;
+  if (workContextBudget !== undefined) body.workMemoryContextBudget = workContextBudget;
+  const sessionId = forcedSessionId || opts.session;
+  if (sessionId) body.contextSessionId = sessionId;
+  if (opts.deliverable) body.deliverable = opts.deliverable;
+  if (opts.timeoutMs) {
+    const timeoutMs = Number(opts.timeoutMs);
+    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+      console.error("--timeout-ms must be a positive integer");
+      process.exit(1);
+    }
+    body.timeoutMs = timeoutMs;
+  }
+
+  if (opts.stream !== false) {
+    await streamLocalOwnerEndpoint("/self/software-agent/run-stream", opts, body);
+    return;
+  }
+
+  const res = await fetchLocalOwnerEndpoint("/self/software-agent/run", opts, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+  const text = await res.text();
+  let data: any;
+  try { data = text ? JSON.parse(text) : {}; }
+  catch { data = { output: text }; }
+
+  if (!res.ok) {
+    console.error(data.error || text || `Request failed with HTTP ${res.status}`);
+    process.exit(1);
+  }
+
+  const failed = renderSoftwareAgentRunResult(data);
   if (failed) process.exit(1);
 }
 
@@ -348,43 +401,35 @@ program
   .option("--memory-scope <scope>", "Memory scope: none|public|task|owner", "owner")
   .option("--risk <level>", "Risk level: low|medium|high", "medium")
   .option("--memory-summary <text>", "Pre-filtered memory/context text to include")
+  .option("--work-context", "Embed a bounded work-memory context packet in the task envelope")
+  .option("--work-context-budget <chars>", "Maximum embedded work-memory context size; also enables --work-context")
   .option("--session <id>", "Akemon-side context session id for explicit software-agent continuity")
   .option("--deliverable <text>", "Expected output shape")
   .option("--timeout-ms <ms>", "Task timeout in milliseconds")
   .option("--no-stream", "Disable local streaming and wait for the final response")
   .action(async (goalParts: string[], opts) => {
-    const body: Record<string, unknown> = {
-      goal: goalParts.join(" "),
-      roleScope: opts.roleScope,
-      memoryScope: opts.memoryScope,
-      riskLevel: opts.risk,
-    };
-    if (opts.workdir) body.workdir = opts.workdir;
-    if (opts.allowOutsideWorkdir) body.allowOutsideWorkdir = true;
-    if (opts.memorySummary) body.memorySummary = opts.memorySummary;
-    if (opts.session) body.contextSessionId = opts.session;
-    if (opts.deliverable) body.deliverable = opts.deliverable;
-    if (opts.timeoutMs) {
-      const timeoutMs = Number(opts.timeoutMs);
-      if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
-        console.error("--timeout-ms must be a positive integer");
-        process.exit(1);
-      }
-      body.timeoutMs = timeoutMs;
-    }
+    await runSoftwareAgentCli(goalParts, opts);
+  });
 
-    if (opts.stream !== false) {
-      await streamLocalOwnerEndpoint("/self/software-agent/run-stream", opts, body);
-      return;
-    }
-
-    const data = await callLocalOwnerEndpoint("/self/software-agent/run", opts, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-
-    if (data.output) console.log(data.output);
-    else console.log(JSON.stringify(data, null, 2));
+program
+  .command("software-agent-continue")
+  .description("Continue an Akemon-side software-agent context session")
+  .argument("<sessionId>", "Akemon-side context session id to continue")
+  .argument("<goal...>", "Task goal to send to the software agent")
+  .option("-p, --port <port>", "Local akemon serve port", "3000")
+  .option("-w, --workdir <path>", "Workdir for the software agent (default: serve workdir)")
+  .option("--allow-outside-workdir", "Allow the software agent workdir to be outside the serve workdir")
+  .option("--role-scope <scope>", "Role scope: owner|public|order|agent|system", "owner")
+  .option("--memory-scope <scope>", "Memory scope: none|public|task|owner", "owner")
+  .option("--risk <level>", "Risk level: low|medium|high", "medium")
+  .option("--memory-summary <text>", "Pre-filtered memory/context text to include")
+  .option("--work-context", "Embed a bounded work-memory context packet in the task envelope")
+  .option("--work-context-budget <chars>", "Maximum embedded work-memory context size; also enables --work-context")
+  .option("--deliverable <text>", "Expected output shape")
+  .option("--timeout-ms <ms>", "Task timeout in milliseconds")
+  .option("--no-stream", "Disable local streaming and wait for the final response")
+  .action(async (sessionId: string, goalParts: string[], opts) => {
+    await runSoftwareAgentCli(goalParts, opts, sessionId);
   });
 
 program

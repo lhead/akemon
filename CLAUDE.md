@@ -1,5 +1,14 @@
 # Claude Code Instructions for Akemon
 
+## Architecture Direction
+
+Akemon 的核心是 core 与各 module 的决策结构：身份、记忆、目标、偏好、任务判断、权限策略、任务分派和复盘。
+
+- `Engine` 是可替换的算力层，服务于 core/module 的短调用、总结、分类、结构化判断等低风险计算。短期可以是纯 LLM API；长期也可以是 no-tools / constrained agent runtime。无论底层是什么，Engine 不拥有 Akemon 的身份、记忆策略或执行权限。
+- Akemon 不内建通用执行 agent，不复刻 Codex、Claude Code、浏览器 agent、办公 agent 或其他专用 agent 工具的能力。需要执行代码修改、命令运行、浏览器操作、外部系统调用等任务时，Akemon 应优先调用用户已经选择和信任的 agent 工具或 agent SDK。
+- Akemon 是任务分配者，但不是传统 agent 编排系统。更准确地说，它像把工作下发给各部门的秘书：明确目标、上下文、记忆边界、权限边界、风险和交付物，再接收结果、记录审计并决定下一步。必要时，它也可以把任务交给专门的 agent 编排工具。
+- 外部 agent 默认只使用 work memory。`self/` 下的人格记忆仍由 Akemon core/module 维护；不要为 Codex/Claude Code 等外部工具添加直接编辑 `self/` 记忆的产品路径，除非用户明确要求普通文件级操作。
+
 ## Assumptions & Guesses Log
 
 当进行以下操作时，请在 `.claude/assumptions.md` 中记录假设：

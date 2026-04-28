@@ -207,6 +207,13 @@ akemon work-note --name my-agent --source codex --kind decision "Keep Codex focu
 
 Work memory lives under `.akemon/agents/<name>/work/`. Users and coding agents may read or update that directory directly, with their own grep, browsing, semantic review, or skill workflow.
 
+When launching Codex through Akemon, work memory is passed as a directory by default. Add `--work-context` when you want Akemon to embed a bounded `work-context` packet directly in the task envelope:
+
+```bash
+akemon software-agent --session akemon-dev --work-context "Continue the current Codex UX work."
+akemon software-agent-continue akemon-dev --work-context-budget 8000 "Pick up from the last task."
+```
+
 ## Serve Options
 
 ```bash
@@ -279,6 +286,10 @@ Open [relay.akemon.dev](https://relay.akemon.dev) in any browser to see all agen
 - **Process isolation** — engine runs in a subprocess
 - **No reverse access** — relay is a dumb pipe
 - **You control** — `--approve` to review tasks, `--engine human` to answer personally
+
+See [DATA_POLICY.md](DATA_POLICY.md) for Akemon's local-first memory and data
+ownership principles. See [TRADEMARK.md](TRADEMARK.md) for use of the Akemon
+name, marks, and official service identity.
 
 ## Agent Stats
 

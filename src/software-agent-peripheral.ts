@@ -53,6 +53,8 @@ export interface TaskEnvelope {
   memorySummary?: string;
   /** User-owned work memory directory that external software agents may read/update as task context. */
   workMemoryDir?: string;
+  /** Optional bounded work-memory packet, generated only when the caller explicitly asks to spend tokens on it. */
+  workMemoryContext?: string;
   /** Akemon-managed context session for cross-run continuity. Distinct from Codex transport session id. */
   contextSessionId?: string;
   /** Path to the Akemon-generated context packet for this task. */
@@ -80,6 +82,9 @@ export interface SoftwareAgentResult {
   error?: string;
   exitCode: number | null;
   durationMs: number;
+  contextSessionId?: string;
+  contextPacketPath?: string;
+  workMemoryDir?: string;
 }
 
 export type SoftwareAgentTaskStatus = "running" | "completed" | "failed";
@@ -118,6 +123,7 @@ export interface SoftwareAgentContextSessionRecord {
   packetPath: string;
   statePath: string;
   hasContextPacket: boolean;
+  workMemoryDir?: string;
   updatedAt?: string;
   lastTaskId?: string;
   lastGoal?: string;
@@ -470,6 +476,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           error: err.message || String(err),
           exitCode: null,
           durationMs,
+          ...taskMetadata,
         };
         relay.sendTaskEnd(taskId, null, durationMs);
         observer?.onEnd?.({
@@ -545,6 +552,7 @@ export class CodexSoftwareAgentPeripheral implements SoftwareAgentPeripheral {
           error: success ? undefined : error || stderr.trim() || `codex exited with code ${exitCode}`,
           exitCode,
           durationMs,
+          ...taskMetadata,
         };
         relay.sendTaskEnd(taskId, exitCode, durationMs);
         observer?.onEnd?.({
@@ -726,6 +734,12 @@ export function buildTaskEnvelopePrompt(envelope: TaskEnvelope): string {
     lines.push("- You may update files under this directory when the task or user asks you to maintain work memory.");
     lines.push("- Do not read or edit Akemon self memory as part of this software-agent task.");
     lines.push("- For a quick append, use `akemon work-note \"<durable work memory>\" --source codex --kind note`.");
+    lines.push("");
+  }
+
+  if (envelope.workMemoryContext?.trim()) {
+    lines.push("Included work-memory context:");
+    lines.push(envelope.workMemoryContext.trim());
     lines.push("");
   }
 
@@ -977,6 +991,7 @@ export function readSoftwareAgentContextSession(
 
   if (state) {
     record.updatedAt = state.updatedAt;
+    record.workMemoryDir = state.workMemoryDir;
     record.lastTaskId = state.lastTaskId;
     record.lastGoal = state.lastGoal;
     record.lastResult = state.lastResult;
@@ -1102,6 +1117,7 @@ function writeSoftwareAgentContextSessionState(
       schemaVersion: 1,
       sessionId: envelope.contextSessionId,
       updatedAt,
+      workMemoryDir: envelope.workMemoryDir,
       lastTaskId: result.taskId,
       lastGoal: envelope.goal,
       lastResult: {
@@ -1157,6 +1173,7 @@ interface SoftwareAgentContextSessionState {
   schemaVersion: 1;
   sessionId: string;
   updatedAt: string;
+  workMemoryDir?: string;
   lastTaskId: string;
   lastGoal?: string;
   lastResult: {
@@ -1173,6 +1190,7 @@ function isSoftwareAgentContextSessionState(value: any): value is SoftwareAgentC
     && value.schemaVersion === 1
     && typeof value.sessionId === "string"
     && typeof value.updatedAt === "string"
+    && (value.workMemoryDir === undefined || typeof value.workMemoryDir === "string")
     && typeof value.lastTaskId === "string"
     && value.lastResult
     && typeof value.lastResult.success === "boolean"

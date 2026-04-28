@@ -63,6 +63,7 @@ describe("buildTaskEnvelopePrompt", () => {
         outsideBaseWorkdir: false,
       },
       workMemoryDir: "/tmp/akemon/.akemon/agents/momo/work",
+      workMemoryContext: "# Akemon Work Memory Context\n\nKeep Codex focused on work memory.",
     }));
 
     assert.match(prompt, /Task ID: sw-test-1/);
@@ -75,6 +76,8 @@ describe("buildTaskEnvelopePrompt", () => {
     assert.match(prompt, /Base workdir: \/tmp/);
     assert.match(prompt, /Outside base workdir: no/);
     assert.match(prompt, /Visible context only\./);
+    assert.match(prompt, /Included work-memory context:/);
+    assert.match(prompt, /Keep Codex focused on work memory/);
     assert.match(prompt, /- read repository files/);
     assert.match(prompt, /- read owner private notes outside this envelope/);
     assert.match(prompt, /Concise engineering report\./);
@@ -455,6 +458,7 @@ describe("CodexSoftwareAgentPeripheral", () => {
       assert.match(firstPacket, /Work memory directory: \/tmp\/akemon\/\.akemon\/agents\/momo\/work/);
       assert.match(firstPacket, /Visible context only\./);
       assert.equal(firstState.sessionId, "project-alpha");
+      assert.equal(firstState.workMemoryDir, "/tmp/akemon/.akemon/agents/momo/work");
       assert.equal(firstState.lastTaskId, "ctx-1");
       assert.equal(firstState.lastResult.outputSummary.text, "first result");
 

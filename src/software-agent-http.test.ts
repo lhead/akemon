@@ -46,12 +46,13 @@ async function callSoftwareAgentEndpoint(
   softwareAgent: { sendTask(envelope: TaskEnvelope): Promise<SoftwareAgentResult> } | null,
   body: unknown,
   token?: string,
+  workdir = "/repo",
 ): Promise<{ statusCode: number; body: any }> {
   const req = createRequest("POST", "/self/software-agent/run", body, token);
   const res = new TestResponse();
   await handleSoftwareAgentRunHttp(req, res as unknown as ServerResponse, {
     options: { secretKey: "owner-secret", key: "legacy-owner-key" },
-    workdir: "/repo",
+    workdir,
     agentName: "test-agent",
     softwareAgent,
   });
@@ -239,6 +240,54 @@ describe("software-agent HTTP endpoint", () => {
       "access files outside the stated workdir unless explicitly needed and reported",
       "make network requests",
     ]);
+  });
+
+  it("embeds work-memory context only when explicitly requested", async () => {
+    const workdir = await mkdtemp(join(tmpdir(), "akemon-software-agent-work-context-"));
+    try {
+      const workMemoryDir = join(workdir, ".akemon", "agents", "test-agent", "work");
+      const selfMemoryDir = join(workdir, ".akemon", "agents", "test-agent", "self");
+      await mkdir(workMemoryDir, { recursive: true });
+      await mkdir(selfMemoryDir, { recursive: true });
+      await writeFile(join(workMemoryDir, "README.md"), "Shared work note.\napi_key=sk-testsecretvalue000000000000\n");
+      await writeFile(join(selfMemoryDir, "identity.jsonl"), "{\"private\":\"self memory must not appear\"}\n");
+
+      const firstEnvelopes: TaskEnvelope[] = [];
+      const first = await callSoftwareAgentEndpoint({
+        async sendTask(envelope) {
+          firstEnvelopes.push(envelope);
+          return successResult(envelope);
+        },
+      }, { goal: "inspect repo" }, "owner-secret", workdir);
+      assert.equal(first.statusCode, 200);
+      assert.equal(firstEnvelopes.length, 1);
+      const firstEnvelope = firstEnvelopes[0];
+      assert.equal(firstEnvelope.workMemoryContext, undefined);
+
+      const secondEnvelopes: TaskEnvelope[] = [];
+      const second = await callSoftwareAgentEndpoint({
+        async sendTask(envelope) {
+          secondEnvelopes.push(envelope);
+          return successResult(envelope);
+        },
+      }, {
+        goal: "inspect repo",
+        includeWorkMemoryContext: true,
+        workMemoryContextBudget: 4_000,
+      }, "owner-secret", workdir);
+
+      assert.equal(second.statusCode, 200);
+      assert.equal(secondEnvelopes.length, 1);
+      const envelope = secondEnvelopes[0];
+      assert.equal(envelope.workMemoryDir, workMemoryDir);
+      assert.match(envelope.workMemoryContext || "", /Akemon Work Memory Context/);
+      assert.match(envelope.workMemoryContext || "", /Shared work note/);
+      assert.doesNotMatch(envelope.workMemoryContext || "", /self memory must not appear/);
+      assert.doesNotMatch(envelope.workMemoryContext || "", /sk-testsecretvalue/);
+      assert.match(envelope.workMemoryContext || "", /\[REDACTED\]/);
+    } finally {
+      await rm(workdir, { recursive: true, force: true });
+    }
   });
 
   it("returns task failures as a completed HTTP response", async () => {
@@ -499,6 +548,7 @@ describe("software-agent HTTP endpoint", () => {
         schemaVersion: 1,
         sessionId: "project-alpha",
         updatedAt: "2026-04-25T02:30:00.000Z",
+        workMemoryDir: join(workdir, ".akemon", "agents", "test-agent", "work"),
         lastTaskId: "older",
         lastGoal: "older task",
         lastResult: {
@@ -518,6 +568,7 @@ describe("software-agent HTTP endpoint", () => {
         statePath: join(contextDir, "SESSION.json"),
       };
       olderRecord.envelope.contextSessionId = "project-alpha";
+      olderRecord.envelope.workMemoryDir = join(workdir, ".akemon", "agents", "test-agent", "work");
       await writeSoftwareAgentTaskRecord(ledgerDir, olderRecord);
       await writeSoftwareAgentTaskRecord(ledgerDir, taskRecord({
         taskId: "newer",
@@ -549,6 +600,7 @@ describe("software-agent HTTP endpoint", () => {
       assert.equal(sessionList.statusCode, 200);
       assert.deepEqual(sessionList.body.tasks.map((task: any) => task.taskId), ["older"]);
       assert.equal(sessionList.body.tasks[0].contextSession.sessionId, "project-alpha");
+      assert.equal(sessionList.body.tasks[0].envelope.workMemoryDir, join(workdir, ".akemon", "agents", "test-agent", "work"));
 
       const unscopedList = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks?limit=2", "owner-secret");
       assert.equal(unscopedList.statusCode, 200);
@@ -565,6 +617,7 @@ describe("software-agent HTTP endpoint", () => {
       assert.equal(contextDetail.statusCode, 200);
       assert.equal(contextDetail.body.task.taskId, "older");
       assert.equal(contextDetail.body.contextSession.sessionId, "project-alpha");
+      assert.equal(contextDetail.body.contextSession.workMemoryDir, join(workdir, ".akemon", "agents", "test-agent", "work"));
       assert.match(contextDetail.body.contextSession.contextPacket, /Older task context/);
 
       const missing = await callSoftwareAgentTasksEndpoint(workdir, "/self/software-agent/tasks/missing", "owner-secret");
@@ -584,6 +637,7 @@ describe("software-agent HTTP endpoint", () => {
         schemaVersion: 1,
         sessionId: "project-alpha",
         updatedAt: "2026-04-26T01:00:00.000Z",
+        workMemoryDir: join(workdir, ".akemon", "agents", "test-agent", "work"),
         lastTaskId: "sw_1",
         lastGoal: "inspect repo",
         lastResult: {
@@ -610,11 +664,13 @@ describe("software-agent HTTP endpoint", () => {
       assert.equal(list.body.sessions[0].lastTaskId, "sw_1");
       assert.equal(list.body.sessions[0].lastGoal, "inspect repo");
       assert.equal(list.body.sessions[0].hasContextPacket, true);
+      assert.equal(list.body.sessions[0].workMemoryDir, join(workdir, ".akemon", "agents", "test-agent", "work"));
       assert.equal(list.body.sessions[0].contextPacket, undefined);
 
       const detail = await callSoftwareAgentContextSessionsEndpoint(workdir, "/self/software-agent/sessions/project-alpha?includeContext=1", "owner-secret");
       assert.equal(detail.statusCode, 200);
       assert.equal(detail.body.session.sessionId, "project-alpha");
+      assert.equal(detail.body.session.workMemoryDir, join(workdir, ".akemon", "agents", "test-agent", "work"));
       assert.match(detail.body.session.contextPacket, /Inspect repo/);
 
       const invalid = await callSoftwareAgentContextSessionsEndpoint(workdir, "/self/software-agent/sessions/..%2Fbad", "owner-secret");

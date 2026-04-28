@@ -1,6 +1,6 @@
 {
   "name": "akemon",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Local AI companion runtime with memory, modules, relay sync, and software-agent control",
   "type": "module",
   "license": "MIT",
@@ -23,6 +23,8 @@
   "files": [
     "dist",
     "scripts",
+    "DATA_POLICY.md",
+    "TRADEMARK.md",
     "README.md"
   ],
   "scripts": {

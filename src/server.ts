@@ -192,6 +192,16 @@ async function readOwnerSoftwareAgentEnvelope(
       envelope,
       request: body,
     });
+    if (readOptionalBooleanBody(body?.includeWorkMemoryContext, "includeWorkMemoryContext")) {
+      const workContext = await buildWorkMemoryContext({
+        workdir: deps.workdir,
+        agentName: deps.agentName,
+        purpose: `software-agent task: ${envelope.goal}`,
+        budget: readOptionalPositiveIntBody(body?.workMemoryContextBudget, "workMemoryContextBudget"),
+      });
+      envelope.workMemoryDir = workContext.workMemoryDir;
+      envelope.workMemoryContext = workContext.text;
+    }
     return envelope;
   } catch (err: any) {
     writeJsonResponse(res, 400, { error: err.message || "Invalid software-agent envelope" });
@@ -455,6 +465,20 @@ function readBooleanQuery(value: string | null): boolean {
   return value === "1" || value === "true" || value === "yes";
 }
 
+function readOptionalBooleanBody(value: unknown, field: string): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value !== "boolean") throw new Error(`Invalid ${field}: expected boolean`);
+  return value;
+}
+
+function readOptionalPositiveIntBody(value: unknown, field: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`Invalid ${field}: expected positive integer`);
+  }
+  return value;
+}
+
 function writeSoftwareAgentStreamEvent(res: ServerResponse, event: Record<string, unknown>): void {
   if (res.destroyed) return;
   res.write(`${JSON.stringify(redactSecrets(event))}\n`);
@@ -502,7 +526,7 @@ import {
   type TaskEnvelope,
 } from "./software-agent-peripheral.js";
 import { buildSoftwareAgentMemorySummary } from "./software-agent-memory.js";
-import { workMemoryDir } from "./work-memory.js";
+import { buildWorkMemoryContext, workMemoryDir } from "./work-memory.js";
 import { SIG, sig } from "./types.js";
 import type { ComputeRequest, ComputeResult, Peripheral } from "./types.js";
 import { ServeOptions, loadConversation, listConversations, buildLLMContext, resolveConvId } from "./context.js";
