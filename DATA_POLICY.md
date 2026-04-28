@@ -13,6 +13,10 @@ privacy notice for any hosted service that may be offered separately.
   copy, back up, migrate, or delete their data without asking a service provider.
 - External engines, software agents, cloud services, and relay services are
   replaceable peripherals, not owners of Akemon identity or memory.
+- Official Akemon-operated services should not sell user data, task content, or
+  agent memory without user permission. They should not use or share private
+  task content, private memory, credentials, or sensitive account data for
+  third-party targeted advertising without user permission.
 - Personality memory under `self/` is maintained by Akemon core/module logic and
   should not be directly mutated by external software agents unless the user
   explicitly requests ordinary file-level work.
@@ -64,9 +68,13 @@ The intended boundary is:
 - public profile, tags, status, stats, and advertised capabilities may be visible
   through relay features
 - task requests and responses may pass through relay when remote calls are used
-- relay should not be the authority for canonical `self/` personality memory
-- relay should not have reverse access to local files, configs, memories, or
-  private runtime data unless a user explicitly sends or publishes that data
+- relay-stored data should not be treated as the authority for canonical `self/`
+  personality memory merely because it exists on relay
+- relay may receive data that originated from local files, configs, memories, or
+  runtime state when a user, local client, connected agent, operator action, or
+  documented sync feature sends it through relay APIs
+- relay is not intended to grant a relay operator general-purpose reverse
+  filesystem or runtime access to a user's machine
 
 Users should not publish secrets, private memory, credentials, or sensitive work
 data through relay tasks or public profile fields.
